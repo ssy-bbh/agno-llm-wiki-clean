@@ -7,7 +7,7 @@ from agno.models.openai.like import OpenAILike
 load_dotenv()
 
 
-def get_qwen_model(model_id="qwen3.6-plus"):
+def get_qwen_model(model_id="qwen-max"):
     api_key = os.getenv("QWEN_API_KEY")
     if not api_key:
         raise ValueError("⚠️ 未找到 QWEN_API_KEY，请检查 .env 文件！")

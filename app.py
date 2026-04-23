@@ -26,4 +26,4 @@ app = agent_os.get_app()
 if __name__ == "__main__":
     import uvicorn
     print("🚀 LLM Wiki 中枢已上线...")
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000,ws_ping_interval=15, reload=False)

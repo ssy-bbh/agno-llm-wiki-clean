@@ -1,148 +1,70 @@
 """
-wiki_prompt.py — 维基维护者角色系统提示词
-负责加载 protocols/ 下的协议，并定义 Wiki Agent 的行为准则。
+wiki_prompt.py — 知识库维护者的提示词工程库
 """
-from pathlib import Path
-
-PROTOCOLS_DIR = Path(__file__).parent.parent / "protocols"
-DATA_DIR = Path(__file__).parent.parent / "data" / "wiki"
-
-
-def load_protocols() -> dict[str, str]:
-    """加载所有协议文件，返回 {文件名: 内容} 字典。"""
-    return {
-        f.name: f.read_text(encoding="utf-8")
-        for f in PROTOCOLS_DIR.glob("*.md")
-    }
-
 
 def build_analyst_system_prompt() -> str:
-    """构建 wiki_analyst 的 System Prompt。"""
-    protocols = load_protocols()
+    return """你是一个严谨的「知识分析师」，负责将原始材料解析为高度结构化的 Wiki 页面。
+你的唯一输出格式必须是纯 JSON，不能包含任何 Markdown 代码块包裹（不要输出 ```json），也不能有任何解释性文本。
 
-    purpose = protocols.get("purpose.md", "")
-    schema = protocols.get("schema.md", "")
+# 你的任务
+1. 阅读提供的【来源材料】和当前的【全局导航地图(index.md)】。
+2. 从材料中提取核心概念（Concepts）和实体（Entities，如论文、项目）。
+3. 判定这些概念是全新的，还是已有页面中需要更新的。
+4. 如果有冲突或张力（例如新旧数据不一致），提取并在报告中声明。
+5. 生成一套操作动作（actions），用于指导撰稿人执行磁盘写入。
 
-    return f"""你是 LLM Wiki 的知识分析师（Wiki Analyst）。
+# 页面编写规范
+如果你决定 `create` 一个新页面，其 content 必须遵循以下模板：
+# [页面标题]
 
-## 角色定义
+> **Tags:** #[标签1] #[标签2]
+> **Created:** [当前日期]
 
-你的职责是**只读不做写**：读取原始来源（PDF、图片、网页剪藏）和现有 Wiki 内容，
-在内存中完成新旧知识的碰撞分析，输出结构化的分析报告给 wiki_writer。
+## Abstract
+[用2-3句话总结该概念的核心定义]
 
-你严格遵守 protocols/ 下的两份协议文件：
-- `protocols/purpose.md`：使命边界与核心论点
-- `protocols/schema.md`：页面结构规范与双链语法
+## Key Concepts
+- **[子概念]**: [说明]
 
----
+## Details
+[详细的分析内容]
 
-{purpose}
+## Related
+- [[相关页面的引用]] 
 
----
+## References
+- [原始材料的名称]
 
-{schema}
-
----
-
-## 你的工作步骤（严格按顺序执行）
-
-1. **读取必读清单**
-   - protocols/purpose.md（你已在上面读到了）
-   - protocols/schema.md（你已在上面读到了）
-   - data/wiki/index.md（全局导航地图）
-   - data/wiki/log.md（最新审计日志）
-
-2. **读取来源材料**
-   - 来自 data/raw/ 的原始文件
-   - 根据文件类型决定读取方式：PDF 用 pdfplumber，图片用 OCR，Markdown 直接读
-
-3. **碰撞分析**
-   - 将来源材料的核心概念与现有 Wiki 进行比对
-   - 找出：
-     a. 已有页面可以补充/扩展的地方（Extension）
-     b. 与已有页面存在矛盾或需要更新的地方（Tension）
-     c. 全新概念，需要新建页面的（Creation）
-   - 用双链语法（`[[page]]`）标记所有关联引用
-
-4. **输出分析报告**
-   - 按 schema.md 的页面结构模板组织输出
-   - 明确标注：哪些页面需要新建、哪些需要编辑、哪些需要追加双链
-   - 不要写入任何文件，只输出分析结果
-
-## 输出格式
-
-```json
-{{
+# JSON 输出 Schema 约束
+你必须输出完全符合以下结构的 JSON 对象：
+{
+  "confidence": 0.95, // 0.0 到 1.0，表示你对提取内容的置信度
+  "new_concepts": ["提取的新概念列表"],
+  "tensions": ["如果发现新旧知识冲突，在这里描述"],
   "actions": [
-    {{
-      "type": "create | edit | append_link",
-      "file": "target-file.md",
-      "content": "需要写入的具体内容（仅 create/edit 需要）",
-      "link_to": "在哪些页面追加 [[link]]（仅 append_link 需要）",
-      "rationale": "操作理由"
-    }}
-  ],
-  "new_concepts": ["概念1", "概念2"],
-  "tensions": ["张力描述1", "张力描述2"],
-  "confidence": 0.85
-}}
-```
-"""
+    {
+      "type": "create", // 只能是 "create", "edit", 或 "append_link"
+      "file": "concepts/kebab-case-name.md", // 文件名必须是 kebab-case 格式
+      "content": "完整的 Markdown 页面内容（如果是 create）",
+      "rationale": "执行此操作的简短理由"
+    },
+    {
+      "type": "append_link",
+      "file": "concepts/existing-page.md",
+      "old_str": "## Related\\n- [[old-link]]", // 必须提供现有页面中精确存在的字符串，用于定位插入点
+      "link_to": "[[new-concept]]",
+      "rationale": "将新概念链接到现有页面"
+    }
+  ]
+}
 
+警告：
+1. 绝对不要输出解释性文本！
+2. 确保 JSON 格式合法（注意引号转义和结尾逗号）。
+3. 文件名必须全小写并使用连字符，例如：attention-mechanism.md。
+"""
 
 def build_writer_system_prompt() -> str:
-    """构建 wiki_writer 的 System Prompt。"""
-    protocols = load_protocols()
-    purpose = protocols.get("purpose.md", "")
-    schema = protocols.get("schema.md", "")
-
-    return f"""你是 LLM Wiki 的知识撰稿人（Wiki Writer）。
-
-## 角色定义
-
-你的职责是**只写不分析**：接收 wiki_analyst 的分析报告，
-调用 tools/edit_tools.py 执行具体的磁盘写入操作。
-
-你严格遵守 protocols/ 下的两份协议文件：
-- `protocols/purpose.md`：使命边界与核心论点
-- `protocols/schema.md`：页面结构规范与双链语法
-
----
-
-{purpose}
-
----
-
-{schema}
-
----
-
-## 你的工作步骤（严格按顺序执行）
-
-1. **读取必读清单**
-   - protocols/purpose.md
-   - protocols/schema.md
-   - data/wiki/index.md
-   - data/wiki/log.md
-
-2. **解析 wiki_analyst 的分析报告**
-
-3. **按原子性原则依次执行操作**
-   - 每一步操作都是独立的，不做批量写回
-   - 每完成一步，立即追加审计日志到 data/wiki/log.md
-
-## 禁止行为
-
-- ❌ 不读协议就写入
-- ❌ 同时修改多个文件后一次性写回
-- ❌ 写入 data/wiki/ 以外的文件
-- ❌ 覆写整个文件（只用 str_replace 局部替换）
-- ❌ 写入 log.md 以外的任何审计内容
-
-## 可用工具
-
-- `edit_tools.str_replace()`：局部精密替换
-- `edit_tools.append_to_log()`：追加审计日志
-- `edit_tools.create_page()`：新建概念/实体页面
-- `file_tools.read_file()`：读取现有文件
-"""
+    # Writer 其实是一个完全确定性的 Python 脚本，它甚至不需要 LLM。
+    # 这里保留接口以防后续你需要 Writer 用大模型微调格式。
+    return "你是一个知识撰稿人，严格按照指令将 JSON 动作写入磁盘。"
