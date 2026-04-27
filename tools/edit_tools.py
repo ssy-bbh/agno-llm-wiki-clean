@@ -15,20 +15,44 @@ def _resolve(path: str) -> Path:
     return p
 
 
-def create_page(file_name: str, title: str, tags: list[str], abstract: str) -> str:
-    """严格按照 schema 模板创建新页面"""
+# 💡 注意参数里多了 content
+def create_page(file_name: str, title: str, tags: list[str], abstract: str, content: str = "") -> str:
+    """严格按照 schema 模板创建新页面，包含模糊去重机制"""
     path = _resolve(file_name)
-
-    # 确保父目录(如 concepts/)存在
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 防覆盖锁：如果文件已经存在，直接拒绝覆写
+    # 1. 物理级模糊去重锁 (保持不变)
+    clean_new_name = path.stem.lower().replace("-", "").replace("_", "").replace(" ", "")
+    for existing_file in path.parent.glob("*.md"):
+        clean_existing = existing_file.stem.lower().replace("-", "").replace("_", "").replace(" ", "")
+        if clean_new_name == clean_existing:
+            return f"⚠️ 拦截重复：检测到异名同义词 ({existing_file.name} 已存在)，规避新建：{file_name}"
+
     if path.exists():
         return f"⚠️ 警告：页面已存在，拒绝覆写 ({file_name})"
 
-    tag_str = " ".join(tags)
+    # 💡 2. 核心修复：解决换行符明文显示的 Bug
+    abstract = abstract.replace("\\n", "\n")
+    content = content.replace("\\n", "\n")
+
+    # 3. 终极 Tags 脏数据清洗 (保持不变)
+    clean_tags = []
+    if tags:
+        if isinstance(tags, str):
+            cleaned = tags.replace("[", "").replace("]", "").replace("'", "").replace('"', "")
+            clean_tags = [t.strip() for t in cleaned.split(",") if t.strip()]
+        elif isinstance(tags, list):
+            for t in tags:
+                t_str = str(t).replace("[", "").replace("]", "").replace("'", "").replace('"', "").strip()
+                if t_str:
+                    clean_tags.append(t_str)
+    tag_str = " ".join(clean_tags)
+
     import datetime
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    # 4. 动态注入正文
+    details_text = content if content else "（等待后续扩展）"
 
     # 强制套用标准模板
     body = f"""# {title}
@@ -40,7 +64,7 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str) -> s
 {abstract}
 
 ## Details
-（等待后续扩展）
+{details_text}
 
 ## Related
 - 

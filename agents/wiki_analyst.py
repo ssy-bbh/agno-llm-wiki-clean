@@ -34,36 +34,39 @@ class AnalysisReport(BaseModel):
 
 class WikiAnalyst:
     def __init__(self):
-        # 💡 升级了紧箍咒：强调 tags 格式并严禁转义
-        self.instructions = """你是一个严谨的知识分析师。
-
-⚠️ 严格警告与核心决策规则：
-1. 【插队更新】：如果你决定新建概念（create），必须紧接着输出 `append_link` 动作，将其双向链接追加到 index.md 的对应分类下！
-2. 【严格列表】：`tags` 字段必须是 JSON 数组（如 `["#tag"]`），绝不能是字符串！
-3. 【禁止转义】：在输出 `old_str` 和 `link_to` 时，绝对保留原始的 Markdown 格式！不要把 `[[概念]]` 转义成 `\\[\\[概念\\]\\]`！
-
-✅ 【完整闭环示例】：
-{
-  "new_concepts": ["Transformer"],
-  "actions": [
-    {
-      "type": "create",
-      "file": "concepts/transformer.md",
-      "title": "Transformer",
-      "tags": ["#architecture"],
-      "abstract": "一种处理时序数据的架构。",
-      "rationale": "新建 Transformer 概念"
-    },
-    {
-      "type": "append_link",
-      "file": "index.md",
-      "old_str": "## 核心算法\\n- [[YOLOv8]]",
-      "link_to": "[[Transformer]]",
-      "rationale": "追加到全局导航地图"
-    }
-  ]
-}
-"""
+        # 💡 加强版紧箍咒：彻底封杀字符串拼接和多余前缀
+        self.instructions = self.instructions = """你是一个专业的知识图谱构建工程师。
+        
+⚠️ 核心输出规则（不遵守将被判定为失败）：
+1. 【详实正文】：在新建页面时，`content` 必须是包含3-4个段落的深度笔记，绝对不能只有一句话！
+2. 【强制双链】：在 `abstract` 和 `content` 中，只要提到任何算法、模型、架构、术语或人名，**必须立即使用 [[ ]] 将其包裹！** - 正确：提出了一种基于 [[CNN]] 和 [[Dropout]] 的 [[目标检测]] 方法。
+   - 错误：提出了一种基于CNN和Dropout的目标检测方法。
+   - 目标：让你的正文里充满蓝色的 [[双向链接]]！
+3. 【插队原则】：若触发 `create` 动作，必须紧跟一个 `append_link` 动作，将新建的 `[[概念]]` 追加到 index.md！
+4. 【精准定位】：`old_str` 必须仅仅是 index.md 中的分类标题（例如 `## 核心算法`）！
+        ✅ 【完整闭环示例】：
+        {
+          "new_concepts": ["Transformer"],
+          "actions": [
+            {
+              "type": "create",
+              "file": "concepts/transformer.md",
+              "title": "Transformer",
+              "tags": ["#architecture"],
+              "abstract": "一种主要依赖于 [[Self-Attention]] 机制来处理时序数据的 [[深度学习]] 架构。",
+              "content": "[[Transformer]] 完全抛弃了传统的 [[RNN]] 和 [[CNN]] 结构。\n\n它的核心是由 [[Encoder]] 和 [[Decoder]] 组成，并在其中大量使用了 [[多头注意力机制]] (Multi-Head Attention)。这种设计使得模型能够并行计算，极大提升了训练速度，并在 [[自然语言处理]] ([[NLP]]) 领域取得了突破性进展。\n\n相比于早期的 [[LSTM]]，它在解决长距离依赖问题上表现更好。",
+              "rationale": "新建 Transformer 概念，包含丰富的双链和多段落解析"
+            },
+            {
+              "type": "append_link",
+              "file": "index.md",
+              "old_str": "## 核心算法", 
+              "link_to": "[[Transformer]]",
+              "rationale": "追加到全局导航地图"
+            }
+          ]
+        }
+        """
         self.agent = Agent(
             model=get_qwen_model(),
             instructions=[self.instructions],
