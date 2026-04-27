@@ -50,3 +50,23 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str) -> s
 """
     path.write_text(body, encoding="utf-8")
     return f"✅ 成功创建页面：{path.name}"
+
+
+def str_replace(file_name: str, old_str: str, new_str: str) -> str:
+    """极其精密的局部替换工具"""
+    path = _resolve(file_name)
+
+    if not path.exists():
+        return f"❌ 错误：想要编辑的文件不存在 ({file_name})"
+
+    content = path.read_text(encoding="utf-8")
+
+    # 防弹锁：必须精确匹配到 old_str 才能替换
+    if old_str not in content:
+        return f"❌ 错误：在 {file_name} 中找不到指定的旧文本，拒绝修改！\n寻找的文本: {repr(old_str)}"
+
+    # 只替换第一次出现的匹配项，防止误伤
+    new_content = content.replace(old_str, new_str, 1)
+    path.write_text(new_content, encoding="utf-8")
+
+    return f"✅ 成功修改文件：{file_name}"

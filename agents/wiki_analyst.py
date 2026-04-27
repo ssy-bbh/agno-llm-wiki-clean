@@ -1,27 +1,33 @@
 # 增加 field_validator 和 Any 的导入
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Any
+from typing import List, Any, Optional
 from agno.agent import Agent
 from core.llm_factory import get_qwen_model
 
-class Action(BaseModel):
-    type: str = Field(description="操作类型，目前固定为 'create'")
-    file: str = Field(description="文件路径，例如 concepts/vision-voice.md")
-    title: str = Field(description="页面的核心标题")
-    tags: List[str] = Field(description="标签列表，例如 ['#ai', '#yolov8']")
-    abstract: str = Field(description="用 2-3 句话总结这个概念的摘要")
-    rationale: str = Field(description="为什么要创建这个页面的理由")
 
-    # 💡 魔法拦截器：专门对付大模型把 List 写成 String 的偷懒行为
+class Action(BaseModel):
+    type: str = Field(description="操作类型：'create' 或 'edit'")
+    file: str = Field(description="文件路径，例如 concepts/yolov8.md")
+
+    # --- Create 专属字段（改为可选） ---
+    title: Optional[str] = Field(default=None, description="页面的核心标题")
+    tags: Optional[List[str]] = Field(default=None, description="标签列表")
+    abstract: Optional[str] = Field(default=None, description="摘要")
+
+    # --- Edit 专属字段（新增且可选） ---
+    old_str: Optional[str] = Field(default=None, description="需要被精确替换的旧文本原文")
+    content: Optional[str] = Field(default=None, description="替换后的新文本内容")
+
+    # --- 通用字段 ---
+    rationale: str = Field(description="操作理由")
+
     @field_validator('tags', mode='before')
     @classmethod
     def ensure_list(cls, v: Any):
         if isinstance(v, str):
-            # 如果是字符串 "#ai, #mobile-app"，自动按逗号切分并清理两边空格
             return [tag.strip() for tag in v.split(',') if tag.strip()]
         return v
 
-# 下面的 AnalysisReport 和 WikiAnalyst 保持不变...
 
 class AnalysisReport(BaseModel):
     new_concepts: List[str] = Field(description="提取出的核心概念名称列表")
@@ -30,32 +36,30 @@ class AnalysisReport(BaseModel):
 
 class WikiAnalyst:
     def __init__(self):
-        # 1. 带有明确 JSON 示例的指令（彻底封死大模型的想象力）
-        self.instructions = """你是一个严谨的知识分析师。你的任务是提取文本中的核心概念，并生成**创建 Wiki 页面**的指令。
+        # 💡 新增了【双向链接规则】和对应的示例
+        self.instructions = """你是一个严谨的知识分析师。你的任务是提取文本中的核心概念，并生成对 Wiki 页面的操作指令。
 
-⚠️ 严格警告：你必须输出合法的 JSON，并且结构必须与下面的【正确示例】一模一样！
-- `new_concepts` 只能是纯字符串列表，不能是字典！
-- `actions` 是建立文件的动作，绝不是描述软件功能！必须严格包含 type, file, title, tags, abstract, rationale 字段！
+⚠️ 严格警告：你必须且只能输出合法的 JSON，严格遵守 Pydantic 的 Schema！
+💡 核心规则【双向链接】：在你编写的 `abstract` 或 `content` 中，只要提到了其他重要的实体、算法或概念（比如你刚提取到 new_concepts 里的词），必须使用双向链接语法将其包裹，即 `[[概念名称]]`！
 
 ✅ 【正确示例】：
 {
-  "new_concepts": ["VisionVoice", "YOLOv8"],
+  "new_concepts": ["端侧AI", "YOLOv8"],
   "actions": [
     {
       "type": "create",
       "file": "concepts/vision-voice.md",
       "title": "VisionVoice",
-      "tags": ["#ai", "#mobile-app"],
-      "abstract": "一款基于端侧 AI 的实时目标识别与发音训练应用。",
-      "rationale": "文本提到了这个核心应用，需要为其建立独立概念页"
+      "tags": ["#mobile-app"],
+      "abstract": "一款基于 [[端侧AI]] 的实时目标识别应用，其底层视觉引擎使用了量化后的 [[YOLOv8]] 模型。",
+      "rationale": "创建项目主页，并关联核心技术"
     },
     {
-      "type": "create",
+      "type": "edit",
       "file": "concepts/yolov8.md",
-      "title": "YOLOv8",
-      "tags": ["#algorithm", "#object-detection"],
-      "abstract": "一种目标检测模型，在项目中被量化以适应端侧设备。",
-      "rationale": "提取到了核心底层算法"
+      "old_str": "## Details\\n（等待后续扩展）",
+      "content": "## Details\\n团队成功将 [[YOLOv8]] 部署到了 iPad 上，极大地增强了 [[端侧AI]] 的推理效率。",
+      "rationale": "补充了 YOLOv8 的端侧部署细节"
     }
   ]
 }
@@ -67,6 +71,8 @@ class WikiAnalyst:
             output_schema=AnalysisReport,
             stream=False
         )
+
+    # 下面的 analyze 方法保持不变...
 
     def analyze(self, raw_text: str) -> dict:
         print("\n[WikiAnalyst] 正在分析文本并强制校验 JSON 格式...")
