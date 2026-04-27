@@ -1,26 +1,24 @@
-# 增加 field_validator 和 Any 的导入
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Any, Optional
+from pathlib import Path
 from agno.agent import Agent
 from core.llm_factory import get_qwen_model
 
+WIKI_ROOT = Path(__file__).parent.parent / "data" / "wiki"
+
 
 class Action(BaseModel):
-    type: str = Field(description="操作类型：'create' 或 'edit'")
-    file: str = Field(description="文件路径，例如 concepts/yolov8.md")
-
-    # --- Create 专属字段（改为可选） ---
-    title: Optional[str] = Field(default=None, description="页面的核心标题")
-    tags: Optional[List[str]] = Field(default=None, description="标签列表")
-    abstract: Optional[str] = Field(default=None, description="摘要")
-
-    # --- Edit 专属字段（新增且可选） ---
-    old_str: Optional[str] = Field(default=None, description="需要被精确替换的旧文本原文")
-    content: Optional[str] = Field(default=None, description="替换后的新文本内容")
-
-    # --- 通用字段 ---
+    type: str = Field(description="操作类型：'create', 'edit', 或 'append_link'")
+    file: str = Field(description="文件路径")
+    title: Optional[str] = Field(default=None)
+    tags: Optional[List[str]] = Field(default=None)
+    abstract: Optional[str] = Field(default=None)
+    old_str: Optional[str] = Field(default=None)
+    content: Optional[str] = Field(default=None)
+    link_to: Optional[str] = Field(default=None)
     rationale: str = Field(description="操作理由")
 
+    # 💡 拦截器：坚决防住大模型把 tags 列表写成字符串的偷懒行为
     @field_validator('tags', mode='before')
     @classmethod
     def ensure_list(cls, v: Any):
@@ -30,41 +28,42 @@ class Action(BaseModel):
 
 
 class AnalysisReport(BaseModel):
-    new_concepts: List[str] = Field(description="提取出的核心概念名称列表")
-    actions: List[Action] = Field(description="执行动作列表")
+    new_concepts: List[str] = Field(description="提取出的概念")
+    actions: List[Action] = Field(description="动作列表")
 
 
 class WikiAnalyst:
     def __init__(self):
-        # 💡 新增了【双向链接规则】和对应的示例
-        self.instructions = """你是一个严谨的知识分析师。你的任务是提取文本中的核心概念，并生成对 Wiki 页面的操作指令。
+        # 💡 升级了紧箍咒：强调 tags 格式并严禁转义
+        self.instructions = """你是一个严谨的知识分析师。
 
-⚠️ 严格警告：你必须且只能输出合法的 JSON，严格遵守 Pydantic 的 Schema！
-💡 核心规则【双向链接】：在你编写的 `abstract` 或 `content` 中，只要提到了其他重要的实体、算法或概念（比如你刚提取到 new_concepts 里的词），必须使用双向链接语法将其包裹，即 `[[概念名称]]`！
+⚠️ 严格警告与核心决策规则：
+1. 【插队更新】：如果你决定新建概念（create），必须紧接着输出 `append_link` 动作，将其双向链接追加到 index.md 的对应分类下！
+2. 【严格列表】：`tags` 字段必须是 JSON 数组（如 `["#tag"]`），绝不能是字符串！
+3. 【禁止转义】：在输出 `old_str` 和 `link_to` 时，绝对保留原始的 Markdown 格式！不要把 `[[概念]]` 转义成 `\\[\\[概念\\]\\]`！
 
-✅ 【正确示例】：
+✅ 【完整闭环示例】：
 {
-  "new_concepts": ["端侧AI", "YOLOv8"],
+  "new_concepts": ["Transformer"],
   "actions": [
     {
       "type": "create",
-      "file": "concepts/vision-voice.md",
-      "title": "VisionVoice",
-      "tags": ["#mobile-app"],
-      "abstract": "一款基于 [[端侧AI]] 的实时目标识别应用，其底层视觉引擎使用了量化后的 [[YOLOv8]] 模型。",
-      "rationale": "创建项目主页，并关联核心技术"
+      "file": "concepts/transformer.md",
+      "title": "Transformer",
+      "tags": ["#architecture"],
+      "abstract": "一种处理时序数据的架构。",
+      "rationale": "新建 Transformer 概念"
     },
     {
-      "type": "edit",
-      "file": "concepts/yolov8.md",
-      "old_str": "## Details\\n（等待后续扩展）",
-      "content": "## Details\\n团队成功将 [[YOLOv8]] 部署到了 iPad 上，极大地增强了 [[端侧AI]] 的推理效率。",
-      "rationale": "补充了 YOLOv8 的端侧部署细节"
+      "type": "append_link",
+      "file": "index.md",
+      "old_str": "## 核心算法\\n- [[YOLOv8]]",
+      "link_to": "[[Transformer]]",
+      "rationale": "追加到全局导航地图"
     }
   ]
 }
 """
-
         self.agent = Agent(
             model=get_qwen_model(),
             instructions=[self.instructions],
@@ -72,21 +71,26 @@ class WikiAnalyst:
             stream=False
         )
 
-    # 下面的 analyze 方法保持不变...
-
     def analyze(self, raw_text: str) -> dict:
-        print("\n[WikiAnalyst] 正在分析文本并强制校验 JSON 格式...")
+        print("\n[WikiAnalyst] 正在读取全局地图并分析文本...")
 
-        # 2. 用户提示词极其精简，不给大模型任何发散的机会
-        user_prompt = f"请分析以下来源材料，并严格填充你的 JSON 模板：\n{raw_text}"
+        index_path = WIKI_ROOT / "index.md"
+        index_content = index_path.read_text(encoding="utf-8") if index_path.exists() else "（当前知识库为空）"
+
+        user_prompt = f"""
+【全局导航地图 (index.md)】:
+{index_content}
+
+---
+【新摄入的资料】:
+{raw_text}
+
+请严格按 JSON 格式输出，不要转义 Markdown 方括号。
+"""
         response = self.agent.run(user_prompt)
 
-        # 3. 增加类型保护：如果 Pydantic 依然解析失败，把大模型的原话打出来看看
         if isinstance(response.content, str):
-            print("\n🚨 Pydantic 解析失败！大模型返回的原始字符串是：")
-            print(response.content)
+            print("\n🚨 Pydantic 解析失败！原始字符串是：\n", response.content)
             raise ValueError("大模型未返回合法的 Pydantic 对象。")
 
-        # 走到这里说明 100% 成功了
-        report_obj = response.content
-        return report_obj.model_dump()
+        return response.content.model_dump()

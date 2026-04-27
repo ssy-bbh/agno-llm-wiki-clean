@@ -36,7 +36,36 @@ class WikiWriter:
                     new_str=new_content
                 )
 
+                # 💡 优雅的新增逻辑：复用手术刀实现精准插队
+
+            elif act_type == "append_link":
+
+                old_str = action.get("old_str", "").replace("\\n", "\n")
+
+                link_to = action.get("link_to", "")
+
+                # 巧妙拼接：把新链接追加到旧字符串的下一行
+
+                new_content = f"{old_str}\n- {link_to}"
+
+                res = str_replace(
+
+                    file_name=file_name,
+
+                    old_str=old_str,
+
+                    new_str=new_content
+
+                )
+
+                print(f" -> [导航地图更新] {res}")
+
+                results.append(res)
+
+
             else:
+
                 print(f" -> ⚠️ 暂未实现的操作类型: {act_type}")
 
         return results
+
