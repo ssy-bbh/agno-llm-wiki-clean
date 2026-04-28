@@ -7,7 +7,7 @@ from agno.models.openai.like import OpenAILike
 load_dotenv()
 
 
-def get_qwen_model(model_id="qwen-max"):
+def get_qwen_model(model_id="qwen3.6-27b"):
     api_key = os.getenv("QWEN_API_KEY")
     if not api_key:
         raise ValueError("⚠️ 未找到 QWEN_API_KEY，请检查 .env 文件！")
@@ -16,6 +16,7 @@ def get_qwen_model(model_id="qwen-max"):
         id=model_id,
         api_key=api_key,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        extra_body={"enable_thinking": False},
         # 核心抗篡改护城河
         role_map={"system": "system", "user": "user", "assistant": "assistant", "tool": "tool"}
     )

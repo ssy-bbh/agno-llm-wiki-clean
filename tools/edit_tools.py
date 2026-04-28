@@ -6,22 +6,30 @@ from pathlib import Path
 # 锁定操作根目录，绝对不准越界
 WIKI_ROOT = Path(__file__).parent.parent / "data" / "wiki"
 
+import os
+from pathlib import Path
+
 
 def _resolve(file_name: str) -> Path:
-    """将物理路径严格路由到对应的镜像目录，并剥夺大模型的路径控制权"""
-    # 1. 从环境变量获取当前激活的资料库和子目录
+    """以父文件夹（分类）为中心的统筹路由"""
     kb_name = os.environ.get("ACTIVE_KB", "default")
     sub_dir = os.environ.get("ACTIVE_SUBDIR", "")
 
-    # 2. 拼装出完美的镜像物理路径：data/wiki/资料库名/子目录结构/
+    # 1. 核心变化：直接把工作区定在“父文件夹”级别，不管具体是哪篇 PDF
     base_dir = Path("data/wiki") / kb_name / sub_dir
-    base_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. 终极夺权：不管大模型在 JSON 里写的是 file: "concepts/YOLO.md" 还是 "核心算法/YOLO.md"
-    # 我们只用 pure_name 提取纯文件名 "YOLO.md"，强行写入我们算好的镜像目录里！
-    pure_name = Path(file_name).name
+    # 2. 智能路由
+    if Path(file_name).name.lower() == "index.md":
+        # 强制把 index.md 放在父文件夹的根目录，作为唯一总索引
+        final_path = base_dir / "index.md"
+    else:
+        # 大模型输出的 concepts/xxx.md 或 datasets/xxx.md 直接拼接在父文件夹后面
+        final_path = base_dir / file_name
 
-    return base_dir / pure_name
+    # 3. 自动创建父级目录（比如自动建好 concepts/）
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    return final_path
 
 
 # 💡 注意参数里多了 content

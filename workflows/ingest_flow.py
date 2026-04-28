@@ -50,8 +50,8 @@ class IngestFlow:
                 print(f"✂️ 文本共 {len(raw_text)} 字符，将进行一次性全局推理。")
             else:
                 print("💻 [架构路由] 启用本地模型，激活滑动窗口切片策略。")
-                chunks = chunk_text(raw_text, chunk_size=4000, overlap=400)
-                print(f"✂️ 切分为 {len(chunks)} 个知识块 (Chunk Size: 4000)。")
+                chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
+                print(f"✂️ 切分为 {len(chunks)} 个知识块 (Chunk Size: 1500)。")
             # ========================================================
 
         else:
@@ -65,7 +65,7 @@ class IngestFlow:
         total_chunks = len(chunks)
         completed_count = 0
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {executor.submit(self.process_single_chunk, chunk, i + 1): i for i, chunk in enumerate(chunks)}
 
             # 💡 兜底机制：加装“超时熔断器”
@@ -156,6 +156,8 @@ if __name__ == "__main__":
     # 7. 智能判断与递归路由执行
     if input_target.is_file():
         os.environ["ACTIVE_SUBDIR"] = ""
+        # 💡 新增：把单文件的纯名字作为容器名
+        os.environ["ACTIVE_DOC_NAME"] = input_target.stem
         flow.run(str(input_target))
 
     elif input_target.is_dir():
@@ -170,9 +172,14 @@ if __name__ == "__main__":
                 rel_dir = str(file_path.parent.relative_to(input_target))
 
             os.environ["ACTIVE_SUBDIR"] = rel_dir
+            # 💡 新增：把当前遍历到的 PDF 名字作为容器名注入！
+            os.environ["ACTIVE_DOC_NAME"] = file_path.stem
 
             print("\n" + "-" * 50)
             print(f"🚀 [批量进度 {idx}/{len(files)}] 正在解析: {file_path.name}")
-            print(f"📁 物理落库路径: data/wiki/{kb_name}/{rel_dir if rel_dir else '根目录'}")
+
+            # 💡 优化了日志输出，让你提前看到极其舒适的目录结构
+            display_dir = f"{kb_name}/{rel_dir}/{file_path.stem}" if rel_dir else f"{kb_name}/{file_path.stem}"
+            print(f"📁 物理落库路径: data/wiki/{display_dir}/")
 
             flow.run(str(file_path))

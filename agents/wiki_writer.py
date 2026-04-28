@@ -51,6 +51,8 @@ class WikiWriter:
 
 
 
+
+
             elif act_type == "append_link":
 
                 old_str = action.get("old_str")
@@ -65,13 +67,11 @@ class WikiWriter:
 
                     target_path = _resolve(file_name)
 
-                    # 💡 1. 暴力清洗：把大模型吐出的乱七八糟的字符串，提取成干净的单链数组
+                    # 1. 暴力清洗
 
                     links = re.findall(r'\[\[.*?\]\]', raw_link_to)
 
                     if not links:
-
-                        # 如果大模型连括号都忘了打，我们强行帮它套上
 
                         clean_name = raw_link_to.replace("[", "").replace("]", "").replace('"', "").replace("'",
                                                                                                             "").strip()
@@ -79,51 +79,59 @@ class WikiWriter:
                         if clean_name:
                             links = [f"[[{clean_name}]]"]
 
-                    if target_path.exists():
+                    # 💡 2. 终极修复：无中生有大魔法！(如果文件不存在，自动建好并写标题)
+
+                    if not target_path.exists():
+                        print(f"  -> 🏗️ 自动初始化缺失的导航文件: {target_path.name}")
+
+                        folder_name = target_path.parent.name if target_path.parent.name else "全局"
+
+                        target_path.write_text(f"# {folder_name} 知识导航\n\n{old_str}\n", encoding="utf-8")
+
+                    # 💡 补漏：如果文件存在，但是没有大模型想要的分类标题
+
+                    content = target_path.read_text(encoding="utf-8")
+
+                    if old_str not in content:
+                        content += f"\n\n{old_str}\n"
+
+                        target_path.write_text(content, encoding="utf-8")
 
                         content = target_path.read_text(encoding="utf-8")
 
-                        # 💡 2. 遍历提取出的每一个独立链接
+                    # 3. 遍历提取出的每一个独立链接
 
-                        for single_link in links:
+                    for single_link in links:
 
-                            # 将准备追加的链接“暴力去噪”（去空格、去符号、转小写）
+                        clean_target = single_link.lower().replace("-", "").replace("_", "").replace(" ", "")
 
-                            clean_target = single_link.lower().replace("-", "").replace("_", "").replace(" ", "")
+                        existing_links = re.findall(r'\[\[(.*?)\]\]', content)
 
-                            # 获取地图里已经存在的所有链接
+                        is_duplicate = False
 
-                            existing_links = re.findall(r'\[\[(.*?)\]\]', content)
+                        for ex_link in existing_links:
 
-                            is_duplicate = False
+                            clean_ex = f"[[{ex_link}]]".lower().replace("-", "").replace("_", "").replace(" ", "")
 
-                            for ex_link in existing_links:
+                            if clean_target == clean_ex:
+                                print(f"  -> ⏭️ 拦截相似：导航地图已存在 [[{ex_link}]]，跳过追加。")
 
-                                clean_ex = f"[[{ex_link}]]".lower().replace("-", "").replace("_", "").replace(" ", "")
+                                is_duplicate = True
 
-                                # 💡 模糊相似度拦截！如果发现存在 FastR-CNN，就拒绝追加 Fast R-CNN
+                                break
 
-                                if clean_target == clean_ex:
-                                    print(f"  -> ⏭️ 拦截相似：导航地图已存在 [[{ex_link}]]，跳过追加 {single_link}。")
+                        if is_duplicate:
+                            continue
 
-                                    is_duplicate = True
+                        # 4. 安全追加
 
-                                    break
+                        new_str = f"{old_str}\n- {single_link}"
 
-                            if is_duplicate:
-                                continue
+                        res = str_replace(file_name, old_str, new_str)
 
-                            # 💡 3. 安全追加：每次只老老实实追加一行
+                        print(f"  -> [导航地图更新] 追加 {single_link} 成功")
 
-                            new_str = f"{old_str}\n- {single_link}"
-
-                            res = str_replace(file_name, old_str, new_str)
-
-                            print(f"  -> [导航地图更新] 追加 {single_link} 成功")
-
-                            # 重要：更新 old_str，这样如果这批有多个链接，它们会乖乖排在下面
-
-                            old_str = new_str
+                        old_str = new_str
             else:
 
                 print(f" -> ⚠️ 暂未实现的操作类型: {act_type}")
