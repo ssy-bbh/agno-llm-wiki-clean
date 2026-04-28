@@ -1,18 +1,27 @@
 """
 edit_tools.py — 局部精准编辑工具 (纯手写安全版)
 """
+import os
 from pathlib import Path
-
 # 锁定操作根目录，绝对不准越界
 WIKI_ROOT = Path(__file__).parent.parent / "data" / "wiki"
 
 
-def _resolve(path: str) -> Path:
-    """安全寻址：确保所有文件读写都被死死圈在 data/wiki/ 目录下"""
-    p = (WIKI_ROOT / path.lstrip("/")).resolve()
-    if not str(p).startswith(str(WIKI_ROOT.resolve())):
-        raise PermissionError(f"🚨 安全拦截：试图越界访问目录 -> {path}")
-    return p
+def _resolve(file_name: str) -> Path:
+    """将物理路径严格路由到对应的镜像目录，并剥夺大模型的路径控制权"""
+    # 1. 从环境变量获取当前激活的资料库和子目录
+    kb_name = os.environ.get("ACTIVE_KB", "default")
+    sub_dir = os.environ.get("ACTIVE_SUBDIR", "")
+
+    # 2. 拼装出完美的镜像物理路径：data/wiki/资料库名/子目录结构/
+    base_dir = Path("data/wiki") / kb_name / sub_dir
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # 3. 终极夺权：不管大模型在 JSON 里写的是 file: "concepts/YOLO.md" 还是 "核心算法/YOLO.md"
+    # 我们只用 pure_name 提取纯文件名 "YOLO.md"，强行写入我们算好的镜像目录里！
+    pure_name = Path(file_name).name
+
+    return base_dir / pure_name
 
 
 # 💡 注意参数里多了 content
@@ -55,7 +64,7 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str, cont
     details_text = content if content else "（等待后续扩展）"
 
     # 强制套用标准模板
-    body = f"""# {title}
+    body = f"""# {title}          和
 
 > **Tags:** {tag_str}
 > **Created:** {date_str}

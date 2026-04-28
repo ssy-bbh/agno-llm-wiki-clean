@@ -100,12 +100,79 @@ class IngestFlow:
 
 
 if __name__ == "__main__":
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import sys
+    import os
+    from pathlib import Path
 
-    if len(sys.argv) > 1:
-        text_to_ingest = " ".join(sys.argv[1:])
-    else:
-        text_to_ingest = "今天了解到一种叫 RAG 的技术..."
+    raw_dir = Path("data/raw")
 
+    # 1. 安全检查：确保基础目录存在
+    if not raw_dir.exists():
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        print(f"⚠️ 找不到 {raw_dir} 目录，已为您自动创建。请先将数据放入该目录！")
+        sys.exit(0)
+
+    # 2. 自动扫描 data/raw 下的所有文件夹和独立的 PDF 文件
+    items = [p for p in raw_dir.iterdir() if p.is_dir() or p.suffix.lower() == '.pdf']
+
+    if not items:
+        print(f"📭 {raw_dir} 目录下空空如也，请先放入包含论文或文档的文件夹。")
+        sys.exit(0)
+
+    # 3. 渲染 CLI 交互式菜单
+    print("\n" + "=" * 50)
+    print("🤖 欢迎使用 LLM-Wiki 自动化摄入系统")
+    print("=" * 50)
+    print("请选择要处理的知识源：\n")
+
+    for i, item in enumerate(items, 1):
+        icon = "📁" if item.is_dir() else "📄"
+        print(f"  [{i}] {icon} {item.name}")
+    print("\n" + "=" * 50)
+
+    # 4. 获取用户输入
+    try:
+        choice = input("👉 请输入对应编号 (按 Ctrl+C 退出): ").strip()
+        choice_idx = int(choice) - 1
+        if choice_idx < 0 or choice_idx >= len(items):
+            raise ValueError
+    except (ValueError, IndexError):
+        print("❌ 输入无效，请输入正确的数字编号。")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n👋 已取消操作。")
+        sys.exit(0)
+
+    # 5. 绑定目标并提取知识库名称
+    input_target = items[choice_idx]
+    kb_name = input_target.stem  # 直接用选中的文件夹/文件名作为隔离区名称
+
+    os.environ["ACTIVE_KB"] = kb_name
+    print(f"\n🌐 [系统路由] 自动提取并激活知识隔离区: {kb_name}")
+
+    # 6. 初始化并执行流水线
     flow = IngestFlow()
-    flow.run(text_to_ingest)
+
+    # 7. 智能判断与递归路由执行
+    if input_target.is_file():
+        os.environ["ACTIVE_SUBDIR"] = ""
+        flow.run(str(input_target))
+
+    elif input_target.is_dir():
+        files = list(input_target.rglob("*.pdf"))
+        print(f"📂 开始深度扫描 [{input_target.name}]，共发现 {len(files)} 个文档。")
+
+        for idx, file_path in enumerate(files, 1):
+            # 计算相对子目录，用于给底层的 _resolve 提供路径
+            if file_path.parent == input_target:
+                rel_dir = ""
+            else:
+                rel_dir = str(file_path.parent.relative_to(input_target))
+
+            os.environ["ACTIVE_SUBDIR"] = rel_dir
+
+            print("\n" + "-" * 50)
+            print(f"🚀 [批量进度 {idx}/{len(files)}] 正在解析: {file_path.name}")
+            print(f"📁 物理落库路径: data/wiki/{kb_name}/{rel_dir if rel_dir else '根目录'}")
+
+            flow.run(str(file_path))

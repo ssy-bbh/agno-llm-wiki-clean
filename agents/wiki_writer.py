@@ -40,7 +40,6 @@ class WikiWriter:
 
             # 💡 新增的 edit 分支
             elif act_type == "edit":
-                # 💡 魔法修复：将 JSON 字符串里的字面量 "\\n" 还原为真正的换行符
                 old_str = action.get("old_str", "").replace("\\n", "\n")
                 new_content = action.get("content", "").replace("\\n", "\n")
 
@@ -50,7 +49,6 @@ class WikiWriter:
                     new_str=new_content
                 )
 
-                # 💡 优雅的新增逻辑：复用手术刀实现精准插队
 
 
             elif act_type == "append_link":
