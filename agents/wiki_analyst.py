@@ -1,71 +1,27 @@
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Any, Optional
-from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import List
 from agno.agent import Agent
 from core.llm_factory import get_qwen_model
 
-WIKI_ROOT = Path(__file__).parent.parent / "data" / "wiki"
 
-
-class Action(BaseModel):
-    type: str = Field(description="操作类型：'create', 'edit', 或 'append_link'")
-    file: str = Field(description="文件路径")
-    title: Optional[str] = Field(default=None)
-    tags: Optional[List[str]] = Field(default=None)
-    abstract: Optional[str] = Field(default=None)
-    old_str: Optional[str] = Field(default=None)
-    content: Optional[str] = Field(default=None)
-    link_to: Optional[str] = Field(default=None)
-    rationale: str = Field(description="操作理由")
-
-    # 💡 拦截器：坚决防住大模型把 tags 列表写成字符串的偷懒行为
-    @field_validator('tags', mode='before')
-    @classmethod
-    def ensure_list(cls, v: Any):
-        if isinstance(v, str):
-            return [tag.strip() for tag in v.split(',') if tag.strip()]
-        return v
-
-
+# 💡 变化 1：把 Action 类彻底删除了！它不配拥有这个权力。
+# 💡 变化 2：AnalysisReport 里去掉了 actions，加上了一个 summary 备用。
 class AnalysisReport(BaseModel):
-    new_concepts: List[str] = Field(description="提取出的概念")
-    actions: List[Action] = Field(description="动作列表")
+    new_concepts: List[str] = Field(description="从新资料中提取出的核心概念列表（如算法、模型、架构、术语等）")
+    summary: str = Field(description="新资料的核心内容摘要（约50-100字），用于后续提供上下文")
 
 
 class WikiAnalyst:
     def __init__(self):
-        # 💡 加强版紧箍咒：彻底封杀字符串拼接和多余前缀
-        self.instructions = self.instructions = """你是一个专业的知识图谱构建工程师。
-        
-⚠️ 核心输出规则（不遵守将被判定为失败）：
-1. 【详实正文】：在新建页面时，`content` 必须是包含3-4个段落的深度笔记，绝对不能只有一句话！
-2. 【强制双链】：在 `abstract` 和 `content` 中，只要提到任何算法、模型、架构、术语或人名，**必须立即使用 [[ ]] 将其包裹！** - 正确：提出了一种基于 [[CNN]] 和 [[Dropout]] 的 [[目标检测]] 方法。
-   - 错误：提出了一种基于CNN和Dropout的目标检测方法。
-   - 目标：让你的正文里充满蓝色的 [[双向链接]]！
-3. 【插队原则】：若触发 `create` 动作，必须紧跟一个 `append_link` 动作，将新建的 `[[概念]]` 追加到 index.md！
-4. 【精准定位】：`old_str` 必须仅仅是 index.md 中的分类标题（例如 `## 核心算法`）！
-        ✅ 【完整闭环示例】：
-        {
-          "new_concepts": ["Transformer"],
-          "actions": [
-            {
-              "type": "create",
-              "file": "concepts/transformer.md",
-              "title": "Transformer",
-              "tags": ["#architecture"],
-              "abstract": "一种主要依赖于 [[Self-Attention]] 机制来处理时序数据的 [[深度学习]] 架构。",
-              "content": "[[Transformer]] 完全抛弃了传统的 [[RNN]] 和 [[CNN]] 结构。\n\n它的核心是由 [[Encoder]] 和 [[Decoder]] 组成，并在其中大量使用了 [[多头注意力机制]] (Multi-Head Attention)。这种设计使得模型能够并行计算，极大提升了训练速度，并在 [[自然语言处理]] ([[NLP]]) 领域取得了突破性进展。\n\n相比于早期的 [[LSTM]]，它在解决长距离依赖问题上表现更好。",
-              "rationale": "新建 Transformer 概念，包含丰富的双链和多段落解析"
-            },
-            {
-              "type": "append_link",
-              "file": "index.md",
-              "old_str": "## 核心算法", 
-              "link_to": "[[Transformer]]",
-              "rationale": "追加到全局导航地图"
-            }
-          ]
-        }
+        # 💡 变化 3：Prompt 彻底大换血，告诉它：你只是个看材料的，别管怎么存！
+        self.instructions = """你是一个专业的知识图谱情报侦察兵。
+
+        你的【唯一任务】是阅读新摄入的资料，提取其中的核心技术概念，并写一段简短的内容摘要。
+        你绝对不要关心这些知识如何写入文件，也绝对不要生成任何操作动作。
+
+        输出要求：
+        1. new_concepts: 提取出资料中出现的所有重要技术概念、算法、模型、专有名词。
+        2. summary: 用一两句话精准概括这段资料的核心信息。
         """
         self.agent = Agent(
             model=get_qwen_model(),
@@ -75,21 +31,15 @@ class WikiAnalyst:
         )
 
     def analyze(self, raw_text: str) -> dict:
-        print("\n[WikiAnalyst] 正在读取全局地图并分析文本...")
-
-        index_path = WIKI_ROOT / "index.md"
-        index_content = index_path.read_text(encoding="utf-8") if index_path.exists() else "（当前知识库为空）"
+        # 💡 变化 4：它不需要再读取本地 index.md 了，减轻它的认知负担。
+        print("\n[WikiAnalyst] 🕵️‍♂️ 侦察兵正在阅读新资料并提取概念...")
 
         user_prompt = f"""
-【全局导航地图 (index.md)】:
-{index_content}
+        【新摄入的资料】:
+        {raw_text}
 
----
-【新摄入的资料】:
-{raw_text}
-
-请严格按 JSON 格式输出，不要转义 Markdown 方括号。
-"""
+        请提取核心概念并生成摘要。
+        """
         response = self.agent.run(user_prompt)
 
         if isinstance(response.content, str):

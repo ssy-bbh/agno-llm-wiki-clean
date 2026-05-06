@@ -1,125 +1,179 @@
 import json
 import sys
 import os
+import re
+import threading
 from pathlib import Path
+from collections import defaultdict
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from concurrent.futures import TimeoutError
+
 from agents.wiki_analyst import WikiAnalyst
+from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
+from tools.edit_tools import _resolve  # 使用原生路由
 
 
 class IngestFlow:
     """
-    知识摄入流水线
-    严格执行 Two-Step CoT（两步思维链）：先分析，后写入。
+    知识摄入流水线 (多脑协作 · 同义词归一 · 细粒度锁并发版)
     """
 
     def __init__(self):
         self.analyst = WikiAnalyst()
+        self.editor = WikiEditor()
         self.writer = WikiWriter()
 
-    # 👇 就是这里！刚才报错就是因为它没被正确放进类里面
+        # 💡 细粒度锁池：为每一个概念动态分配一把锁，互不干扰
+        self.concept_locks = defaultdict(threading.Lock)
+
+    def _normalize_name(self, text: str) -> str:
+        """纯净器：移除所有非字母、数字、中文的字符，转小写"""
+        if not text:
+            return ""
+        return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
+
+    def _find_existing_file(self, concept: str) -> Path:
+        """同义词嗅探器：在本地寻找是否已有相似概念的文件"""
+        concepts_dir = _resolve("concepts")
+        if not concepts_dir.exists():
+            return None
+
+        norm_c = self._normalize_name(concept)
+        if not norm_c:
+            return None
+
+        for f in concepts_dir.glob("*.md"):
+            norm_f = self._normalize_name(f.stem)
+
+            # 1. 核心去重：完全一致
+            if norm_c == norm_f:
+                return f
+            # 2. 同义词判定：互相包含且长度大于2（如"注意力机制" 包含 "注意力"）
+            if len(norm_c) > 2 and len(norm_f) > 2:
+                if norm_c in norm_f or norm_f in norm_c:
+                    return f
+
+        return None
+
+    def _fetch_local_context(self, concepts: list) -> str:
+        """档案管理员：提取上下文并告诉主编真实的文件名"""
+        context_str = "\n"
+
+        index_path = _resolve("index.md")
+        if index_path.exists():
+            context_str += f"=== index.md (导航地图) ===\n{index_path.read_text(encoding='utf-8')}\n\n"
+        else:
+            context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
+
+        for concept in concepts:
+            real_file = self._find_existing_file(concept)
+
+            if real_file:
+                # 💡 如果查到了同义词文件，强制让主编使用这个已存在的名字！
+                content = real_file.read_text(encoding="utf-8")
+                rel_path = f"concepts/{real_file.name}"
+                context_str += f"=== {rel_path} (本地已存在，匹配到概念 [{concept}]) ===\n{content}\n\n"
+            else:
+                safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+                context_str += f"=== concepts/{safe_name}.md ===\n(全新概念，文件暂不存在)\n\n"
+
+        return context_str
+
     def process_single_chunk(self, chunk, chunk_id):
-        print(f"  [线程 {chunk_id}] 🧠 开始分析...")
         try:
-            report = self.analyst.analyze(chunk)
-            if not report.get("actions"):
+            print(f"  [线程 {chunk_id}] 🕵️‍♂️ 侦察兵开始提取概念...")
+            analysis_result = self.analyst.analyze(chunk)
+            new_concepts = analysis_result.get("new_concepts", [])
+            summary = analysis_result.get("summary", "")
+
+            if not new_concepts:
                 return chunk_id, None, "没有提取到核心概念"
+
+            # 💡 锁的死锁防御机制：对概念归一化后排序，按顺序加锁，绝对不会死锁
+            normalized_concepts = list(set([self._normalize_name(c) for c in new_concepts if c]))
+            normalized_concepts.sort()
+
+            # 💡 启动细粒度并发锁：只有当前 Chunk 涉及的概念才会被锁住！
+            with ExitStack() as stack:
+                for norm_c in normalized_concepts:
+                    stack.enter_context(self.concept_locks[norm_c])
+
+                print(f"  [线程 {chunk_id}] 🔒 已锁定概念 {new_concepts}，档案员查档中...")
+                existing_context = self._fetch_local_context(new_concepts)
+
+                print(f"  [线程 {chunk_id}] 🧠 主编接手，开始比对生成修改指令...")
+                report = self.editor.merge(
+                    raw_text=chunk,
+                    analyst_summary=summary,
+                    existing_context=existing_context
+                )
+
+                if not report.get("actions"):
+                    return chunk_id, None, "主编裁定无增量信息，无需修改"
+
+                # 💡 必须在释放锁之前完成物理写盘，保障后续线程读到的是最新数据！
+                self.writer.execute(report)
+
             return chunk_id, report, "成功"
         except Exception as e:
             return chunk_id, None, f"报错: {str(e)}"
 
     def run(self, input_source: str):
         print("\n" + "=" * 60)
-        print("🚀 [IngestFlow] 启动知识摄入流水线 (多线程提速版)...")
+        print("🚀 [IngestFlow] 启动知识摄入流水线 (多脑协作·细粒度并发锁版)...")
 
         path = Path(input_source)
         if path.exists() and path.is_file():
             print(f"📄 检测到文件：{path.name}")
             raw_text = extract_text(str(path))
-
-            # ========================================================
-            # 💡 动态上下文路由策略
-            # ========================================================
-            USE_CLOUD_LONG_CONTEXT = False
-
-            if USE_CLOUD_LONG_CONTEXT:
-                print("☁️ [架构路由] 开启全量沉浸式阅读 (1M Context)！")
-                chunks = [raw_text]
-                print(f"✂️ 文本共 {len(raw_text)} 字符，将进行一次性全局推理。")
-            else:
-                print("💻 [架构路由] 启用本地模型，激活滑动窗口切片策略。")
-                chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
-                print(f"✂️ 切分为 {len(chunks)} 个知识块 (Chunk Size: 1500)。")
-            # ========================================================
-
+            print("💻 [架构路由] 启用滑动窗口切片策略。")
+            chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
+            print(f"✂️ 切分为 {len(chunks)} 个知识块 (Chunk Size: 1500)。")
         else:
             print("📝 检测到短文本输入。")
             chunks = [input_source]
 
         print("=" * 60)
-        print("⚡ 启动并发处理引擎...")
+        print("⚡ 启动高稳定并发处理引擎...")
 
-        reports_to_write = []
         total_chunks = len(chunks)
         completed_count = 0
 
-        with ThreadPoolExecutor(max_workers=12) as executor:  # 线程数根据你的API额度调整
+        with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {executor.submit(self.process_single_chunk, chunk, i + 1): i for i, chunk in enumerate(chunks)}
 
-            # 💡 拆除全局 180s 熔断炸弹！只要有耐心，几千个块也能安稳跑完
             for future in as_completed(futures):
                 completed_count += 1
                 try:
                     chunk_id, report, status = future.result()
-
                     if report:
-                        print(f"✅ [{completed_count}/{total_chunks}] 线程 {chunk_id} 分析完成，⚡ 立即落盘！")
-                        # 边算边写，瞬间落盘，不用等所有线程结束！
-                        self.writer.execute(report)
+                        print(f"\n✅ [{completed_count}/{total_chunks}] 线程 {chunk_id} 完全落盘闭环！")
                     else:
-                        print(f"⏭️ [{completed_count}/{total_chunks}] 线程 {chunk_id} 被跳过：{status}")
-
+                        print(f"\n⏭️ [{completed_count}/{total_chunks}] 线程 {chunk_id} 跳过：{status}")
                 except Exception as e:
-                    # 如果某个底层线程真的网络崩溃了，只丢弃那一个，不影响全局！
-                    print(f"❌ [{completed_count}/{total_chunks}] 某个线程出现致命网络错误: {e}")
+                    print(f"\n❌ [{completed_count}/{total_chunks}] 致命错误: {e}")
 
         print("\n" + "=" * 60)
-        print(f"✍️ 汇总完毕，准备执行物理写盘 (共 {len(reports_to_write)} 项任务)...")
-
-        # 按照原来的顺序对结果进行排序，保证写入顺序的稳定性
-        reports_to_write.sort(key=lambda x: x[0])
-
-        for chunk_id, report in reports_to_write:
-            self.writer.execute(report)
-
-        print("\n" + "=" * 60)
-        print("✅ [IngestFlow] 极速摄入完毕，完美收工！")
+        print("✅ [IngestFlow] 极速摄入与融合完毕，完美收工！")
         print("=" * 60)
 
 
 if __name__ == "__main__":
-    import sys
-    import os
-    from pathlib import Path
-
     raw_dir = Path("data/raw")
 
-    # 1. 安全检查：确保基础目录存在
     if not raw_dir.exists():
         raw_dir.mkdir(parents=True, exist_ok=True)
         print(f"⚠️ 找不到 {raw_dir} 目录，已为您自动创建。请先将数据放入该目录！")
         sys.exit(0)
 
-    # 2. 自动扫描 data/raw 下的所有文件夹和独立的 PDF 文件
     items = [p for p in raw_dir.iterdir() if p.is_dir() or p.suffix.lower() == '.pdf']
 
     if not items:
         print(f"📭 {raw_dir} 目录下空空如也，请先放入包含论文或文档的文件夹。")
         sys.exit(0)
 
-    # 3. 渲染 CLI 交互式菜单
     print("\n" + "=" * 50)
     print("🤖 欢迎使用 LLM-Wiki 自动化摄入系统")
     print("=" * 50)
@@ -130,7 +184,6 @@ if __name__ == "__main__":
         print(f"  [{i}] {icon} {item.name}")
     print("\n" + "=" * 50)
 
-    # 4. 获取用户输入
     try:
         choice = input("👉 请输入对应编号 (按 Ctrl+C 退出): ").strip()
         choice_idx = int(choice) - 1
@@ -143,20 +196,16 @@ if __name__ == "__main__":
         print("\n👋 已取消操作。")
         sys.exit(0)
 
-    # 5. 绑定目标并提取知识库名称
     input_target = items[choice_idx]
-    kb_name = input_target.stem  # 直接用选中的文件夹/文件名作为隔离区名称
+    kb_name = input_target.stem
 
     os.environ["ACTIVE_KB"] = kb_name
     print(f"\n🌐 [系统路由] 自动提取并激活知识隔离区: {kb_name}")
 
-    # 6. 初始化并执行流水线
     flow = IngestFlow()
 
-    # 7. 智能判断与递归路由执行
     if input_target.is_file():
         os.environ["ACTIVE_SUBDIR"] = ""
-        # 💡 新增：把单文件的纯名字作为容器名
         os.environ["ACTIVE_DOC_NAME"] = input_target.stem
         flow.run(str(input_target))
 
@@ -165,21 +214,16 @@ if __name__ == "__main__":
         print(f"📂 开始深度扫描 [{input_target.name}]，共发现 {len(files)} 个文档。")
 
         for idx, file_path in enumerate(files, 1):
-            # 计算相对子目录，用于给底层的 _resolve 提供路径
             if file_path.parent == input_target:
                 rel_dir = ""
             else:
                 rel_dir = str(file_path.parent.relative_to(input_target))
 
             os.environ["ACTIVE_SUBDIR"] = rel_dir
-            # 💡 新增：把当前遍历到的 PDF 名字作为容器名注入！
             os.environ["ACTIVE_DOC_NAME"] = file_path.stem
 
             print("\n" + "-" * 50)
             print(f"🚀 [批量进度 {idx}/{len(files)}] 正在解析: {file_path.name}")
-
-            # 💡 优化了日志输出，让你提前看到极其舒适的目录结构
-            display_dir = f"{kb_name}/{rel_dir}/{file_path.stem}" if rel_dir else f"{kb_name}/{file_path.stem}"
-            print(f"📁 物理落库路径: data/wiki/{display_dir}/")
+            print(f"📁 知识流向: 正在将数据注入至当前激活的底层沙箱环境...")
 
             flow.run(str(file_path))
