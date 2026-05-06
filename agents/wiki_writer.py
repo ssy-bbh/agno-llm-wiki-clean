@@ -51,8 +51,6 @@ class WikiWriter:
 
 
 
-
-
             elif act_type == "append_link":
 
                 old_str = action.get("old_str")

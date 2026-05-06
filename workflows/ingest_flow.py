@@ -65,25 +65,25 @@ class IngestFlow:
         total_chunks = len(chunks)
         completed_count = 0
 
-        with ThreadPoolExecutor(max_workers=12) as executor:
+        with ThreadPoolExecutor(max_workers=12) as executor:  # 线程数根据你的API额度调整
             futures = {executor.submit(self.process_single_chunk, chunk, i + 1): i for i, chunk in enumerate(chunks)}
 
-            # 💡 兜底机制：加装“超时熔断器”
-            try:
-                # timeout=180 表示：如果整个监听过程有超过 3 分钟没有收到任何新回包，直接触发警报！
-                for future in as_completed(futures, timeout=180):
-                    completed_count += 1
+            # 💡 拆除全局 180s 熔断炸弹！只要有耐心，几千个块也能安稳跑完
+            for future in as_completed(futures):
+                completed_count += 1
+                try:
                     chunk_id, report, status = future.result()
 
                     if report:
-                        print(f"✅ [{completed_count}/{total_chunks}] 线程 {chunk_id} 分析完成，已存入待写队列。")
-                        reports_to_write.append((chunk_id, report))
+                        print(f"✅ [{completed_count}/{total_chunks}] 线程 {chunk_id} 分析完成，⚡ 立即落盘！")
+                        # 边算边写，瞬间落盘，不用等所有线程结束！
+                        self.writer.execute(report)
                     else:
                         print(f"⏭️ [{completed_count}/{total_chunks}] 线程 {chunk_id} 被跳过：{status}")
-            except TimeoutError:
-                # 💡 弃车保帅：一旦超时，立刻截断，拿着已有的成果继续往下走！
-                print("\n⚠️ [兜底触发] 检测到 API 严重卡死或网络异常！")
-                print(f"⚠️ 强行熔断！丢弃未响应的线程，强行结算已完成的 {len(reports_to_write)} 个知识块。")
+
+                except Exception as e:
+                    # 如果某个底层线程真的网络崩溃了，只丢弃那一个，不影响全局！
+                    print(f"❌ [{completed_count}/{total_chunks}] 某个线程出现致命网络错误: {e}")
 
         print("\n" + "=" * 60)
         print(f"✍️ 汇总完毕，准备执行物理写盘 (共 {len(reports_to_write)} 项任务)...")
