@@ -14,10 +14,12 @@ __pycache__/
 # IDE
 .idea/
 .vscode/
-
+#个人知识库，不提交
+data/raw/
 # Wiki 编译层（由代码自动生成，不提交）
 data/wiki/
 !data/wiki/README.md
 
 # 设计文档（个人笔记，不提交）
 LLM_Wiki_Design_Doc.md
+LLM-Wiki_report.md
