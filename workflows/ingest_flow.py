@@ -17,7 +17,8 @@ from tools.edit_tools import _resolve  # 使用原生路由
 
 class IngestFlow:
     """
-    知识摄入流水线 (多脑协作 · 同义词归一 · 细粒度锁并发版)
+    知识摄入流水线 (终极形态：Map-Reduce 降维打击版)
+    完全摒弃锁机制，彻底解决并发竞态与大模型 Token 冗余浪费。
     """
 
     def __init__(self):
@@ -25,17 +26,12 @@ class IngestFlow:
         self.editor = WikiEditor()
         self.writer = WikiWriter()
 
-        # 💡 细粒度锁池：为每一个概念动态分配一把锁，互不干扰
-        self.concept_locks = defaultdict(threading.Lock)
-
     def _normalize_name(self, text: str) -> str:
-        """纯净器：移除所有非字母、数字、中文的字符，转小写"""
         if not text:
             return ""
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
     def _find_existing_file(self, concept: str) -> Path:
-        """同义词嗅探器：在本地寻找是否已有相似概念的文件"""
         concepts_dir = _resolve("concepts")
         if not concepts_dir.exists():
             return None
@@ -46,21 +42,15 @@ class IngestFlow:
 
         for f in concepts_dir.glob("*.md"):
             norm_f = self._normalize_name(f.stem)
-
-            # 1. 核心去重：完全一致
             if norm_c == norm_f:
                 return f
-            # 2. 同义词判定：互相包含且长度大于2（如"注意力机制" 包含 "注意力"）
             if len(norm_c) > 2 and len(norm_f) > 2:
                 if norm_c in norm_f or norm_f in norm_c:
                     return f
-
         return None
 
     def _fetch_local_context(self, concepts: list) -> str:
-        """档案管理员：提取上下文并告诉主编真实的文件名"""
         context_str = "\n"
-
         index_path = _resolve("index.md")
         if index_path.exists():
             context_str += f"=== index.md (导航地图) ===\n{index_path.read_text(encoding='utf-8')}\n\n"
@@ -69,94 +59,143 @@ class IngestFlow:
 
         for concept in concepts:
             real_file = self._find_existing_file(concept)
-
             if real_file:
-                # 💡 如果查到了同义词文件，强制让主编使用这个已存在的名字！
                 content = real_file.read_text(encoding="utf-8")
                 rel_path = f"concepts/{real_file.name}"
-                context_str += f"=== {rel_path} (本地已存在，匹配到概念 [{concept}]) ===\n{content}\n\n"
+                context_str += f"=== {rel_path} (本地已存在) ===\n{content}\n\n"
             else:
                 safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
-                context_str += f"=== concepts/{safe_name}.md ===\n(全新概念，文件暂不存在)\n\n"
+                context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
 
         return context_str
 
-    def process_single_chunk(self, chunk, chunk_id):
+    def _map_extract(self, chunk, chunk_id):
+        """Map 阶段的核心逻辑：只提取，不写盘，无锁狂奔"""
         try:
-            print(f"  [线程 {chunk_id}] 🕵️‍♂️ 侦察兵开始提取概念...")
+            print(f"  [Map 线程 {chunk_id}] 🕵️‍♂️ 提取中...")
             analysis_result = self.analyst.analyze(chunk)
-            new_concepts = analysis_result.get("new_concepts", [])
-            summary = analysis_result.get("summary", "")
-
-            if not new_concepts:
-                return chunk_id, None, "没有提取到核心概念"
-
-            # 💡 锁的死锁防御机制：对概念归一化后排序，按顺序加锁，绝对不会死锁
-            normalized_concepts = list(set([self._normalize_name(c) for c in new_concepts if c]))
-            normalized_concepts.sort()
-
-            # 💡 启动细粒度并发锁：只有当前 Chunk 涉及的概念才会被锁住！
-            with ExitStack() as stack:
-                for norm_c in normalized_concepts:
-                    stack.enter_context(self.concept_locks[norm_c])
-
-                print(f"  [线程 {chunk_id}] 🔒 已锁定概念 {new_concepts}，档案员查档中...")
-                existing_context = self._fetch_local_context(new_concepts)
-
-                print(f"  [线程 {chunk_id}] 🧠 主编接手，开始比对生成修改指令...")
-                report = self.editor.merge(
-                    raw_text=chunk,
-                    analyst_summary=summary,
-                    existing_context=existing_context
-                )
-
-                if not report.get("actions"):
-                    return chunk_id, None, "主编裁定无增量信息，无需修改"
-
-                # 💡 必须在释放锁之前完成物理写盘，保障后续线程读到的是最新数据！
-                self.writer.execute(report)
-
-            return chunk_id, report, "成功"
+            if not analysis_result.get("new_concepts"):
+                return chunk_id, chunk, None, "无核心概念"
+            return chunk_id, chunk, analysis_result, "成功"
         except Exception as e:
-            return chunk_id, None, f"报错: {str(e)}"
+            return chunk_id, chunk, None, f"报错: {str(e)}"
 
     def run(self, input_source: str):
         print("\n" + "=" * 60)
-        print("🚀 [IngestFlow] 启动知识摄入流水线 (多脑协作·细粒度并发锁版)...")
+        print("🚀 [IngestFlow] 启动终极 Map-Reduce 知识摄入引擎...")
 
         path = Path(input_source)
         if path.exists() and path.is_file():
-            print(f"📄 检测到文件：{path.name}")
+            print(f"📄 目标文件：{path.name}")
             raw_text = extract_text(str(path))
-            print("💻 [架构路由] 启用滑动窗口切片策略。")
             chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
-            print(f"✂️ 切分为 {len(chunks)} 个知识块 (Chunk Size: 1500)。")
+            print(f"✂️ 切分为 {len(chunks)} 个知识块。")
         else:
-            print("📝 检测到短文本输入。")
             chunks = [input_source]
 
-        print("=" * 60)
-        print("⚡ 启动高稳定并发处理引擎...")
+        # ==========================================
+        # 🟢 PHASE 1: MAP (无锁绝对并发)
+        # ==========================================
+        print("\n" + "=" * 60)
+        print("⚡ [Phase 1: MAP] 启动侦察兵并发提取 (释放全部线程)...")
 
-        total_chunks = len(chunks)
-        completed_count = 0
-
+        map_results = []
         with ThreadPoolExecutor(max_workers=12) as executor:
-            futures = {executor.submit(self.process_single_chunk, chunk, i + 1): i for i, chunk in enumerate(chunks)}
-
+            futures = {executor.submit(self._map_extract, chunk, i + 1): i for i, chunk in enumerate(chunks)}
             for future in as_completed(futures):
-                completed_count += 1
-                try:
-                    chunk_id, report, status = future.result()
-                    if report:
-                        print(f"\n✅ [{completed_count}/{total_chunks}] 线程 {chunk_id} 完全落盘闭环！")
-                    else:
-                        print(f"\n⏭️ [{completed_count}/{total_chunks}] 线程 {chunk_id} 跳过：{status}")
-                except Exception as e:
-                    print(f"\n❌ [{completed_count}/{total_chunks}] 致命错误: {e}")
+                cid, chunk_text_val, res, status = future.result()
+                if res:
+                    map_results.append((chunk_text_val, res))
+                    print(f"  -> ✅ 线程 {cid} 提取完毕: {res.get('new_concepts')}")
+
+                # ==========================================
+                # 🟡 PHASE 2: SHUFFLE (内存级同义词聚类)
+                # ==========================================
+                print("\n" + "=" * 60)
+                print("🔀 [Phase 2: SHUFFLE] 正在将碎片知识按概念重新洗牌聚类 (启动双语解构引擎)...")
+
+                import re
+
+                concept_payloads = {}
+                for chunk_text_val, res in map_results:
+                    concepts = res.get("new_concepts", [])
+                    summary = res.get("summary", "")
+
+                    for raw_c in concepts:
+                        # 💡 1. 核心魔法：用正则把 "Self-Attention (自注意力)" 拆成两半
+                        # match.group(1) 是英文，match.group(2) 是中文
+                        match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', raw_c)
+
+                        if match:
+                            en_key = match.group(1).strip()
+                            zh_alias = match.group(2).strip()
+                            full_display = f"{en_key} ({zh_alias})"  # 统一格式化为完美双语
+                        else:
+                            # 如果大模型偶尔没遵守规则，兜底处理
+                            en_key = raw_c.strip()
+                            zh_alias = ""
+                            full_display = en_key
+
+                        # 💡 2. 物理拦截：基于拆解出的英文进行长度过滤
+                        if len(en_key.split()) > 4 or len(en_key) > 25:
+                            continue
+
+                        # 💡 3. 归一化：我们只拿【英文部分】去计算主键！这彻底解决了翻译不一致导致的分裂！
+                        norm_c = self._normalize_name(en_key)
+                        if not norm_c or len(norm_c) < 2:
+                            continue
+
+                        if norm_c not in concept_payloads:
+                            concept_payloads[norm_c] = {
+                                "primary_key": en_key,  # 例如: "Self-Attention" (用于底层比对)
+                                "display_name": full_display,  # 例如: "Self-Attention (自注意力)" (给主编看)
+                                "aliases": set(),  # 收集所有的中文翻译变体
+                                "texts": [],
+                                "summaries": []
+                            }
+
+                        if zh_alias:
+                            concept_payloads[norm_c]["aliases"].add(zh_alias)
+
+                        concept_payloads[norm_c]["texts"].append(chunk_text_val)
+                        concept_payloads[norm_c]["summaries"].append(summary)
+
+        # ==========================================
+        # 🔴 PHASE 3: REDUCE (按概念逐个融合)
+        # ==========================================
+        print("\n" + "=" * 60)
+        total_concepts = len(concept_payloads)
+        print(f"🧠 [Phase 3: REDUCE] 惊人降维！发现 {total_concepts} 个独立核心概念。")
+        print("主编接手，开始统一排版与落盘 (彻底告别死锁)...")
+
+        # 串行合并，完全没有并发写盘冲突！主编只需为每个概念写1次文件！
+        for i, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
+            display_name = payload["display_name"]  # 这里主编看到的就是 "Self-Attention (自注意力)" 了！
+            print(f"\n" + "-" * 50)
+            print(f"🔄 [融合 {i}/{total_concepts}] 目标概念: [{display_name}]")
+
+            # 将多块文本拼装，让大模型一次性拥有“上帝视角”
+            combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
+            combined_summary = "\n".join(payload["summaries"])
+
+            existing_context = self._fetch_local_context([display_name])
+
+            try:
+                report = self.editor.merge(
+                    raw_text=combined_text,
+                    analyst_summary=combined_summary,
+                    existing_context=existing_context
+                )
+
+                if report and report.get("actions"):
+                    self.writer.execute(report)
+                else:
+                    print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
+            except Exception as e:
+                print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
 
         print("\n" + "=" * 60)
-        print("✅ [IngestFlow] 极速摄入与融合完毕，完美收工！")
+        print("✅ [IngestFlow] 终极降维摄入完毕，知识图谱完美生长！")
         print("=" * 60)
 
 
