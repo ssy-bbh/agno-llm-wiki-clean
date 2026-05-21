@@ -249,6 +249,4 @@ result = wf.run(query="你的问题")
 
 ---
 
-## License
 
-MIT
