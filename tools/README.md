@@ -1,38 +1,20 @@
 # tools/ — 技能工具箱
 
-> **拓展新能力的核心入口**。每个工具文件封装一类外部能力，Agent 按需组合调用。
+封装外部能力供 Agent 调用，每个工具文件专注一类操作。
 
 ## 文件说明
 
 | 文件 | 能力 | 状态 |
 |------|------|------|
-| `search_tools.py` | DuckDuckGo 联网搜索 + Newspaper4k 全文抓取 | ✅ 已实现 |
-| `file_tools.py` | 读写隔离：所有操作强制圈禁在 `data/wiki/` 内，路径越界直接抛异常 | ✅ 已实现 |
-| `edit_tools.py` | `str_replace` 精密替换 + `append_to_log()` 审计 + `create_page()` 新建页面 | ✅ 已实现 |
-| `ppt_tools.py` | python-pptx 封装，"根据大纲生成一页 PPT"函数 | 🔧 扩展中 |
-| `vision_tools.py` | 图片读取、OCR、截图等视觉预处理工具 | 🔧 扩展中 |
+| `search_tools.py` | DuckDuckGoTools 联网搜索 + Newspaper4kTools 全文抓取 | ✅ |
+| `file_tools.py` | 安全文件操作：路径锁定在 `data/wiki/`，拒绝 `../` 越界遍历 | ✅ |
+| `edit_tools.py` | `str_replace` 精密局部替换 + `create_page` 新建页面 + `append_to_log` 审计日志。**所有写入必须经过此模块** | ✅ |
+| `ppt_tools.py` | python-pptx 封装，根据大纲生成 PPT | 🔧 WIP |
+| `vision_tools.py` | 图片读取、OCR 等视觉预处理 | 🔧 WIP |
+| `document_parser.py` | 文档解析（PDF 读取、文本分块） | ✅ |
 
-## 核心安全机制
+## 安全隔离
 
-### file_tools.py
-```
-WIKI_ROOT = data/wiki/  # 硬编码，Agent 无法跳出
-_check_path() 在每次操作前校验，拒绝 ../ 目录遍历攻击
-```
-**禁止**：`file_tools.write_file()` 已被重写，直接抛 `PermissionError`。
-**允许**：`append_to_file()` 仅限 `data/wiki/log.md`。
-
-### edit_tools.py
-- `str_replace(old, new)`：必须精确匹配原文，防止 LLM 全量覆写导致 Markdown 格式错乱
-- `append_to_log()`：Append-only，只能追加审计日志，不能写其他内容
-- `create_page()`：自动在 `log.md` 追加创建记录
-
-## 新增工具流程
-
-1. 新建 `xxx_tools.py`
-2. 参考 `file_tools.py` 的 `_check_path()` 做安全隔离
-3. 在对应 Agent 的 `tools=` 参数中注册
-
-## 与 protocols/ 的关系
-
-工具只负责"怎么做"，不负责"做什么"。做什么由 `prompts/` 和 `protocols/` 定义。
+- `file_tools.py` 和 `edit_tools.py` 强制校验路径，所有文件操作被圈禁在 `data/wiki/` 内
+- Agent 无法越界写入其他目录
+- 所有写入操作（新建、编辑、追加日志）统一通过 `edit_tools.py`，确保审计可追溯

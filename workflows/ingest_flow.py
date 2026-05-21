@@ -32,7 +32,9 @@ class IngestFlow:
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
     def _find_existing_file(self, concept: str) -> Path:
-        concepts_dir = _resolve("concepts")
+        """同义词嗅探器：使用纯粹的原生 Path 在当前 concepts 目录下寻找"""
+        # 💡 移除了 _resolve()
+        concepts_dir = Path("concepts")
         if not concepts_dir.exists():
             return None
 
@@ -42,16 +44,23 @@ class IngestFlow:
 
         for f in concepts_dir.glob("*.md"):
             norm_f = self._normalize_name(f.stem)
+
+            # 1. 核心去重：完全一致
             if norm_c == norm_f:
                 return f
+            # 2. 同义词判定
             if len(norm_c) > 2 and len(norm_f) > 2:
                 if norm_c in norm_f or norm_f in norm_c:
                     return f
+
         return None
 
     def _fetch_local_context(self, concepts: list) -> str:
+        """档案管理员：提取上下文并告诉主编真实的文件名"""
         context_str = "\n"
-        index_path = _resolve("index.md")
+
+        # 💡 移除了 _resolve()
+        index_path = Path("index.md")
         if index_path.exists():
             context_str += f"=== index.md (导航地图) ===\n{index_path.read_text(encoding='utf-8')}\n\n"
         else:
@@ -59,8 +68,10 @@ class IngestFlow:
 
         for concept in concepts:
             real_file = self._find_existing_file(concept)
+
             if real_file:
                 content = real_file.read_text(encoding="utf-8")
+                # 已经是原生 Path，name 属性就是文件名
                 rel_path = f"concepts/{real_file.name}"
                 context_str += f"=== {rel_path} (本地已存在) ===\n{content}\n\n"
             else:
@@ -174,7 +185,7 @@ class IngestFlow:
             print(f"\n" + "-" * 50)
             print(f"🔄 [融合 {i}/{total_concepts}] 目标概念: [{display_name}]")
 
-            # 将多块文本拼装，让大模型一次性拥有“上帝视角”
+            # 将多块文本拼装
             combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
             combined_summary = "\n".join(payload["summaries"])
 

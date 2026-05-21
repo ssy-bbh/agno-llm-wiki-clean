@@ -1,185 +1,254 @@
-# LLM Wiki Project
+# LLM Wiki Demo — 多智能体知识研究系统
 
-> 基于 Agno 框架的多智能体知识研究系统，核心理念：**让大模型像维护维基百科一样持续管理你的私人知识库**。
+> 基于 Agno 框架的多智能体系统——让大模型像维护维基百科一样持续管理你的私人知识库。
 
 ---
 
-## 📁 目录结构
+## 项目概述
+
+**LLM Wiki Demo** 是一个基于 Agno 框架构建的多智能体知识研究系统。核心理念是：**让 LLM 像维护维基百科一样，持续自动管理你的私人知识库**。
+
+知识库不是静态文档，而是**活的系统**——自动摄入新资料、交叉验证多来源、发现概念关联、定期审查死链，像维基百科编辑团队一样 7×24 运转。
+
+---
+
+## 四大核心设计原则
+
+### 1. Protocols 与 Prompts 分离
+
+| 层 | 职责 | 修改方式 |
+|---|---|---|
+| **Protocols** (`protocols/`) | **做什么**——知识库使命边界、双链语法、页面模板、操作 SOP | 编辑 `.md` 文件，无需触碰 Python |
+| **Prompts** (`prompts/`) | **怎么说**——模型语气、输出格式、角色设定 | 编辑 Python 字符串 |
+
+像改文档一样调整策略，无需修改源码。
+
+### 2. 两步思维链（Two-Step CoT）
+
+```
+wiki_analyst ──分析──→ AnalysisReport(JSON) ──→ wiki_writer ──写入──→ data/wiki/
+  (只读不碰磁盘)         (可验证、可回滚)          (只写不分析)         (str_replace)
+```
+
+- **分析**与**写入**物理隔离：`wiki_analyst` 只读不写，`wiki_writer` 只写不分析
+- 中间传递结构化 JSON 报告，可验证、可审计、可回滚
+- `wiki_writer` 使用 `str_replace` 精确替换，避免整页覆写
+
+### 3. 读写分离
+
+```
+data/raw/    → 只读来源层，大模型只能消费，不能写入
+data/wiki/   → 维基编译层，大模型全权写入
+LanceDB      → 语义兜底，仅在 index.md 超载时启用
+```
+
+- `file_tools` 路径锁死 `data/wiki/`，严格拒绝目录遍历
+- `index.md` 是全局导航地图，每次读写**必读**
+- `log.md` 是 append-only 审计日志
+
+### 4. Workflow 确定性
+
+| 工作流 | 步骤 | 特点 |
+|---|---|---|
+| `ingest_flow` | 分析 → 写入 → 追加日志 | **串行执行**，禁止 Agent 自由发挥 |
+| `lint_flow` | 死链检测 → Backlinks 织网 → 孤立页面报告 | 定期审查 |
+| `query_flow` | Team[local_wiki + web_researcher] → Summarizer 汇总 | 查询路由 |
+
+`ingest_flow` 强制串行（analyze→write→log），知识摄入过程不引入并发，确保每步可追溯。
+
+---
+
+## 架构总览
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     app.py (FastAPI)                     │
+│              AgentOS · Router · SqliteDb                 │
+└────────────┬──────────────────────────┬──────────────────┘
+             │                          │
+    ┌────────▼────────┐        ┌────────▼────────┐
+    │   Agents 层      │        │  Workflows 层    │
+    │  web_researcher │        │  ingest_flow    │
+    │  local_wiki     │        │  lint_flow      │
+    │  wiki_analyst ◄─┼───────►│  query_flow     │
+    │  wiki_writer    │  CoT   │                 │
+    │  wiki_editor    │        │                 │
+    │  ppt_maker      │        │                 │
+    │  vision_analyst │        │                 │
+    └────────┬────────┘        └───────────┬───────┘
+             │                             │
+    ┌────────▼─────────────────────────────▼───┐
+    │           Tools & Protocols               │
+    │  search / file / edit / ppt / vision      │
+    │  purpose.md / schema.md (协议层)          │
+    └────────────────────┬──────────────────────┘
+                         │
+              ┌──────────▼──────────┐
+              │    Data 层           │
+              │  raw/  (只读来源)    │
+              │  wiki/ (编译输出)    │
+              └──────────┬──────────┘
+                         │
+              ┌──────────▼──────────┐
+              │   Storage 层         │
+              │  SQLite 会话记忆     │
+              │  LanceDB 向量检索    │
+              └─────────────────────┘
+```
+
+---
+
+## 目录结构
 
 ```
 agno-llm-wiki-demo/
+├── .env                    # API Key 配置
+├── requirements.txt        # 依赖
+├── app.py                  # FastAPI + AgentOS 入口
 │
-├── .env                    # 环境变量（Qwen API Key 等）
-├── requirements.txt        # 项目依赖
-├── app.py                  # 中枢总控台（FastAPI + AgentOS）
-│
-├── core/                   # ① 核心基座层（原有，维持不动）
-│   ├── config.py           # 读取 .env，全局配置
+├── core/                   # 核心基座层
+│   ├── config.py           # pydantic Settings 全局配置
 │   ├── llm_factory.py      # 模型工厂：Qwen-Max / Qwen-VL
 │   └── memory_manager.py   # SQLite 会话记忆 + LanceDB 向量存储
 │
-├── protocols/              # ② 维基协议层（【新增】）
-│   ├── purpose.md          # 知识库灵魂：使命边界、意图、核心论点
-│   └── schema.md           # 操作 SOP：双链语法、页面结构、降级策略
+├── protocols/              # 维基协议层
+│   ├── purpose.md          # 知识库使命边界、核心论点
+│   └── schema.md           # 操作SOP：双链语法、页面模板
 │
-├── tools/                  # ③ 技能工具箱
-│   ├── search_tools.py     # DuckDuckGo 联网搜索 ✅
-│   ├── ppt_tools.py        # python-pptx 封装（扩展中）🔧
-│   ├── vision_tools.py     # 图片/OCR 封装（扩展中）🔧
-│   ├── file_tools.py       # 读写隔离：权限圈禁在 data/wiki/ 内 ✅
-│   └── edit_tools.py       # str_replace 精密替换，防止格式错乱 ✅
+├── tools/                  # 技能工具箱
+│   ├── search_tools.py     # DuckDuckGo + Newspaper4k
+│   ├── file_tools.py       # 读写隔离，路径锁在 data/wiki/
+│   ├── edit_tools.py       # str_replace + create_page + append_to_log
+│   ├── ppt_tools.py        # python-pptx 封装（扩展中）
+│   └── vision_tools.py     # 图片/OCR（扩展中）
 │
-├── prompts/                # ④ 提示词工程库
-│   ├── boss_prompt.py      # 主管 Agent 路由规则
+├── prompts/                # 提示词工程库
+│   ├── boss_prompt.py      # 主管路由：Research / Wiki / PPT
 │   ├── research_prompt.py  # 深度研究协议
-│   └── wiki_prompt.py      # Wiki 维护者角色定义 ✅
+│   ├── wiki_prompt.py      # Wiki维护者 + load_protocols()
+│   └── ppt_prompt.py       # PPT排版指令
 │
-├── agents/                 # ⑤ 原子智能体
-│   ├── web_researcher.py   # 联网研究员 ✅
-│   ├── local_wiki.py       # 本地知识库（向量检索）✅
-│   ├── wiki_analyst.py     # 知识分析师：只读不做写 ✅
-│   └── wiki_writer.py      # 知识撰稿人：只写不分析 ✅
+├── agents/                 # 原子智能体
+│   ├── web_researcher.py   # 联网搜索
+│   ├── local_wiki.py       # 本地知识库（LanceDB）
+│   ├── wiki_analyst.py     # 只读分析，输出 AnalysisReport
+│   ├── wiki_writer.py      # 只写执行：create/edit/append_link
+│   ├── wiki_editor.py      # 比对新旧知识，生成 EditorReport
+│   ├── ppt_maker.py        # PPT生成（扩展中）
+│   └── vision_analyst.py   # 视觉分析（扩展中）
 │
-├── workflows/              # ⑥ 确定性工作流层（【新增】）
-│   ├── __init__.py
-│   ├── ingest_flow.py      # 摄入流水线（Analyze→Write，严格串行）✅
-│   └── lint_flow.py        # 审查流水线（死链/孤立页面清理）✅
+├── workflows/              # 确定性工作流
+│   ├── ingest_flow.py      # 摄入流水线：分析→写入→日志
+│   ├── lint_flow.py        # 审查流水线：死链检测 + 反向链接织网
+│   └── query_flow.py       # 查询路由：Team[local_wiki+web_researcher]→汇总
 │
-├── data/                   # ⑦ 数据层（【重构】读写分离）
-│   ├── raw/               # 来源只读层：PDF、图片等原始资料
-│   └── wiki/              # 维基编译层：大模型全权维护
-│       ├── concepts/       # 知识概念节点页面
-│       ├── entities/       # 具体人物/项目实体页面
-│       ├── index.md        # 全局导航地图（每次读写必读）
-│       └── log.md          # Append-only 审计日志
+├── data/                   # 数据层（读写分离）
+│   ├── raw/               # 只读来源层
+│   └── wiki/              # 维基编译层（LLM全权写入）
+│       ├── concepts/      # 概念页面
+│       ├── entities/      # 实体页面
+│       ├── index.md       # 全局导航地图
+│       └── log.md         # Append-only审计日志
 │
-└── storage/                # ⑧ 记忆持久化（已加入 .gitignore）
-    ├── sqlite/             # Agno SQLite 会话记忆
-    └── lancedb/            # 向量数据库（长尾兜底检索）
+└── storage/                # 记忆持久化（.gitignore）
+    ├── sqlite/            # 会话记忆
+    └── lancedb/           # 向量索引
 ```
 
 ---
 
-## 🗺️ 架构设计核心逻辑
+## 入口文件
 
-### 分离 Protocols 与 Prompts
+```python
+from agno.os import AgentOS
+from agents.local_wiki import get_local_wiki
+from workflows.query_flow import get_query_workflow
 
+wiki_expert = get_local_wiki()
+router_workflow = get_query_workflow()
+
+agent_os = AgentOS(
+    agents=[],
+    workflows=[router_workflow],
+    db=SqliteDb(db_file="tmp/agent_os.db"),
+    tracing=True
+)
 ```
-Prompts (提示词)    → 怎么调用模型（语气、格式）
-Protocols (协议)    → 怎么维护知识库（规范、语法）
-```
-
-将 `schema.md` / `purpose.md` 物理隔离，像改文档一样调整维基演进策略，无需动 Python 代码。
-
-### 引入 Workflows（工作流）
-
-摄入新知识时，**必须按确定性步骤执行**，禁止 Agent 自由发挥：
-
-```
-ingest_flow.py 流水线步骤：
-  ① wiki_analyst   只读不写 → 输出分析报告（内存中碰撞新旧知识）
-  ② wiki_writer    接收报告 → 调用 edit_tools 执行原子性写入
-```
-
-### 两步思维链（Two-Step CoT）
-
-```
-wiki_analyst  专注分析：找张力、找缺口、找关联
-wiki_writer   专注写入：str_replace 精密替换，不全量覆写
-```
-
-### 底层 Data 拓扑
-
-```
-data/raw/    → 只读，大模型只能消费，不能写入
-data/wiki/   → 大模型全权写入，index.md 是全局寻址核心
-```
-
-LanceDB 仅作为 `index.md` 超载时的语义兜底，不作为主存储。
 
 ---
 
-## 🔧 快速开始
+## 快速开始
 
 ```bash
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 配置环境变量
-# 编辑 .env：
+# 2. 配置 API Key（编辑 .env）
 QWEN_API_KEY=sk-xxxxxxxxxxxxxxxx
 
 # 3. 上传原始资料
-# 把 PDF、图片放入 data/raw/
+# 将 PDF / 图片 / 文档放入 data/raw/
 
 # 4. 启动服务
 python app.py
 
-# 5. 执行首次摄入（Python 脚本）
-from workflows import IngestFlow
-flow = IngestFlow(source_file="my-paper.pdf", context="这是XXX论文")
-result = flow.run()
-print(result)
+# 5. 查询知识库
+from workflows.query_flow import get_query_workflow
+wf = get_query_workflow()
+result = wf.run(query="你的问题")
 ```
 
 ---
 
-## 📋 TODO
+## 依赖
+
+| 依赖 | 用途 |
+|---|---|
+| `agno>=1.0` | 多智能体编排框架 |
+| `openai` | LLM API 客户端 |
+| `python-dotenv` | 环境变量管理 |
+| `duckduckgo-search` | 联网搜索 |
+| `newspaper4k` | 网页正文提取 |
+| `lancedb` | 向量数据库（长尾兜底） |
+| `sqlalchemy` | ORM / SQLite 持久化 |
+| `fastapi` | Web 框架 |
+| `uvicorn` | ASGI 服务器 |
+| `pdfplumber` | PDF 解析 |
+| `python-pptx` | PPT 生成（扩展中） |
+| `pillow` | 图像处理（扩展中） |
+
+---
+
+## TODO
 
 ### ✅ 已完成
 
-- [x] 目录结构设计与搭建
-- [x] `protocols/schema.md` — 维基操作 SOP
-- [x] `protocols/purpose.md` — 知识库使命定义
-- [x] `tools/file_tools.py` — 读写隔离文件工具
-- [x] `tools/edit_tools.py` — str_replace 精密替换工具
-- [x] `prompts/wiki_prompt.py` — Wiki 维护者角色提示词
-- [x] `agents/wiki_analyst.py` — 知识分析师 Agent
-- [x] `agents/wiki_writer.py` — 知识撰稿人 Agent
-- [x] `workflows/ingest_flow.py` — 摄入流水线
-- [x] `workflows/lint_flow.py` — 审查流水线
-- [x] README.md 编写
+- [x] 项目目录结构与基础框架
+- [x] Protocols 协议层（purpose.md / schema.md）
+- [x] Tools 工具箱（search / file / edit）
+- [x] Prompts 提示词库（boss / research / wiki / ppt）
+- [x] 核心 Agents（web_researcher / local_wiki / wiki_analyst / wiki_writer / wiki_editor）
+- [x] Workflows（ingest_flow / lint_flow / query_flow）
+- [x] 读写分离数据拓扑 + index.md 全局导航
+- [x] LanceDB 向量兜底检索
+- [x] 两步思维链（分析/写入隔离）
 
 ### 🔧 扩展中
 
-- [ ] `app.py` 接入新的 Wiki Agents 和 Workflows
-- [ ] `tools/ppt_tools.py` — PPT 生成工具封装
-- [ ] `agents/ppt_maker.py` — PPT 生成 Agent
-- [ ] `prompts/ppt_prompt.py` — PPT 排版提示词
+- [ ] app.py 完整接入 Wiki Agents 和 Workflows
+- [ ] PPT 生成管线（ppt_tools / ppt_maker / ppt_prompt）
+- [ ] 视觉分析管线（vision_tools / vision_analyst）
 
-### 🐣 待开发
+### 📌 规划中
 
-- [ ] `tools/vision_tools.py` — 图片读取 / OCR 工具
-- [ ] `agents/vision_analyst.py` — 视觉分析师 Agent
-- [ ] `agents/local_wiki.py` 与 LanceDB 的长尾兜底检索集成
-- [ ] `app.py` 中 Wiki Agents 与现有 Web Researcher 的路由逻辑
-- [ ] 增量摄入：同一来源文件的二次更新（diff + merge）
-- [ ] 冲突解决：多个来源同时引用同一概念时的合并策略
-- [ ] `lint_flow.py` 调用大模型自动修复死链（而非仅报告）
-- [ ] `index.md` 超载时自动拆分（>500 行阈值）
-- [ ] Web 前端：上传资料、查看摄入状态、浏览 Wiki 页面
-
-### 📌 已知限制
-
-- `edit_tools.py` 的 `str_replace` 依赖精确匹配空白符，需保证 old_str 完全一致
-- `lint_flow.py` 目前只做静态扫描，不调用 LLM 修复；修复能力在 TODO 列表中
-- PDF 读取依赖 `pdfplumber`，需 pip install
+- [ ] `index.md` 超载自动拆分（>500 行阈值）
+- [ ] 增量摄入：同一来源二次更新（diff + merge）
+- [ ] 冲突解决：多来源引用同一概念的合并策略
+- [ ] `lint_flow.py` LLM 自动修复死链（当前仅报告）
+- [ ] Web 前端：资料上传 / 摄入状态 / Wiki 浏览
 
 ---
 
-## 📦 主要依赖
+## License
 
-```txt
-agno>=1.0
-openai
-python-dotenv
-duckduckgo-search
-newspaper4k
-lancedb
-sqlalchemy
-fastapi
-uvicorn
-pdfplumber          # PDF 解析
-python-pptx          # PPT 生成（扩展中）
-pillow              # 图片处理（扩展中）
-```
+MIT
