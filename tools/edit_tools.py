@@ -94,20 +94,25 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str, cont
 
 
 def str_replace(file_name: str, old_str: str, new_str: str) -> str:
-    """极其精密的局部替换工具"""
+    """极其精密的局部替换工具 (带空格宽容 + 活路径路由)"""
+
+    # 💡 核心修复：必须用 _resolve 找回动态活路径！
     path = _resolve(file_name)
 
     if not path.exists():
-        return f"❌ 错误：想要编辑的文件不存在 ({file_name})"
+        return f"❌ 错误：底层工具找不到文件 ({path})"
 
     content = path.read_text(encoding="utf-8")
 
-    # 防弹锁：必须精确匹配到 old_str 才能替换
-    if old_str not in content:
-        return f"❌ 错误：在 {file_name} 中找不到指定的旧文本，拒绝修改！\n寻找的文本: {repr(old_str)}"
+    # 1. 尝试绝对精确匹配
+    if old_str in content:
+        path.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
+        return f"✅ 成功修改文件：{path.name}"
 
-    # 只替换第一次出现的匹配项，防止误伤
-    new_content = content.replace(old_str, new_str, 1)
-    path.write_text(new_content, encoding="utf-8")
+    # 2. 尝试宽容匹配 (去掉大模型首尾乱加的换行和空格)
+    old_str_clean = old_str.strip()
+    if old_str_clean and old_str_clean in content:
+        path.write_text(content.replace(old_str_clean, new_str, 1), encoding="utf-8")
+        return f"✅ 成功修改文件(启用宽容匹配)：{path.name}"
 
-    return f"✅ 成功修改文件：{file_name}"
+    return f"❌ 找不到旧文本，大模型可能产生了格式幻觉！\n寻找的: {repr(old_str)}"

@@ -1,9 +1,8 @@
 """
-wiki_writer.py — 知识撰稿人 (纯执行器 - 双轨骨架拦截+严格写盘完全版)
+wiki_writer.py — 知识撰稿人 (活路径雷达 + 严格写盘版)
 """
 import re
-from pathlib import Path
-from tools.edit_tools import create_page, str_replace
+from tools.edit_tools import _resolve, create_page, str_replace
 
 class WikiWriter:
     def execute(self, report: dict) -> list[str]:
@@ -11,102 +10,74 @@ class WikiWriter:
         actions = report.get("actions", [])
         results = []
 
-        # 💡 内置双轨归一化纯净器：用于在最底层物理落盘的最后一纳秒拦截同义词与时差冲突
         def _is_same_concept(name1, name2):
-            # 提取纯英文和数字骨架
-            eng1 = re.sub(r'[^a-zA-Z0-9]', '', name1).lower()
-            eng2 = re.sub(r'[^a-zA-Z0-9]', '', name2).lower()
-            # 提取纯中文骨架
-            zh1 = re.sub(r'[^\u4e00-\u9fa5]', '', name1)
-            zh2 = re.sub(r'[^\u4e00-\u9fa5]', '', name2)
-
-            # 条件1：英文骨架互相包含（至少3个字母防误伤）
-            match_eng = bool(eng1 and eng2) and (eng1 in eng2 or eng2 in eng1) and min(len(eng1), len(eng2)) >= 3
-            # 条件2：中文骨架互相包含（至少2个汉字防误伤）
-            match_zh = bool(zh1 and zh2) and (zh1 in zh2 or zh2 in zh1) and min(len(zh1), len(zh2)) >= 2
-
-            return match_eng or match_zh
+            eng1, eng2 = re.sub(r'[^a-zA-Z0-9]', '', name1).lower(), re.sub(r'[^a-zA-Z0-9]', '', name2).lower()
+            zh1, zh2 = re.sub(r'[^\u4e00-\u9fa5]', '', name1), re.sub(r'[^\u4e00-\u9fa5]', '', name2)
+            return (bool(eng1 and eng2) and (eng1 in eng2 or eng2 in eng1) and min(len(eng1), len(eng2)) >= 3) or \
+                   (bool(zh1 and zh2) and (zh1 in zh2 or zh2 in zh1) and min(len(zh1), len(zh2)) >= 2)
 
         for action in actions:
             act_type = action.get("type")
 
-            # 智能路径寻址：大模型如果丢了 concepts/ 前缀，在这里自动补齐
             raw_file = action.get("file", "concepts/untitled.md")
             if not raw_file.startswith("concepts/") and raw_file != "index.md":
                 raw_file = f"concepts/{raw_file}"
 
-            # 坚决不使用外部重定向工具，直接锁定本地原生 Path
-            target_path = Path(raw_file)
+            # 💡 核心修复 1：使用 _resolve() 计算出最终活路径，雷达扫描必须基于真实路径！
+            target_path = _resolve(raw_file)
 
             if act_type == "create":
-                # 强力清除首尾空格，消灭 "Label Smoothing .md" 这种幻觉
                 title = (action.get("title") or target_path.stem).strip()
                 safe_title = title.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
-                perfect_file_name = f"{target_path.parent}/{safe_title}.md"
 
-                # 🛡️ 最后一纳秒的物理拦截雷达：即使模型发出 create 指令，也必须检索是否有同义词已落盘
+                # 重新计算一次最标准的真实路径，防止大模型名字给得不规范
+                perfect_raw_file = f"concepts/{safe_title}.md"
+                perfect_target_path = _resolve(perfect_raw_file)
+
+                # 🛡️ 物理拦截雷达启动（基于真实目标目录）
                 found_existing = None
-                if target_path.parent.exists():
-                    for existing_file in target_path.parent.glob("*.md"):
+                if perfect_target_path.parent.exists():
+                    for existing_file in perfect_target_path.parent.glob("*.md"):
                         if _is_same_concept(existing_file.stem, title):
                             found_existing = existing_file
                             break
 
-                # 🚨 触发时差冲突拦截：前序并发任务已经把同义词文件抢先写入了！
                 if found_existing:
-                    print(f"  -> 🛡️ 拦截物理创建冲突：同义词文件 [{found_existing.name}] 已被前序任务抢先写盘！")
-                    print(f"     物理层自动将 [create] 扭转为 [增量追加] 模式，防止文件分裂...")
+                    print(f"  -> 🛡️ 拦截创建冲突：同义词文件 [{found_existing.name}] 已存在，自动转为 [增量追加]...")
 
-                    old_content = found_existing.read_text(encoding="utf-8")
-                    new_content = action.get("content", "").replace("\\n", "\n")
-
-                    # 极其安全地以 Markdown 形式追加，绝对不丢失、不覆盖、不分裂
-                    updated_content = old_content + f"\n\n---\n### 🧠 增量融合视角 ({title})\n{new_content}\n"
+                    # 💡 核心修复 2：将换行符替换抽出，避开 Python 3.11 的 f-string 报错
+                    safe_new_content = action.get("content", "").replace("\\n", "\n")
+                    updated_content = found_existing.read_text(encoding="utf-8") + f"\n\n---\n### 🧠 增量融合视角 ({title})\n{safe_new_content}\n"
                     found_existing.write_text(updated_content, encoding="utf-8")
 
-                    msg = f"成功在物理层拦截冲突，增量内容已安全追加至: {found_existing.name}"
-                    results.append(msg)
+                    results.append(f"成功合并至: {found_existing.name}")
                     continue
 
-                # 如果确实是无冲突的纯新概念，执行正常创建
-                res = create_page(
-                    file_name=perfect_file_name,
-                    title=title,
-                    tags=action.get("tags", []),
-                    abstract=action.get("abstract", ""),
-                    content=action.get("content", "")
-                )
+                # 工具层依然接收相对的 perfect_raw_file 即可，里面会再次 _resolve
+                res = create_page(perfect_raw_file, title, action.get("tags", []), action.get("abstract", ""), action.get("content", ""))
                 print(f"  -> {res}")
                 results.append(res)
 
             elif act_type == "edit":
-                # 严格写盘模式：如果文件在硬盘上不存在，先尝试用双轨骨架纠错重定向
                 if not target_path.exists():
                     found_match = False
                     if target_path.parent.exists():
                         for existing_file in target_path.parent.glob("*.md"):
                             if _is_same_concept(existing_file.stem, target_path.stem):
                                 target_path = existing_file
+                                # 扭转相对路径，供底层工具使用
+                                raw_file = f"concepts/{existing_file.name}" if raw_file != "index.md" else "index.md"
                                 print(f"  -> 🔍 纠错重定向：大模型编辑路径存在幻觉，已自动扭转至真实物理文件 [{target_path.name}]")
                                 found_match = True
                                 break
 
-                    # 如果连同义词骨架也对不上，说明模型彻底胡编了一个不存在的文件，无情拦截，绝不降级创建！
                     if not found_match:
-                        msg = f"  -> ❌ 严格模式拦截：找不到编辑目标且无同义词匹配 ({target_path.name})，已丢弃动作以防污染。"
+                        msg = f"  -> ❌ 严格模式拦截：找不到编辑目标 ({target_path.name})，已丢弃动作。"
                         print(msg)
                         results.append(msg)
                         continue
 
-                # 正常的字符串原子替换
-                old_str = action.get("old_str", "").replace("\\n", "\n")
-                new_content = action.get("content", "").replace("\\n", "\n")
-
-                res = str_replace(
-                    file_name=str(target_path),
-                    old_str=old_str,
-                    new_str=new_content
-                )
+                res = str_replace(raw_file, action.get("old_str", "").replace("\\n", "\n"), action.get("content", "").replace("\\n", "\n"))
                 print(f"  -> {res}")
                 results.append(res)
 
@@ -116,20 +87,13 @@ class WikiWriter:
                 moc_content = action.get("content", "")
 
                 safe_title = moc_title.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
-                moc_path = f"concepts/{safe_title}.md"
+                moc_raw_path = f"concepts/{safe_title}.md"
 
-                # 创建子 MOC 导航页面
-                res = create_page(
-                    file_name=moc_path,
-                    title=moc_title,
-                    tags=["#MOC", "#导航地图"],
-                    abstract=f"关于 {old_str.replace('#', '').strip()} 领域的知识汇聚与导航地图。",
-                    content=moc_content
-                )
+                res = create_page(moc_raw_path, moc_title, ["#MOC", "#导航地图"], f"关于 {old_str.replace('#', '').strip()} 领域的知识汇聚与导航地图。", moc_content)
                 print(f"  -> 🌟 [细胞裂变] 成功创建子地图: {safe_title}.md")
 
-                # 精细截断并更新主 index.md
-                index_path = Path("index.md")
+                # 💡 核心修复 3：精准获取真实活路径下的 index.md
+                index_path = _resolve("index.md")
                 if index_path.exists():
                     content = index_path.read_text(encoding="utf-8")
                     lines = content.split('\n')
@@ -170,9 +134,7 @@ class WikiWriter:
                         if clean_name:
                             links = [f"[[{clean_name}]]"]
 
-                    # 如果导航目标文件本身不存在，执行初始化
                     if not target_path.exists():
-                        print(f"  -> 🏗️ 自动初始化缺失的导航文件: {target_path.name}")
                         folder_name = target_path.parent.name if target_path.parent.name else "全局"
                         target_path.parent.mkdir(parents=True, exist_ok=True)
                         target_path.write_text(f"# {folder_name} 知识导航\n\n{old_str}\n", encoding="utf-8")
@@ -183,7 +145,6 @@ class WikiWriter:
                         target_path.write_text(content, encoding="utf-8")
                         content = target_path.read_text(encoding="utf-8")
 
-                    # 安全追加，防止重复链接产生
                     for single_link in links:
                         clean_target = single_link.lower().replace("-", "").replace("_", "").replace(" ", "")
                         existing_links = re.findall(r'\[\[(.*?)\]\]', content)
@@ -200,7 +161,8 @@ class WikiWriter:
                             continue
 
                         new_str = f"{old_str}\n- {single_link}"
-                        res = str_replace(str(target_path), old_str, new_str)
+                        # 确保交给工具的是相对路径，由 _resolve 接管
+                        res = str_replace(raw_file, old_str, new_str)
                         print(f"  -> [导航地图更新] 追加 {single_link} 成功")
                         old_str = new_str
                         results.append(res)

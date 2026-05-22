@@ -1,30 +1,26 @@
-import json
 import sys
 import os
 import re
 import threading
 from pathlib import Path
-from collections import defaultdict
-from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from agents.wiki_analyst import WikiAnalyst
 from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
-from tools.edit_tools import _resolve  # 使用原生路由
+from tools.edit_tools import _resolve  # 💡 必须引入，用于动态定位活路径
 
 
 class IngestFlow:
     """
     知识摄入流水线 (终极形态：Map-Reduce 降维打击版)
-    完全摒弃锁机制，彻底解决并发竞态与大模型 Token 冗余浪费。
     """
 
     def __init__(self):
         self.analyst = WikiAnalyst()
-        self.editor = WikiEditor()
         self.writer = WikiWriter()
+        # 注意：这里不再全局初始化 Editor，而是在 Phase 3 中每次循环重新初始化
 
     def _normalize_name(self, text: str) -> str:
         if not text:
@@ -32,9 +28,9 @@ class IngestFlow:
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
     def _find_existing_file(self, concept: str) -> Path:
-        """同义词嗅探器：使用纯粹的原生 Path 在当前 concepts 目录下寻找"""
-        # 💡 移除了 _resolve()
-        concepts_dir = Path("concepts")
+        """同义词嗅探器：使用 _resolve 精准定位到当前激活的活路径下"""
+        # 💡 核心修复：必须用 _resolve("concepts")，否则它会去根目录找，导致上下文失明
+        concepts_dir = _resolve("concepts")
         if not concepts_dir.exists():
             return None
 
@@ -44,23 +40,19 @@ class IngestFlow:
 
         for f in concepts_dir.glob("*.md"):
             norm_f = self._normalize_name(f.stem)
-
-            # 1. 核心去重：完全一致
             if norm_c == norm_f:
                 return f
-            # 2. 同义词判定
             if len(norm_c) > 2 and len(norm_f) > 2:
                 if norm_c in norm_f or norm_f in norm_c:
                     return f
-
         return None
 
     def _fetch_local_context(self, concepts: list) -> str:
-        """档案管理员：提取上下文并告诉主编真实的文件名"""
+        """档案管理员：提取上下文，提供给大模型参考"""
         context_str = "\n"
 
-        # 💡 移除了 _resolve()
-        index_path = Path("index.md")
+        # 💡 核心修复：必须用 _resolve 获取真实的导航地图路径
+        index_path = _resolve("index.md")
         if index_path.exists():
             context_str += f"=== index.md (导航地图) ===\n{index_path.read_text(encoding='utf-8')}\n\n"
         else:
@@ -68,10 +60,8 @@ class IngestFlow:
 
         for concept in concepts:
             real_file = self._find_existing_file(concept)
-
             if real_file:
                 content = real_file.read_text(encoding="utf-8")
-                # 已经是原生 Path，name 属性就是文件名
                 rel_path = f"concepts/{real_file.name}"
                 context_str += f"=== {rel_path} (本地已存在) ===\n{content}\n\n"
             else:
@@ -81,7 +71,7 @@ class IngestFlow:
         return context_str
 
     def _map_extract(self, chunk, chunk_id):
-        """Map 阶段的核心逻辑：只提取，不写盘，无锁狂奔"""
+        """Map 阶段的核心逻辑：只提取，不写盘"""
         try:
             print(f"  [Map 线程 {chunk_id}] 🕵️‍♂️ 提取中...")
             analysis_result = self.analyst.analyze(chunk)
@@ -107,69 +97,68 @@ class IngestFlow:
         # ==========================================
         # 🟢 PHASE 1: MAP (无锁绝对并发)
         # ==========================================
+        map_lock = threading.Lock()
+
         print("\n" + "=" * 60)
         print("⚡ [Phase 1: MAP] 启动侦察兵并发提取 (释放全部线程)...")
 
         map_results = []
         with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {executor.submit(self._map_extract, chunk, i + 1): i for i, chunk in enumerate(chunks)}
+
             for future in as_completed(futures):
                 cid, chunk_text_val, res, status = future.result()
                 if res:
-                    map_results.append((chunk_text_val, res))
+                    # 进入临界区，安全写入
+                    with map_lock:
+                        map_results.append((chunk_text_val, res))
                     print(f"  -> ✅ 线程 {cid} 提取完毕: {res.get('new_concepts')}")
 
-                # ==========================================
-                # 🟡 PHASE 2: SHUFFLE (内存级同义词聚类)
-                # ==========================================
-                print("\n" + "=" * 60)
-                print("🔀 [Phase 2: SHUFFLE] 正在将碎片知识按概念重新洗牌聚类 (启动双语解构引擎)...")
+        # 🚨🚨🚨 核心修复：彻底退格！完全跳出了上面的 with ThreadPoolExecutor 循环 🚨🚨🚨
 
-                import re
+        # ==========================================
+        # 🟡 PHASE 2: SHUFFLE (内存级同义词聚类)
+        # ==========================================
+        print("\n" + "=" * 60)
+        print("🔀 [Phase 2: SHUFFLE] 正在将碎片知识按概念重新洗牌聚类 (启动双语解构引擎)...")
 
-                concept_payloads = {}
-                for chunk_text_val, res in map_results:
-                    concepts = res.get("new_concepts", [])
-                    summary = res.get("summary", "")
+        concept_payloads = {}
+        for chunk_text_val, res in map_results:
+            concepts = res.get("new_concepts", [])
+            summary = res.get("summary", "")
 
-                    for raw_c in concepts:
-                        # 💡 1. 核心魔法：用正则把 "Self-Attention (自注意力)" 拆成两半
-                        # match.group(1) 是英文，match.group(2) 是中文
-                        match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', raw_c)
+            for raw_c in concepts:
+                match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', raw_c)
+                if match:
+                    en_key = match.group(1).strip()
+                    zh_alias = match.group(2).strip()
+                    full_display = f"{en_key} ({zh_alias})"
+                else:
+                    en_key = raw_c.strip()
+                    zh_alias = ""
+                    full_display = en_key
 
-                        if match:
-                            en_key = match.group(1).strip()
-                            zh_alias = match.group(2).strip()
-                            full_display = f"{en_key} ({zh_alias})"  # 统一格式化为完美双语
-                        else:
-                            # 如果大模型偶尔没遵守规则，兜底处理
-                            en_key = raw_c.strip()
-                            zh_alias = ""
-                            full_display = en_key
+                if len(en_key.split()) > 4 or len(en_key) > 25:
+                    continue
 
-                        # 💡 2. 物理拦截：基于拆解出的英文进行长度过滤
-                        if len(en_key.split()) > 4 or len(en_key) > 25:
-                            continue
+                norm_c = self._normalize_name(en_key)
+                if not norm_c or len(norm_c) < 2:
+                    continue
 
-                        # 💡 3. 归一化：我们只拿【英文部分】去计算主键！这彻底解决了翻译不一致导致的分裂！
-                        norm_c = self._normalize_name(en_key)
-                        if not norm_c or len(norm_c) < 2:
-                            continue
+                if norm_c not in concept_payloads:
+                    concept_payloads[norm_c] = {
+                        "primary_key": en_key,
+                        "display_name": full_display,
+                        "aliases": set(),
+                        "texts": [],
+                        "summaries": []
+                    }
 
-                        if norm_c not in concept_payloads:
-                            concept_payloads[norm_c] = {
-                                "primary_key": en_key,  # 例如: "Self-Attention" (用于底层比对)
-                                "display_name": full_display,  # 例如: "Self-Attention (自注意力)" (给主编看)
-                                "aliases": set(),  # 收集所有的中文翻译变体
-                                "texts": [],
-                                "summaries": []
-                            }
+                if zh_alias:
+                    concept_payloads[norm_c]["aliases"].add(zh_alias)
 
-                        if zh_alias:
-                            concept_payloads[norm_c]["aliases"].add(zh_alias)
-
-                        concept_payloads[norm_c]["texts"].append(chunk_text_val)
-                        concept_payloads[norm_c]["summaries"].append(summary)
+                concept_payloads[norm_c]["texts"].append(chunk_text_val)
+                concept_payloads[norm_c]["summaries"].append(summary)
 
         # ==========================================
         # 🔴 PHASE 3: REDUCE (按概念逐个融合)
@@ -177,22 +166,27 @@ class IngestFlow:
         print("\n" + "=" * 60)
         total_concepts = len(concept_payloads)
         print(f"🧠 [Phase 3: REDUCE] 惊人降维！发现 {total_concepts} 个独立核心概念。")
-        print("主编接手，开始统一排版与落盘 (彻底告别死锁)...")
 
-        # 串行合并，完全没有并发写盘冲突！主编只需为每个概念写1次文件！
         for i, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
-            display_name = payload["display_name"]  # 这里主编看到的就是 "Self-Attention (自注意力)" 了！
+            display_name = payload["display_name"]
             print(f"\n" + "-" * 50)
             print(f"🔄 [融合 {i}/{total_concepts}] 目标概念: [{display_name}]")
 
-            # 将多块文本拼装
             combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
-            combined_summary = "\n".join(payload["summaries"])
 
+            # Token 熔断保护
+            MAX_CHARS = 8000
+            if len(combined_text) > MAX_CHARS:
+                print(f"  -> ⚠️ 警告：知识碎片过长 ({len(combined_text)} 字符)，已触发自动截断保护！")
+                combined_text = combined_text[:MAX_CHARS] + "\n\n... [数据过长，出于系统上下文保护已截断，请基于以上核心信息进行融合] ..."
+
+            combined_summary = "\n".join(payload["summaries"])
             existing_context = self._fetch_local_context([display_name])
 
             try:
-                report = self.editor.merge(
+                # 每次循环重启主编，消除记忆污染
+                fresh_editor = WikiEditor()
+                report = fresh_editor.merge(
                     raw_text=combined_text,
                     analyst_summary=combined_summary,
                     existing_context=existing_context
