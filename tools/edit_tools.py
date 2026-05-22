@@ -15,8 +15,8 @@ def _resolve(file_name: str) -> Path:
     kb_name = os.environ.get("ACTIVE_KB", "default")
     sub_dir = os.environ.get("ACTIVE_SUBDIR", "")
 
-    # 1. 核心变化：直接把工作区定在“父文件夹”级别，不管具体是哪篇 PDF
-    base_dir = Path("data/wiki") / kb_name / sub_dir
+    # 1. 核心变化：只改这一行！利用 __file__ 获取当前工具文件所在位置，死死锁住项目的绝对根目录
+    base_dir = Path(__file__).resolve().parent.parent / "data" / "wiki" / kb_name / sub_dir
 
     # 2. 智能路由
     if Path(file_name).name.lower() == "index.md":

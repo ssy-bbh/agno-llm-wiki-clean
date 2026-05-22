@@ -11,10 +11,25 @@ class WikiWriter:
         results = []
 
         def _is_same_concept(name1, name2):
-            eng1, eng2 = re.sub(r'[^a-zA-Z0-9]', '', name1).lower(), re.sub(r'[^a-zA-Z0-9]', '', name2).lower()
-            zh1, zh2 = re.sub(r'[^\u4e00-\u9fa5]', '', name1), re.sub(r'[^\u4e00-\u9fa5]', '', name2)
-            return (bool(eng1 and eng2) and (eng1 in eng2 or eng2 in eng1) and min(len(eng1), len(eng2)) >= 3) or \
-                   (bool(zh1 and zh2) and (zh1 in zh2 or zh2 in zh1) and min(len(zh1), len(zh2)) >= 2)
+            """聪明且克制的集合交集防撞雷达"""
+
+            def _get_aliases(text: str) -> set:
+                aliases = set()
+                # 1. 整体纯净版
+                clean_text = text.lower().replace("-", "").replace("_", "").replace(" ", "")
+                if clean_text: aliases.add(clean_text)
+
+                # 2. 括号双语解构版
+                match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
+                if match:
+                    part1 = match.group(1).lower().replace("-", "").replace("_", "").replace(" ", "")
+                    part2 = match.group(2).lower().replace("-", "").replace("_", "").replace(" ", "")
+                    if part1: aliases.add(part1)
+                    if part2: aliases.add(part2)
+                return aliases
+
+            # 只有两个名字的别名集合有交集，才算是同一个概念
+            return bool(_get_aliases(name1) & _get_aliases(name2))
 
         for action in actions:
             act_type = action.get("type")

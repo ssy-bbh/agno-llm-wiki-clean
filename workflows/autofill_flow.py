@@ -227,6 +227,6 @@ if __name__ == "__main__":
 
     print(f"\n🚀 锁定目标沙箱: [{selected_kb}]，准备启动侦测...")
 
-    # 触发阈值可以自己调，这里设定被引用 2 次及以上就触发填补
-    flow = AutoFillFlow(threshold=2)
+    # 触发阈值可以自己调，这里设定被引用 5 次及以上就触发填补
+    flow = AutoFillFlow(threshold=5)
     flow.run()
