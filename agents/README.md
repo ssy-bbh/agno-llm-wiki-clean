@@ -7,9 +7,9 @@
 | Agent | 模型 | 工具 | 职责 | 状态 |
 |---|---|---|---|---|
 | `web_researcher.py` | Qwen-Max (`get_qwen_model()`) | DuckDuckGo + Newspaper4k | 全网深度搜索与网页内容抓取 | ✅ |
-| `local_wiki.py` | Qwen-Max (`get_qwen_model()`) | LanceDB 知识库 | 本地知识库只读查询 | ✅ |
-| `wiki_analyst.py` | Qwen-Max | 无（纯文本分析） | **只读分析**：从资料提取概念，输出 `AnalysisReport` | ✅ |
-| `wiki_writer.py` | 无（纯执行器） | `edit_tools` | **只写执行**：接收报告，执行 create/edit/append_link/extract_moc | ✅ |
+| `local_wiki.py` | Qwen-Max (`get_qwen_model()`) | LanceDB 知识库 (Knowledge) | 本地知识库只读查询 | ✅ |
+| `wiki_analyst.py` | Qwen-Max | 无（纯文本分析） | **只读分析**：侦察兵，从资料提取概念+摘要，输出 `AnalysisReport` | ✅ |
+| `wiki_writer.py` | 无（纯执行器） | `edit_tools` | **只写执行**：接收 Report，执行 create/edit/append_link | ✅ |
 | `wiki_editor.py` | Qwen-Max | 无（纯决策） | **主编**：比对新旧知识，输出 `EditorReport` 融合动作 | ✅ |
 | `ppt_maker.py` | — | `ppt_tools` | PPT 生成 | 🔧 WIP |
 | `vision_analyst.py` | — | `vision_tools` | 视觉分析 | 🔧 WIP |
@@ -20,13 +20,13 @@
 wiki_analyst (只读分析) ──AnalysisReport──▶ wiki_writer (只写执行)
         │                                      │
    分析新资料                              操作磁盘文件
-   提取概念                                create_page / str_replace
-   输出 AnalysisReport                     append_link / extract_moc
+   提取概念+摘要                           create_page / str_replace
+   输出 AnalysisReport                     append_link
 ```
 
 **为什么分两步？**
 1. **分析阶段**（`wiki_analyst`）：纯文本推理，不碰磁盘。专注理解资料、提取概念、建立关联。
-2. **执行阶段**（`wiki_writer`）：纯 Python 执行器，不做分析。接收 `AnalysisReport` 后直接调用 `edit_tools` 操作文件系统。
+2. **执行阶段**（`wiki_writer`）：纯 Python 执行器，不做分析。接收 `AnalysisReport` / `EditorReport` 后直接调用 `edit_tools` 操作文件系统。
 
 ## 分析师-主编-撰稿人 三级流水线
 
@@ -36,18 +36,40 @@ wiki_analyst (只读分析) ──AnalysisReport──▶ wiki_writer (只写执
 新资料 ──▶ wiki_analyst ──▶ AnalysisReport ──▶ wiki_editor ──▶ EditorReport ──▶ wiki_writer ──▶ Wiki Pages
 ```
 
-1. **分析师**（`wiki_analyst`）：从新资料提取概念，输出 `AnalysisReport`（不碰磁盘）
-2. **主编**（`wiki_editor`）：调用 `local_wiki` 检索已有知识，对比新旧内容，生成精确的 `EditorReport` 融合动作
-3. **撰稿人**（`wiki_writer`）：执行 `EditorReport` 中的 create / edit / append / link 操作
+1. **分析师**（`wiki_analyst`）：从新资料提取概念与摘要，输出 `AnalysisReport`（不碰磁盘）
+2. **主编**（`wiki_editor`）：调用 `local_wiki` 检索已有知识，对比新旧内容，生成精确的 `EditorReport` 融合动作（create / edit / append_link）
+3. **撰稿人**（`wiki_writer`）：执行 `EditorReport` 中的操作，含同义词防撞雷达和活路径解析
 
 **分层设计原则**：
 
 | 层 | 职责 | Agent | 特征 |
 |---|---|---|---|
 | **数据层** | 获取原始资料 | `web_researcher`, `local_wiki` | 外部输入 |
-| **分析层** | 提取结构化知识 | `wiki_analyst` | 只读不写，输出 Pydantic |
-| **决策层** | 融合新旧知识 | `wiki_editor` | 只读决策，输出 Pydantic |
+| **分析层** | 提取结构化知识 | `wiki_analyst` | 只读不写，输出 `AnalysisReport` |
+| **决策层** | 融合新旧知识 | `wiki_editor` | 只读决策，输出 `EditorReport` + `Action` |
 | **执行层** | 持久化到磁盘 | `wiki_writer` | 只写不分析，纯执行器 |
+
+## Map-Reduce 知识摄取引擎 (`IngestFlow`)
+
+知识摄取采用 **Map-Reduce 并发架构**，大幅提升处理效率：
+
+```
+原始文档 ──▶ 切分知识块 ──▶ [Phase 1: MAP] 并发提取 ──▶ [Phase 2: SHUFFLE] 概念聚类 ──▶ [Phase 3: REDUCE] 逐概念融合
+                            12线程并发                       同义词解构                      主编逐个融合+写盘
+```
+
+- **Phase 1 MAP**：12 线程并发调用 `WikiAnalyst` 提取各知识块的核心概念
+- **Phase 2 SHUFFLE**：基于双语解构引擎（`英文名 (中文)` 格式）按概念聚类碎片知识
+- **Phase 3 REDUCE**：逐个概念启动新鲜 `WikiEditor` 进行融合，Token 超限自动截断
+
+## 工作流 (Workflows)
+
+| 工作流 | 文件 | 功能 | 状态 |
+|---|---|---|---|
+| 知识摄入 | `workflows/ingest_flow.py` | Map-Reduce 知识摄取流水线 | ✅ |
+| 审查织网 | `workflows/lint_flow.py` | 扫描双链，自动建立 Backlinks，清理死链 | ✅ |
+| 查询路由 | `workflows/query_flow.py` | 意图路由：本地 Wiki vs 全网搜索，汇总输出 | ✅ |
+| 幽灵节点填补 | `workflows/autofill_flow.py` | 探测真空节点（高频引用但无页面），自动合成 | ✅ |
 
 ## 关键文件
 
@@ -55,7 +77,33 @@ wiki_analyst (只读分析) ──AnalysisReport──▶ wiki_writer (只写执
 |---|---|
 | `core/llm_factory.py` | 模型工厂，`get_qwen_model()` 统一提供 LLM 实例 |
 | `prompts/wiki_prompt.py` | `build_analyst_system_prompt()` / `build_writer_system_prompt()` |
-| `tools/edit_tools.py` | Wiki 页面编辑工具集 |
-| `workflows/ingest_flow.py` | 知识摄取流水线编排 |
+| `prompts/research_prompt.py` | `get_deep_research_instructions()` |
+| `tools/edit_tools.py` | Wiki 页面编辑工具集（含 `_resolve` 活路径解析） |
+| `tools/document_parser.py` | 文档解析与分块（`extract_text` / `chunk_text`） |
+| `tools/search_tools.py` | 搜索工具集 |
+| `workflows/ingest_flow.py` | 知识摄取流水线编排（Map-Reduce） |
+| `workflows/lint_flow.py` | 知识库审查与反向链接织网 |
+| `workflows/query_flow.py` | 查询路由工作流（Team + Agent 编排） |
+| `workflows/autofill_flow.py` | 幽灵节点自动实例化引擎 |
+
+## 核心数据结构
+
+### `AnalysisReport`（分析师输出）
+```python
+class AnalysisReport(BaseModel):
+    new_concepts: List[str]    # 核心概念列表（强制双语：英文名 (中文)）
+    summary: str               # 约50-100字内容摘要
+```
+
+### `EditorReport`（主编输出）
+```python
+class Action(BaseModel):
+    type: Literal["create", "edit", "append_link"]
+    file: str
+    title / tags / abstract / old_str / content / link_to / rationale
+
+class EditorReport(BaseModel):
+    actions: List[Action]
+```
 
 > **设计哲学**：让每个 Agent 做好一件事，通过结构化的中间产物传递信息，而非直接操作共享状态。分析与执行分离，决策与写入分离。

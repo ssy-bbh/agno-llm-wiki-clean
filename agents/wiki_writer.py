@@ -96,47 +96,102 @@ class WikiWriter:
                 print(f"  -> {res}")
                 results.append(res)
 
+
             elif act_type == "extract_moc":
-                old_str = action.get("old_str", "")
+
+                # 1. 兼容大模型输出的多行文本和转义换行符
+
+                old_str = action.get("old_str", "").replace("\\n", "\n")
+
                 moc_title = (action.get("title", "")).strip()
+
                 moc_content = action.get("content", "")
 
                 safe_title = moc_title.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+
                 moc_raw_path = f"concepts/{safe_title}.md"
 
-                res = create_page(moc_raw_path, moc_title, ["#MOC", "#导航地图"], f"关于 {old_str.replace('#', '').strip()} 领域的知识汇聚与导航地图。", moc_content)
+                # 抽出第一行作为纯文本标题，避免 f-string 解析多行文本报错
+
+                desc_title = old_str.replace('#', '').strip().split('\n')[0] if old_str else moc_title
+
+                res = create_page(moc_raw_path, moc_title, ["#MOC", "#导航地图"],
+                                  f"关于 {desc_title} 领域的知识汇聚与导航地图。", moc_content)
+
                 print(f"  -> 🌟 [细胞裂变] 成功创建子地图: {safe_title}.md")
 
-                # 💡 核心修复 3：精准获取真实活路径下的 index.md
+                # 2. 核心：守护上下文的智能折叠算法
+
                 index_path = _resolve("index.md")
+
                 if index_path.exists():
+
                     content = index_path.read_text(encoding="utf-8")
+
+                    if not old_str.strip():
+                        continue
+
+                    # 提取雷达锚点：只要命中第一行标题即可
+
+                    first_line = old_str.strip().split('\n')[0]
+
+                    target_anchor = first_line.replace("#", "").strip().lower()
+
                     lines = content.split('\n')
+
                     new_lines = []
+
                     in_target_section = False
+
                     replaced = False
 
                     for line in lines:
-                        if line.strip() == old_str.strip():
+
+                        # 锚点命中：当前行是标题，且包含目标文本，开启折叠区间
+
+                        if not in_target_section and line.strip().startswith('#') and target_anchor in line.lower():
                             in_target_section = True
-                            new_lines.append(line)
+
+                            new_lines.append(line)  # 保留这个父级标题
+
                             continue
 
                         if in_target_section:
-                            if line.startswith('#'):
+
+                            # 遇到下一个带 # 的标题，关闭折叠区间，恢复正常解析
+
+                            if line.strip().startswith('#'):
+
                                 in_target_section = False
+
                                 new_lines.append(line)
-                            elif line.strip().startswith('- [[') or line.strip().startswith('* [['):
+
+
+                            # 🎯 核心逻辑：只折叠具体的概念链接！
+
+                            elif (line.strip().startswith('-') or line.strip().startswith(
+                                    '*')) and '[[' in line and ']]' in line:
+
+                                # 只要是带有双链的列表项，统统被折叠为 MOC 入口
+
                                 if not replaced:
-                                    new_lines.append(f"- [[{moc_title}]]")
+                                    new_lines.append(f"- 🗂️ [[{moc_title}]]")
+
                                     replaced = True
+
                             else:
+
+                                # 🛡️ 守护机制：领域描述、没有链接的说明文字、排版空行，原封不动保留！
+
                                 new_lines.append(line)
+
                         else:
+
                             new_lines.append(line)
 
                     index_path.write_text('\n'.join(new_lines), encoding="utf-8")
-                    print(f"  -> ✂️ [精细截断] index.md 导航地图已自动折叠至 [[{moc_title}]]")
+
+                    print(f"  -> ✂️ [精细截断] index.md 导航地图已优雅折叠至 [[{moc_title}]] (已保留上下文描述)")
 
             elif act_type == "append_link":
                 old_str = action.get("old_str")

@@ -72,7 +72,7 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str, cont
     details_text = content if content else "（等待后续扩展）"
 
     # 强制套用标准模板
-    body = f"""# {title}          和
+    body = f"""# {title}
 
 > **Tags:** {tag_str}
 > **Created:** {date_str}
