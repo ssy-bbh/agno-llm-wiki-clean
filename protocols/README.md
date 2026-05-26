@@ -27,6 +27,6 @@
 
 ## 扩展指引
 
-- 新增协议：在本目录新建 `.md` 文件，`load_protocols()` 会自动加载
-- 修改规范：直接编辑 `schema.md`，Agent 下次执行时自动生效
-- 不在此目录放 Python 代码
+- **新增协议**：在本目录新建 `.md` 文件，Agent instructions 中可通过文件读取引用
+- **修改规范**：直接编辑 `schema.md`，Agent 下次摄入/写入时自动生效
+- **不在此目录放 Python 代码**：这里是纯 Markdown 协议层

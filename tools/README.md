@@ -8,10 +8,10 @@
 |------|------|------|
 | `search_tools.py` | DuckDuckGoTools 联网搜索 + Newspaper4kTools 全文抓取 | ✅ |
 | `file_tools.py` | 安全文件操作：路径锁定在 `data/wiki/`，拒绝 `../` 越界遍历 | ✅ |
-| `edit_tools.py` | `str_replace` 精密局部替换 + `create_page` 新建页面 + `append_to_log` 审计日志。**所有写入必须经过此模块** | ✅ |
+| `edit_tools.py` | `str_replace` 精密局部替换 + `create_page` 新建页面。**含 `_resolve()` 活路径解析 + 同义词防撞** | ✅ |
 | `ppt_tools.py` | python-pptx 封装，根据大纲生成 PPT | 🔧 WIP |
 | `vision_tools.py` | 图片读取、OCR 等视觉预处理 | 🔧 WIP |
-| `document_parser.py` | 文档解析（PDF 读取、文本分块） | ✅ |
+| `document_parser.py` | 文档解析（PDF 读取、文本分块 `extract_text` / `chunk_text`） | ✅ |
 
 ## 安全隔离
 

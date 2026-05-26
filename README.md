@@ -23,16 +23,17 @@
 
 像改文档一样调整策略，无需修改源码。
 
-### 2. 两步思维链（Two-Step CoT）
+### 2. 分析师-主编-撰稿人 三级流水线 + 两步思维链
 
 ```
-wiki_analyst ──分析──→ AnalysisReport(JSON) ──→ wiki_writer ──写入──→ data/wiki/
-  (只读不碰磁盘)         (可验证、可回滚)          (只写不分析)         (str_replace)
+新资料 ──▶ wiki_analyst ──▶ AnalysisReport ──▶ wiki_editor ──▶ EditorReport ──▶ wiki_writer ──▶ data/wiki/
+  (原始输入)    (只读分析)    (概念+摘要)        (比对决策)     (精确动作)      (只写执行)      (str_replace)
 ```
 
-- **分析**与**写入**物理隔离：`wiki_analyst` 只读不写，`wiki_writer` 只写不分析
-- 中间传递结构化 JSON 报告，可验证、可审计、可回滚
-- `wiki_writer` 使用 `str_replace` 精确替换，避免整页覆写
+- **分析师**（`wiki_analyst`）：纯文本推理，提取核心概念与摘要，输出 `AnalysisReport`
+- **主编**（`wiki_editor`）：检索已有知识，对比新旧内容，输出精确的 `EditorReport`（create / edit / append_link）
+- **撰稿人**（`wiki_writer`）：纯 Python 执行器，接收 Report 后操作文件系统
+- 分析与执行分离、决策与写入分离，中间传递 Pydantic 结构化报告
 
 ### 3. 读写分离
 
@@ -46,15 +47,16 @@ LanceDB      → 语义兜底，仅在 index.md 超载时启用
 - `index.md` 是全局导航地图，每次读写**必读**
 - `log.md` 是 append-only 审计日志
 
-### 4. Workflow 确定性
+### 4. Map-Reduce 并发摄入 + Workflow 确定性
 
 | 工作流 | 步骤 | 特点 |
 |---|---|---|
-| `ingest_flow` | 分析 → 写入 → 追加日志 | **串行执行**，禁止 Agent 自由发挥 |
+| `ingest_flow` | MAP 并发提取 → SHUFFLE 概念聚类 → REDUCE 逐概念融合 | **Map-Reduce 并发**，12线程并行提取 |
 | `lint_flow` | 死链检测 → Backlinks 织网 → 孤立页面报告 | 定期审查 |
 | `query_flow` | Team[local_wiki + web_researcher] → Summarizer 汇总 | 查询路由 |
+| `autofill_flow` | 扫描双链 → 探测真空节点 → 自动合成填充 | 知识黑洞自愈 |
 
-`ingest_flow` 强制串行（analyze→write→log），知识摄入过程不引入并发，确保每步可追溯。
+`ingest_flow` 采用三阶段 Map-Reduce 架构：Phase 1 12线程并发提取 → Phase 2 同义词聚类 → Phase 3 逐概念融合写入，兼顾效率与质量。
 
 ---
 
@@ -66,16 +68,16 @@ LanceDB      → 语义兜底，仅在 index.md 超载时启用
 │              AgentOS · Router · SqliteDb                 │
 └────────────┬──────────────────────────┬──────────────────┘
              │                          │
-    ┌────────▼────────┐        ┌────────▼────────┐
-    │   Agents 层      │        │  Workflows 层    │
-    │  web_researcher │        │  ingest_flow    │
-    │  local_wiki     │        │  lint_flow      │
-    │  wiki_analyst ◄─┼───────►│  query_flow     │
-    │  wiki_writer    │  CoT   │                 │
-    │  wiki_editor    │        │                 │
-    │  ppt_maker      │        │                 │
-    │  vision_analyst │        │                 │
-    └────────┬────────┘        └───────────┬───────┘
+    ┌────────▼────────┐        ┌────────▼──────────┐
+    │   Agents 层      │        │  Workflows 层      │
+    │  web_researcher │        │  ingest_flow       │
+    │  local_wiki     │        │  lint_flow         │
+    │  wiki_analyst ◄─┼───────►│  query_flow        │
+    │  wiki_writer    │  CoT   │  autofill_flow     │
+    │  wiki_editor    │        │                    │
+    │  ppt_maker      │        │                    │
+    │  vision_analyst │        │                    │
+    └────────┬────────┘        └───────────┬────────┘
              │                             │
     ┌────────▼─────────────────────────────▼───┐
     │           Tools & Protocols               │
@@ -138,9 +140,10 @@ agno-llm-wiki-demo/
 │   └── vision_analyst.py   # 视觉分析（扩展中）
 │
 ├── workflows/              # 确定性工作流
-│   ├── ingest_flow.py      # 摄入流水线：分析→写入→日志
+│   ├── ingest_flow.py      # 摄入流水线：Map-Reduce 三阶段并发
 │   ├── lint_flow.py        # 审查流水线：死链检测 + 反向链接织网
-│   └── query_flow.py       # 查询路由：Team[local_wiki+web_researcher]→汇总
+│   ├── query_flow.py       # 查询路由：Team[local_wiki+web_researcher]→汇总
+│   └── autofill_flow.py    # 幽灵节点填补：探测真空节点并自动合成
 │
 ├── data/                   # 数据层（读写分离）
 │   ├── raw/               # 只读来源层
@@ -231,7 +234,9 @@ result = wf.run(query="你的问题")
 - [x] Workflows（ingest_flow / lint_flow / query_flow）
 - [x] 读写分离数据拓扑 + index.md 全局导航
 - [x] LanceDB 向量兜底检索
-- [x] 两步思维链（分析/写入隔离）
+- [x] 两步思维链（分析师→主编→撰稿人三级流水线）
+- [x] Map-Reduce 并发摄入引擎（12线程 + 同义词聚类 + 逐概念融合）
+- [x] 幽灵节点自动填补（autofill_flow 双向链接扫描 + 真空合成）
 
 ### 🔧 扩展中
 
@@ -244,6 +249,7 @@ result = wf.run(query="你的问题")
 - [ ] `index.md` 超载自动拆分（>500 行阈值）
 - [ ] 增量摄入：同一来源二次更新（diff + merge）
 - [ ] 冲突解决：多来源引用同一概念的合并策略
+- [ ] 上下文智能剪枝：按标题分块 + 语义匹配，减少主编输入负载
 - [ ] `lint_flow.py` LLM 自动修复死链（当前仅报告）
 - [ ] Web 前端：资料上传 / 摄入状态 / Wiki 浏览
 

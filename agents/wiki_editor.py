@@ -9,7 +9,7 @@ from core.llm_factory import get_qwen_model
 
 # 💡 我们把 Action 的定义移交给了主编，因为只有它才有权下达动作指令
 class Action(BaseModel):
-    type: Literal["create", "edit", "append_link"] = Field(description="必须严格使用这三个词之一")
+    type: Literal["create", "edit", "append_link", "extract_moc"] = Field(description="必须严格使用这四个词之一")
     file: str = Field(description="文件路径")
     title: Optional[str] = Field(default=None)
     tags: Optional[List[str]] = Field(default=None)
@@ -46,7 +46,12 @@ class WikiEditor:
            - `content`：写入融合了新旧知识的全新段落。
         4. 【强制双链】：所有技术术语、模型名称必须用 [[ ]] 包裹。
         5.【专注原则】：在当前的决策中，你只被允许修改你在【本地已有文件内容】中亲眼看到的文件（如 index.md 和当前的目标概念文件）。绝对、绝对不允许尝试去 edit 任何未在此上下文中展示的旧文件！
-        6.
+        6. 【渐进式披露 (extract_moc)】（最高警戒）：在修改 `index.md` 时，必须时刻监控信息密度！
+           - ⚡ 触发条件：当你准备向 `index.md` 的某个 `### 标题` 下追加链接时，如果发现该标题下现有的 `[[具体知识点]]` 链接数量达到或超过 7 个，你绝对不能继续使用 'append_link'！
+           - 🛠️ 强制动作：你必须改为输出 'extract_moc' 动作，将该标题下的所有旧链接与你的新链接，一起打包提取为一个独立的 MOC (导航地图) 文件。
+           - `old_str`：必须包含该标题和下方所有的旧链接（用于底层的雷达精确锁定与折叠）。
+           - `title`：新子地图的名称（如 "YOLO系列演进 MOC"）。
+           - `content`：新子地图的完整正文（包含领域摘要、分类标题以及所有的具体链接）。
         """
         self.agent = Agent(
             model=get_qwen_model(),

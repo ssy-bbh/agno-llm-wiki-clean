@@ -205,7 +205,7 @@ class IngestFlow:
 
 
 if __name__ == "__main__":
-    raw_dir = Path("data/raw")
+    raw_dir = Path("../data/raw")
 
     if not raw_dir.exists():
         raw_dir.mkdir(parents=True, exist_ok=True)
