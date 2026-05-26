@@ -3,6 +3,8 @@ autofill_flow.py — 幽灵节点实例化引擎 (知识黑洞自动填补)
 """
 import os
 import re
+import json
+import asyncio
 from pathlib import Path
 from collections import Counter
 
@@ -23,14 +25,23 @@ class AutoFillFlow:
         if not text: return ""
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
-    def run(self):
-        kb_name = os.environ.get("ACTIVE_KB", "default")
-        print("\n" + "=" * 60)
-        print(f"🕳️ [AutoFill Flow] 启动知识黑洞探测器 | 目标沙箱: {kb_name}")
+    async def stream_run(self, kb_name: str):
+        """
+        🚀 Web 端专用的真空节点流式实例化引擎
+        """
+        def format_log(msg: str):
+            return f"data: {json.dumps({'type': 'log', 'content': msg})}\n\n"
 
-        concepts_dir = Path("../data/wiki") / kb_name / "concepts"
+        yield format_log(f"🕳️ [AutoFill Flow] 启动知识黑洞探测器 | 🎯 锁定目标沙箱: {kb_name}")
+        await asyncio.sleep(0.01)
+
+        # 💡 强制切置底层环境变量，确保 _resolve 工具寻路绝不窜台
+        os.environ["ACTIVE_KB"] = kb_name
+        os.environ["ACTIVE_SUBDIR"] = ""
+
+        concepts_dir = Path(__file__).resolve().parent.parent / "data" / "wiki" / kb_name / "concepts"
         if not concepts_dir.exists():
-            print("❌ concepts 目录不存在，图谱为空，无法探测。")
+            yield format_log("❌ 错误：concepts 核心概念仓不存在，图谱为空，无法探测。")
             return
 
         # ==========================================
@@ -39,11 +50,11 @@ class AutoFillFlow:
         link_counter = Counter()
         backlinks_context = {}  # 记录谁引用了它，用于给大模型提供溯源上下文
 
-        print("📡 正在全盘扫描物理文件并提取双向链接...")
+        yield format_log("📡 正在全盘解构物理文件并精确提取双向引用权重...")
+        await asyncio.sleep(0.01)
+
         for file_path in concepts_dir.glob("*.md"):
             content = file_path.read_text(encoding="utf-8")
-
-            # 提取所有 [[xxx]] 或 [[xxx|yyy]] 格式的链接
             links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
 
             for link in links:
@@ -51,10 +62,8 @@ class AutoFillFlow:
                 if not clean_link: continue
 
                 link_counter[clean_link] += 1
-
                 if clean_link not in backlinks_context:
                     backlinks_context[clean_link] = []
-                # 记录来源文件的名字
                 if file_path.stem not in backlinks_context[clean_link]:
                     backlinks_context[clean_link].append(file_path.stem)
 
@@ -65,90 +74,73 @@ class AutoFillFlow:
         existing_files = list(concepts_dir.glob("*.md"))
 
         def _get_real_target_if_exists(ghost_name: str, files: list) -> str:
-            """终极防撞雷达：基于括号解构的别名集合交集法，0误杀！"""
-            import re
-
+            """基于括号解构的别名集合交集法"""
             def _get_aliases(text: str) -> set:
                 aliases = set()
-                # 1. 放入整体干净名称 (去掉横线空格等干扰符)
                 clean_text = text.lower().replace("-", "").replace("_", "").replace(" ", "")
-                if clean_text:
-                    aliases.add(clean_text)
-
-                # 2. 如果符合 "A (B)" 或 "A（B）" 格式，安全拆解出 A 和 B 作为独立别名
+                if clean_text: aliases.add(clean_text)
                 match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
                 if match:
                     part1 = match.group(1).lower().replace("-", "").replace("_", "").replace(" ", "")
                     part2 = match.group(2).lower().replace("-", "").replace("_", "").replace(" ", "")
                     if part1: aliases.add(part1)
                     if part2: aliases.add(part2)
-
                 return aliases
 
             ghost_aliases = _get_aliases(ghost_name)
-
             for ex_file in files:
                 ex_aliases = _get_aliases(ex_file.stem)
-
-                # 🎯 核心魔法：集合求交集。只要有一个别名完全对上，就是同一个概念！
                 if ghost_aliases & ex_aliases:
                     return ex_file.stem
-
             return ""
 
-        print("\n" + "=" * 60)
-        print("🛠️ [自愈系统] 正在进行假空节点清洗与底层链接重定向...")
+        yield format_log("🛠️ [自愈系统] 正在清理异名同义假空节点并自动重定向物理指针...")
+        await asyncio.sleep(0.01)
 
         for link, count in link_counter.items():
             real_target = _get_real_target_if_exists(link, existing_files)
 
             if real_target:
                 if link != real_target:
-                    print(f"  -> 🔀 [偷天换日] 发现异名假空节点 [{link}] -> 真实归宿 [{real_target}]")
+                    yield format_log(f"  -> 🔀 [偷天换日] 修复假空节点 [{link}] -> 真实归宿 [{real_target}]")
+                    await asyncio.sleep(0.01)
                     for source_file in backlinks_context[link]:
                         source_path = concepts_dir / f"{source_file}.md"
                         if source_path.exists():
                             content = source_path.read_text(encoding="utf-8")
                             pattern = re.compile(rf'\[\[{re.escape(link)}(?:\|([^\]]+))?\]\]')
-                            new_content = pattern.sub(lambda m: f"[[{real_target}|{m.group(1) or link}]]",
-                                                      content)
+                            new_content = pattern.sub(lambda m: f"[[{real_target}|{m.group(1) or link}]]", content)
 
                             if new_content != content:
                                 source_path.write_text(new_content, encoding="utf-8")
-                                print(f"    -> ✅ 成功重定向文件底层的幽灵指针: {source_file}.md")
             else:
-                # 🎯 这里是纯正的真空节点！大模型没写过的处女地！
                 if count >= self.threshold:
                     target_ghosts.append((link, count))
 
-        # 按入度从高到低排序
         target_ghosts.sort(key=lambda x: x[1], reverse=True)
 
-        # 💡 把打印真空节点的逻辑独立出来，让你一眼看到它们！
         if not target_ghosts:
-            print("\n✅ 图谱极其健康，没有发现达到阈值的真空知识黑洞。")
-        else:
-            print(f"\n🎯 警报！发现 {len(target_ghosts)} 个高频真空节点 (入度 >= {self.threshold})：")
-            for node, count in target_ghosts:
-                sources = ", ".join(backlinks_context[node][:3])
-                more = "..." if len(backlinks_context[node]) > 3 else ""
-                print(f"  - [{node}] (入度: {count} | 来源: {sources}{more})")
+            yield format_log("✅ 经脉调理完毕：当前图谱极其健康，未发现任何触发阈值的真空知识黑洞。")
+            return
+
+        yield format_log(f"🎯 警报！全库共探测到 {len(target_ghosts)} 个严重高频真空节点 (被引用 >= {self.threshold}次)：")
+        await asyncio.sleep(0.01)
+
         # ==========================================
         # 3. 逐个召唤主编进行物理填补
         # ==========================================
-        print("\n" + "=" * 60)
-        print("🪄 开始自动合成节点...")
+        yield format_log("🪄 正在物理启动熔炉，呼叫 WikiEditor / WikiWriter 智能体合成真空实体...")
+        await asyncio.sleep(0.01)
 
         for node, count in target_ghosts:
-            print(f"\n✨ [实例化] 正在合成空节点: [{node}]")
+            yield format_log(f"✨ [实例化中] 正在驱动大模型提取上下文并合成新实体: [{node}]")
+            await asyncio.sleep(0.01)
 
-            # 💡 核心魔法：组装溯源上下文
-            # 把引用了这个概念的原文开头拿出来，喂给大模型，防止它胡编乱造
             source_docs_str = ""
             for source_file in backlinks_context[node][:3]:
-                source_path = _resolve(f"concepts/{source_file}.md")
+                source_path = concepts_dir / f"{source_file}.md"
                 if source_path.exists():
-                    snippet = source_path.read_text(encoding='utf-8')[:600]  # 取前600字
+                    snippet = source_path.read_text(encoding='utf-8')[:600]
                     source_docs_str += f"\n=== {source_file} (提及了该概念) ===\n{snippet}...\n"
 
             prompt_text = (
@@ -159,10 +151,7 @@ class AutoFillFlow:
             )
 
             try:
-                # 每次重新实例化主编，确保脑子干净
                 fresh_editor = WikiEditor()
-
-                # 欺骗大模型，把它当作普通的合并任务
                 report = fresh_editor.merge(
                     raw_text=prompt_text,
                     analyst_summary=f"这是一个高频核心实体，必须创建一个全新的详细词条：{node}",
@@ -171,62 +160,38 @@ class AutoFillFlow:
 
                 if report and report.get("actions"):
                     self.writer.execute(report)
+                    yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功: concepts/{node}.md")
                 else:
-                    print(f"  -> ⏭️ 主编拒绝生成: [{node}]")
+                    yield format_log(f"  -> ⏭️ 智能主编拒绝生成词条: [{node}]")
+                await asyncio.sleep(0.01)
             except Exception as e:
-                print(f"  -> ❌ 填补 [{node}] 时发生致命错误: {e}")
+                yield format_log(f"  -> ❌ 填补节点 [{node}] 发生未知阻断: {e}")
 
-        print("\n" + "=" * 60)
-        print("✅ [AutoFill Flow] 幽灵节点全部实例化完毕，图谱经脉已打通！")
+        yield format_log("✅ [AutoFill Flow] 真空幽灵实体全部实例化完毕，图谱暗物质已清除！")
+
+    def run(self):
+        """保留单机终端调试脚本兼容性"""
+        wiki_dir = Path(__file__).resolve().parent.parent / "data" / "wiki"
+        if not wiki_dir.exists():
+            return
+        kbs = [p for p in wiki_dir.iterdir() if p.is_dir()]
+        if not kbs: return
+        print("\n📂 请选择本地沙箱：")
+        for i, kb in enumerate(kbs, 1):
+            print(f"  [{i}] {kb.name}")
+        choice = input("👉 输入编号: ").strip()
+        selected_kb = kbs[int(choice) - 1].name
+
+        async def run_cli():
+            async for log in self.stream_run(selected_kb):
+                clean_line = log.replace("data: ", "").strip()
+                if clean_line:
+                    try:
+                        print(json.loads(clean_line).get("content", ""))
+                    except: pass
+        asyncio.run(run_cli())
 
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-
-    wiki_dir = Path("../data/wiki")
-
-    if not wiki_dir.exists():
-        print(f"❌ 找不到 {wiki_dir} 目录，当前没有任何知识库！")
-        sys.exit(0)
-
-    # 扫描所有的子文件夹（每一个子文件夹就是一个独立的知识库）
-    kbs = [p for p in wiki_dir.iterdir() if p.is_dir()]
-
-    if not kbs:
-        print(f"📭 {wiki_dir} 目录下空空如也，请先运行摄入流生成知识图谱。")
-        sys.exit(0)
-
-    print("\n" + "=" * 50)
-    print("🕳️ 欢迎使用 幽灵节点自动实例化引擎 (黑洞填补)")
-    print("=" * 50)
-    print("请选择你要扫描并修补的知识库：\n")
-
-    for i, kb in enumerate(kbs, 1):
-        print(f"  [{i}] 📚 {kb.name}")
-    print("\n" + "=" * 50)
-
-    try:
-        choice = input("👉 请输入对应编号 (按 Ctrl+C 退出): ").strip()
-        choice_idx = int(choice) - 1
-        if choice_idx < 0 or choice_idx >= len(kbs):
-            raise ValueError
-    except (ValueError, IndexError):
-        print("❌ 输入无效，请输入正确的数字编号。")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\n👋 已取消操作。")
-        sys.exit(0)
-
-    # 获取用户选择的真实知识库名称
-    selected_kb = kbs[choice_idx].name
-
-    # 注入环境变量，让底层的 _resolve 函数知道该去哪个目录干活
-    os.environ["ACTIVE_KB"] = selected_kb
-    os.environ["ACTIVE_SUBDIR"] = ""
-
-    print(f"\n🚀 锁定目标沙箱: [{selected_kb}]，准备启动侦测...")
-
-    # 触发阈值可以自己调，这里设定被引用 5 次及以上就触发填补
     flow = AutoFillFlow(threshold=5)
     flow.run()

@@ -38,7 +38,7 @@ export default function QueryMode({ selectedSandbox }) {
 
     try {
       // 🚀 双端连接：将问题、当前隔离区沙箱标识、历史上下文捆绑发往后端
-      const response = await fetch('http://127.0.0.1:8000/api/chat', {
+      const response = await fetch('http://127.0.0.1:8888/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

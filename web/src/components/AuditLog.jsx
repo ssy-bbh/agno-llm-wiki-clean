@@ -1,45 +1,34 @@
-import { mockAuditLogs } from '../data/mockData'
+import { useEffect, useRef } from 'react'
 
-export default function AuditLog() {
+export default function AuditLog({ logs }) {
+  const logEndRef = useRef(null)
+
+  // 自动平滑滚动到最新一条熔炉进度日志
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [logs])
+
+  if (!logs || logs.length === 0) {
+    return <div className="text-slate-600 italic">暂无熔炉运行记录。</div>
+  }
+
   return (
-    <div className="p-3">
-      {/* Header */}
-      <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/40 border border-slate-700/40 mb-3">
-        <span className="text-slate-400">📜</span>
-        <div>
-          <p className="text-xs text-slate-300 font-medium">织网档案室</p>
-          <p className="text-[10px] text-slate-500">操作审计日志 · 持久化记录</p>
-        </div>
-      </div>
+    <div className="space-y-1.5 flex flex-col h-full select-text">
+      {logs.map((log, index) => {
+        // 根据日志的前缀特征动态渲染有质感的赛博颜色
+        let textColor = 'text-emerald-400'
+        if (log.text.startsWith('❌') || log.text.startsWith('💥')) textColor = 'text-red-400 font-semibold'
+        if (log.text.startsWith('⚠️') || log.text.startsWith('🚨')) textColor = 'text-amber-400'
+        if (log.text.startsWith('🚀') || log.text.startsWith('🔥')) textColor = 'text-cyan-400 font-medium'
+        if (log.text.startsWith('  ->')) textColor = 'text-slate-400 pl-2'
 
-      {/* Logs */}
-      <div className="space-y-1">
-        {mockAuditLogs.map(log => (
-          <div
-            key={log.id}
-            className="px-3 py-2 rounded-lg bg-black/30 border border-slate-800/40 font-mono text-[11px] hover:bg-black/40 transition-all"
-          >
-            <div className="flex items-start gap-2">
-              <span className="text-slate-600 shrink-0">{log.time}</span>
-              <span className={`shrink-0 ${log.type === 'human' ? 'text-emerald-500/80' : 'text-cyan-500/80'}`}>
-                {log.type === 'human' ? '👤' : '🤖'}
-              </span>
-              <span className="text-slate-300">
-                <span className={log.type === 'human' ? 'text-emerald-400/80' : 'text-cyan-400/80'}>
-                  {log.user}
-                </span>
-                {' '}{log.action}
-              </span>
-            </div>
+        return (
+          <div key={index} className={`whitespace-pre-wrap leading-relaxed ${textColor}`}>
+            {log.text}
           </div>
-        ))}
-      </div>
-
-      {/* Bottom indicator */}
-      <div className="mt-3 flex items-center justify-center gap-2 text-[10px] text-slate-600">
-        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500/60 animate-pulse" />
-        <span>日志实时同步中</span>
-      </div>
+        )
+      })}
+      <div ref={logEndRef} />
     </div>
   )
 }

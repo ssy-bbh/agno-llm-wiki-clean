@@ -12,7 +12,7 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
       return
     }
 
-    fetch(`http://127.0.0.1:8000/api/graph?workspace=${selectedSandbox}`)
+    fetch(`http://127.0.0.1:8888/api/graph?workspace=${selectedSandbox}`)
       .then(res => res.json())
       .then(data => {
         // 终极防线：收集所有真实存在的节点 ID

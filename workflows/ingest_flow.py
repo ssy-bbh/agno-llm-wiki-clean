@@ -9,7 +9,7 @@ from agents.wiki_analyst import WikiAnalyst
 from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
-from tools.edit_tools import _resolve  # 💡 必须引入，用于动态定位活路径
+from tools.edit_tools import _resolve
 
 
 class IngestFlow:
@@ -20,7 +20,7 @@ class IngestFlow:
     def __init__(self):
         self.analyst = WikiAnalyst()
         self.writer = WikiWriter()
-        # 注意：这里不再全局初始化 Editor，而是在 Phase 3 中每次循环重新初始化
+        # Editor 会在循环内动态实例化，防止上下文记忆污染
 
     def _normalize_name(self, text: str) -> str:
         if not text:
@@ -28,8 +28,7 @@ class IngestFlow:
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
     def _find_existing_file(self, concept: str) -> Path:
-        """同义词嗅探器：使用 _resolve 精准定位到当前激活的活路径下"""
-        # 💡 核心修复：必须用 _resolve("concepts")，否则它会去根目录找，导致上下文失明
+        """同义词嗅探器：使用 _resolve 精准定位到当前激活的沙箱路径下"""
         concepts_dir = _resolve("concepts")
         if not concepts_dir.exists():
             return None
@@ -42,6 +41,7 @@ class IngestFlow:
             norm_f = self._normalize_name(f.stem)
             if norm_c == norm_f:
                 return f
+            # 模糊包含匹配
             if len(norm_c) > 2 and len(norm_f) > 2:
                 if norm_c in norm_f or norm_f in norm_c:
                     return f
@@ -50,9 +50,8 @@ class IngestFlow:
     def _fetch_local_context(self, concepts: list) -> str:
         """档案管理员：提取上下文，提供给大模型参考"""
         context_str = "\n"
-
-        # 💡 核心修复：必须用 _resolve 获取真实的导航地图路径
         index_path = _resolve("index.md")
+
         if index_path.exists():
             context_str += f"=== index.md (导航地图) ===\n{index_path.read_text(encoding='utf-8')}\n\n"
         else:
@@ -87,10 +86,10 @@ class IngestFlow:
 
         path = Path(input_source)
         if path.exists() and path.is_file():
-            print(f"📄 目标文件：{path.name}")
+            print(f"📄 目标语料：{path.name}")
             raw_text = extract_text(str(path))
             chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
-            print(f"✂️ 切分为 {len(chunks)} 个知识块。")
+            print(f"✂️ 物理切分为 {len(chunks)} 个知识块。")
         else:
             chunks = [input_source]
 
@@ -103,18 +102,17 @@ class IngestFlow:
         print("⚡ [Phase 1: MAP] 启动侦察兵并发提取 (释放全部线程)...")
 
         map_results = []
+        # 使用 12 个并发线程进行提取
         with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {executor.submit(self._map_extract, chunk, i + 1): i for i, chunk in enumerate(chunks)}
 
             for future in as_completed(futures):
                 cid, chunk_text_val, res, status = future.result()
                 if res:
-                    # 进入临界区，安全写入
+                    # 进入临界区，安全写入内存
                     with map_lock:
                         map_results.append((chunk_text_val, res))
                     print(f"  -> ✅ 线程 {cid} 提取完毕: {res.get('new_concepts')}")
-
-        # 🚨🚨🚨 核心修复：彻底退格！完全跳出了上面的 with ThreadPoolExecutor 循环 🚨🚨🚨
 
         # ==========================================
         # 🟡 PHASE 2: SHUFFLE (内存级同义词聚类)
@@ -128,6 +126,7 @@ class IngestFlow:
             summary = res.get("summary", "")
 
             for raw_c in concepts:
+                # 尝试剥离 "English (中文)" 格式
                 match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', raw_c)
                 if match:
                     en_key = match.group(1).strip()
@@ -138,6 +137,7 @@ class IngestFlow:
                     zh_alias = ""
                     full_display = en_key
 
+                # 过滤明显不是概念的超长垃圾数据
                 if len(en_key.split()) > 4 or len(en_key) > 25:
                     continue
 
@@ -161,7 +161,7 @@ class IngestFlow:
                 concept_payloads[norm_c]["summaries"].append(summary)
 
         # ==========================================
-        # 🔴 PHASE 3: REDUCE (按概念逐个融合)
+        # 🔴 PHASE 3: REDUCE (按概念逐个融合落盘)
         # ==========================================
         print("\n" + "=" * 60)
         total_concepts = len(concept_payloads)
@@ -174,7 +174,7 @@ class IngestFlow:
 
             combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
 
-            # Token 熔断保护
+            # Token 熔断保护 (防止合并后文本过长撑爆大模型)
             MAX_CHARS = 8000
             if len(combined_text) > MAX_CHARS:
                 print(f"  -> ⚠️ 警告：知识碎片过长 ({len(combined_text)} 字符)，已触发自动截断保护！")
@@ -184,7 +184,7 @@ class IngestFlow:
             existing_context = self._fetch_local_context([display_name])
 
             try:
-                # 每次循环重启主编，消除记忆污染
+                # 每次循环重启主编，消除前一个概念的记忆污染
                 fresh_editor = WikiEditor()
                 report = fresh_editor.merge(
                     raw_text=combined_text,
@@ -200,8 +200,7 @@ class IngestFlow:
                 print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
 
         print("\n" + "=" * 60)
-        print("✅ [IngestFlow] 终极降维摄入完毕，知识图谱完美生长！")
-        print("=" * 60)
+        print("✅ [IngestFlow] 单文件降维摄入完毕，知识图谱已延展！")
 
 
 if __name__ == "__main__":
@@ -212,6 +211,7 @@ if __name__ == "__main__":
         print(f"⚠️ 找不到 {raw_dir} 目录，已为您自动创建。请先将数据放入该目录！")
         sys.exit(0)
 
+    # 读取 raw/ 下的所有文件夹（作为沙箱）和 PDF
     items = [p for p in raw_dir.iterdir() if p.is_dir() or p.suffix.lower() == '.pdf']
 
     if not items:
@@ -219,12 +219,12 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print("\n" + "=" * 50)
-    print("🤖 欢迎使用 LLM-Wiki 自动化摄入系统")
+    print("🤖 欢迎使用 LLM-Wiki 本地自动化摄入系统")
     print("=" * 50)
     print("请选择要处理的知识源：\n")
 
     for i, item in enumerate(items, 1):
-        icon = "📁" if item.is_dir() else "📄"
+        icon = "🗂️" if item.is_dir() else "📄"
         print(f"  [{i}] {icon} {item.name}")
     print("\n" + "=" * 50)
 
@@ -241,33 +241,34 @@ if __name__ == "__main__":
         sys.exit(0)
 
     input_target = items[choice_idx]
-    kb_name = input_target.stem
-
-    os.environ["ACTIVE_KB"] = kb_name
-    print(f"\n🌐 [系统路由] 自动提取并激活知识隔离区: {kb_name}")
-
     flow = IngestFlow()
 
-    if input_target.is_file():
-        os.environ["ACTIVE_SUBDIR"] = ""
-        os.environ["ACTIVE_DOC_NAME"] = input_target.stem
-        flow.run(str(input_target))
-
-    elif input_target.is_dir():
+    # 💡 核心逻辑适配：如果选择了文件夹，则文件夹名即为专属沙箱名
+    if input_target.is_dir():
         files = list(input_target.rglob("*.pdf"))
-        print(f"📂 开始深度扫描 [{input_target.name}]，共发现 {len(files)} 个文档。")
+        print(f"📂 开始深度扫描沙箱文件夹 [{input_target.name}]，共发现 {len(files)} 份语料。")
+
+        # 锁定沙箱名
+        kb_name = input_target.stem
+        os.environ["ACTIVE_KB"] = kb_name
+        print(f"📁 知识流向: 锁定专属沙箱 -> [data/wiki/{kb_name}/]")
 
         for idx, file_path in enumerate(files, 1):
-            if file_path.parent == input_target:
-                rel_dir = ""
-            else:
-                rel_dir = str(file_path.parent.relative_to(input_target))
-
-            os.environ["ACTIVE_SUBDIR"] = rel_dir
+            os.environ["ACTIVE_SUBDIR"] = ""
             os.environ["ACTIVE_DOC_NAME"] = file_path.stem
 
             print("\n" + "-" * 50)
             print(f"🚀 [批量进度 {idx}/{len(files)}] 正在解析: {file_path.name}")
-            print(f"📁 知识流向: 正在将数据注入至当前激活的底层沙箱环境...")
-
             flow.run(str(file_path))
+
+        print(f"\n✅✅ 沙箱 [{kb_name}] 的批量提炼任务已全部完成！")
+
+    # 如果选择了单个文件，则自动以文件名开辟新沙箱
+    elif input_target.is_file():
+        kb_name = input_target.stem
+        os.environ["ACTIVE_KB"] = kb_name
+        os.environ["ACTIVE_SUBDIR"] = ""
+        os.environ["ACTIVE_DOC_NAME"] = input_target.stem
+
+        print(f"\n📁 知识流向: 为该文件单独开辟沙箱 -> [data/wiki/{kb_name}/]")
+        flow.run(str(input_target))
