@@ -127,7 +127,6 @@ agno-llm-wiki-demo/
 ├── prompts/                # 提示词工程库
 │   ├── boss_prompt.py      # 主管路由：Research / Wiki / PPT
 │   ├── research_prompt.py  # 深度研究协议
-│   ├── wiki_prompt.py      # Wiki维护者 + load_protocols()
 │   └── ppt_prompt.py       # PPT排版指令
 │
 ├── agents/                 # 原子智能体
@@ -152,6 +151,16 @@ agno-llm-wiki-demo/
 │       ├── entities/      # 实体页面
 │       ├── index.md       # 全局导航地图
 │       └── log.md         # Append-only审计日志
+│
+├── web/                   # Web 前端（React + Vite + Tailwind）
+│   ├── src/               # 源码
+│   │   ├── components/    # UI 组件（侧栏 / 探求 / 织网 / 力导向图）
+│   │   ├── data/          # Mock 数据
+│   │   └── store/         # 状态管理
+│   ├── index.html
+│   ├── package.json
+│   ├── tailwind.config.js
+│   └── vite.config.js
 │
 └── storage/                # 记忆持久化（.gitignore）
     ├── sqlite/            # 会话记忆
@@ -182,8 +191,10 @@ agent_os = AgentOS(
 
 ## 快速开始
 
+### 后端启动
+
 ```bash
-# 1. 安装依赖
+# 1. 安装 Python 依赖
 pip install -r requirements.txt
 
 # 2. 配置 API Key（编辑 .env）
@@ -192,16 +203,38 @@ QWEN_API_KEY=sk-xxxxxxxxxxxxxxxx
 # 3. 上传原始资料
 # 将 PDF / 图片 / 文档放入 data/raw/
 
-# 4. 启动服务
+# 4. 启动后端服务
 python app.py
-
-# 5. 查询知识库
-from workflows.query_flow import get_query_workflow
-wf = get_query_workflow()
-result = wf.run(query="你的问题")
+# 后端默认监听 http://localhost:8000
 ```
 
+### 前端启动（另开终端）
+
+```bash
+# 进入前端目录
+cd web
+
+# 安装前端依赖
+npm install
+
+# 启动开发服务器
+npm run dev
+# 前端自动打开 http://localhost:3000
+```
+
+### 联调说明
+
+- 前端部分使用 Mock 数据，可独立运行预览 UI
+- 对接后端时，在对应组件中将 `setTimeout` 假请求替换为 `fetch` 调用
+- 后端 FastAPI 已配置 CORS，前端 `localhost:3000` 可直接访问
+
+> ⚠️ **暂不提供 Docker 部署方案**，Dockerfile 仍在调试中。
+
 ---
+
+## 授权声明
+
+本项目**不附带任何开源许可证**。代码仅供个人研究与内部使用，未经作者明确书面授权，禁止以任何形式复制、分发、商用或用于训练。
 
 ## 依赖
 
@@ -251,7 +284,7 @@ result = wf.run(query="你的问题")
 - [ ] 冲突解决：多来源引用同一概念的合并策略
 - [ ] 上下文智能剪枝：按标题分块 + 语义匹配，减少主编输入负载
 - [ ] `lint_flow.py` LLM 自动修复死链（当前仅报告）
-- [ ] Web 前端：资料上传 / 摄入状态 / Wiki 浏览
+- [x] Web 前端 SPA：探求模式对话 + 织网模式力导向图 + 审批/雷达/熔炉控制台
 
 ---
 
