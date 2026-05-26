@@ -1,183 +1,216 @@
-import { useState, useRef, useEffect } from 'react'
-import { marked } from 'marked'
-import { mockQueryResponse } from '../data/mockData'
+import { useState, useEffect, useRef } from 'react'
+import { marked } from 'marked' // 💡 换成更健壮、对流式输出极度宽容的 marked 引擎
 
-// Terminal log lines that appear sequentially
-const MOCK_LOG_LINES = [
-  { text: '> 路由分析中...', delay: 400 },
-  { text: '> 挂载本地知识库: data/wiki/', delay: 800 },
-  { text: '> LanceDB 向量检索: 3 个候选命中', delay: 1400 },
-  { text: '> 检索 index.md 全局导航...', delay: 2000 },
-  { text: '> 启动 web_researcher 交叉验证', delay: 2800 },
-  { text: '> 合成回答...', delay: 3500 },
-]
-
-function TerminalBlock({ lines }) {
-  const [visible, setVisible] = useState(false)
-  const [shownLines, setShownLines] = useState([])
-
-  useEffect(() => {
-    if (lines.length === 0) return
-    setVisible(true)
-    const timeouts = lines.map((line) =>
-      setTimeout(() => {
-        setShownLines(prev => [...prev, line.text])
-      }, line.delay)
-    )
-    return () => timeouts.forEach(clearTimeout)
-  }, [lines])
-
-  if (!visible) return null
-
-  return (
-    <div className="bg-black/60 rounded-lg border border-slate-700/50 p-3 font-mono text-xs">
-      <div className="flex items-center gap-2 mb-2 pb-2 border-b border-slate-700/30">
-        <div className="w-2 h-2 rounded-full bg-red-500/80" />
-        <div className="w-2 h-2 rounded-full bg-yellow-500/80" />
-        <div className="w-2 h-2 rounded-full bg-green-500/80" />
-        <span className="text-slate-500 text-[10px] ml-1">思维轨迹</span>
-      </div>
-      <div className="space-y-0.5">
-        {shownLines.map((line, i) => (
-          <div key={i} className="text-emerald-400/80 leading-relaxed animate-fade-in">
-            {line}
-          </div>
-        ))}
-        {shownLines.length < lines.length && (
-          <div className="text-emerald-400/40 typing-cursor">&nbsp;</div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-function ChatBubble({ message }) {
-  const { role, content, logs } = message
-  const isUser = role === 'user'
-
-  return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4 animate-slide-up`}>
-      <div className={`max-w-[80%] ${isUser ? 'order-1' : ''}`}>
-        {/* Terminal logs (only for assistant) */}
-        {!isUser && logs && logs.length > 0 && (
-          <div className="mb-2">
-            <TerminalBlock lines={logs} />
-          </div>
-        )}
-
-        {/* Message bubble */}
-        <div className={`rounded-xl px-4 py-3 ${
-          isUser
-            ? 'bg-emerald-500/15 border border-emerald-500/30 text-slate-100'
-            : 'glass rounded-tl-none text-slate-200'
-        }`}>
-          {isUser ? (
-            <p className="text-sm leading-relaxed">{content}</p>
-          ) : (
-            <div
-              className="prose prose-sm prose-invert max-w-none prose-headings:text-cyan-300 prose-a:text-emerald-400 prose-code:text-amber-300 prose-code:bg-slate-800/60 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-blockquote:border-l-cyan-500/50 prose-blockquote:text-slate-400 prose-strong:text-slate-100"
-              dangerouslySetInnerHTML={{ __html: marked.parse(content) }}
-            />
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-export default function QueryMode() {
-  const [messages, setMessages] = useState([])
+export default function QueryMode({ selectedSandbox }) {
   const [input, setInput] = useState('')
+  const [messages, setMessages] = useState([])
   const [isTyping, setIsTyping] = useState(false)
-  const scrollRef = useRef(null)
+  const messagesEndRef = useRef(null)
 
+  // 💡 核心会话隔离：一旦在左侧边栏切换了沙箱隔离区，强制重置当前对话，防止记忆跨库交叉污染
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
-    }
-  }, [messages])
+    setMessages([])
+    setInput('')
+  }, [selectedSandbox])
 
-  const handleSend = () => {
+  // 自动平滑滚动到最新消息
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, isTyping])
+
+  const handleSend = async () => {
     if (!input.trim() || isTyping) return
-    const userMsg = { role: 'user', content: input.trim() }
+
+    const currentInput = input.trim()
+    const userMsg = { role: 'user', content: currentInput }
     setMessages(prev => [...prev, userMsg])
     setInput('')
     setIsTyping(true)
 
-    // Simulate assistant response with delay
-    setTimeout(() => {
-      const assistantMsg = {
-        role: 'assistant',
-        content: mockQueryResponse,
-        logs: MOCK_LOG_LINES,
+    // 初始化 AI 气泡与思维轨迹日志数组
+    const assistantMsg = { role: 'assistant', content: '', logs: [] }
+    setMessages(prev => [...prev, assistantMsg])
+
+    // 💡 记忆提纯：在发送前提取当前的有效聊天记录，过滤掉报错和空信息
+    const chatHistory = messages
+      .filter(m => m.role && m.content && !m.content.includes('❌'))
+      .map(m => ({ role: m.role, content: m.content }))
+
+    try {
+      // 🚀 双端连接：将问题、当前隔离区沙箱标识、历史上下文捆绑发往后端
+      const response = await fetch('http://127.0.0.1:8000/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: currentInput,
+          workspace: selectedSandbox || "",
+          history: chatHistory
+        })
+      })
+
+      if (!response.ok) throw new Error(`HTTP 错误! 状态码: ${response.status}`)
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      // 💡 工业级防线：声明数据流缓冲区，完美解决网络碎片折断 JSON 的问题
+      let buffer = ''
+
+      while (true) {
+        const { value, done } = await reader.read()
+
+        if (value) {
+          buffer += decoder.decode(value, { stream: true })
+        }
+
+        const parts = buffer.split('\n\n')
+
+        // 如果流未结束，最后一个包可能不完整，弹出并留到下一轮循环拼接
+        if (!done) {
+          buffer = parts.pop() || ''
+        }
+
+        for (const line of parts) {
+          if (line.startsWith('data: ')) {
+            const dataStr = line.replace('data: ', '')
+            if (!dataStr.trim()) continue
+
+            try {
+              const data = JSON.parse(dataStr)
+
+              if (data.type === 'log') {
+                setMessages(prev => {
+                  const newMsgs = [...prev]
+                  const lastIdx = newMsgs.length - 1
+                  newMsgs[lastIdx] = {
+                    ...newMsgs[lastIdx],
+                    logs: [...(newMsgs[lastIdx].logs || []), { text: data.content }]
+                  }
+                  return newMsgs
+                })
+              } else if (data.type === 'text') {
+                setMessages(prev => {
+                  const newMsgs = [...prev]
+                  const lastIdx = newMsgs.length - 1
+                  newMsgs[lastIdx] = {
+                    ...newMsgs[lastIdx],
+                    content: newMsgs[lastIdx].content + data.content
+                  }
+                  return newMsgs
+                })
+              }
+            } catch (err) {
+              console.warn("解析 SSE 数据包失败:", dataStr, err)
+            }
+          }
+        }
+
+        if (done) break
       }
-      setMessages(prev => [...prev, assistantMsg])
+    } catch (e) {
+      console.error("流式通信断开:", e)
+      setMessages(prev => {
+        const newMsgs = [...prev]
+        const lastIdx = newMsgs.length - 1
+        newMsgs[lastIdx] = {
+          ...newMsgs[lastIdx],
+          content: "❌ 链路发生严重故障，无法获取本地知识引擎响应，请检查后端网关状态。"
+        }
+        return newMsgs
+      })
+    } finally {
       setIsTyping(false)
-    }, 600)
+    }
   }
 
   return (
     <div className="flex flex-col h-full bg-slate-900 relative">
-      {/* Subtle grid background */}
-      <div className="absolute inset-0 opacity-[0.03]" style={{
-        backgroundImage: 'linear-gradient(rgba(148,163,184,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,0.3) 1px, transparent 1px)',
-        backgroundSize: '40px 40px'
-      }} />
-
-      {/* Chat area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6 relative z-10">
-        {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-center">
-            <div className="text-5xl mb-4 opacity-40">🔮</div>
-            <h2 className="text-lg font-semibold text-slate-400 mb-1">知识探求模式</h2>
-            <p className="text-sm text-slate-600 max-w-md">向系统提问，LLM 将检索本地知识库与互联网资源，合成结构化回答。</p>
-            <div className="mt-6 flex flex-wrap gap-2 justify-center">
-              {['Transformer 核心原理', 'RAG 系统如何工作', 'RLHF 训练流程'].map(q => (
-                <button
-                  key={q}
-                  onClick={() => setInput(q)}
-                  className="px-3 py-1.5 text-xs rounded-full border border-slate-700/50 text-slate-400 hover:border-emerald-500/40 hover:text-emerald-400 transition-all"
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <>
-            {messages.map((msg, i) => (
-              <ChatBubble key={i} message={msg} />
-            ))}
-            {isTyping && (
-              <div className="flex items-center gap-2 text-slate-500 text-xs animate-pulse ml-2">
-                <div className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
-                <span>系统正在分析中...</span>
-              </div>
-            )}
-          </>
-        )}
+      {/* 沙箱隔离雷达指示器 */}
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 px-4 py-1.5 rounded-full bg-slate-800/90 border border-slate-700/60 backdrop-blur-sm flex items-center gap-2 shadow-lg">
+        <div className={`w-2 h-2 rounded-full ${selectedSandbox ? 'bg-cyan-400 animate-pulse shadow-[0_0_8px_rgba(34,211,238,0.6)]' : 'bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.6)]'}`}></div>
+        <span className="text-xs font-mono text-slate-300">
+          {selectedSandbox ? `[隔离区激活] 正在定向检索: ${selectedSandbox}` : '[全局漫游] 广域知识检索'}
+        </span>
       </div>
 
-      {/* Input bar */}
-      <div className="px-6 pb-5 relative z-10">
-        <div className="flex gap-2">
+      {/* 消息历史画布 */}
+      <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 scrollbar-thin pt-16">
+        {messages.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center text-slate-500 font-mono space-y-2">
+            <span className="text-3xl animate-bounce">🗣️</span>
+            <p className="text-sm">知识库探求中心已就绪，请输入你的提问...</p>
+          </div>
+        ) : (
+          messages.map((msg, idx) => (
+            <div key={idx} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+              {msg.role === 'user' ? (
+                <div className="max-w-[80%] bg-slate-800 border border-slate-700/60 rounded-2xl px-4 py-3 text-slate-200 text-sm shadow-md">
+                  {msg.content}
+                </div>
+              ) : (
+                <div className="max-w-[85%] w-full space-y-3">
+                  {/* 物理思维轨迹 (Terminal 日志推流) */}
+                  {msg.logs && msg.logs.length > 0 && (
+                    <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3 font-mono text-[11px] text-slate-400 max-h-[160px] overflow-y-auto space-y-1 shadow-inner">
+                      <p className="text-[10px] text-cyan-500/80 border-b border-slate-800/60 pb-1 mb-1 font-semibold uppercase tracking-wider">⚡ Thinking Process & Action Stream</p>
+                      {msg.logs.map((log, lIdx) => (
+                        <div key={lIdx} className="text-emerald-400/90 whitespace-pre-wrap">{log.text}</div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* 回答正文气泡 */}
+                  {msg.content && (
+                    <div className="bg-slate-800/40 border border-slate-800/60 rounded-2xl px-5 py-4 text-slate-200 text-sm shadow-sm leading-relaxed">
+                      {/* 💡 核心修复：使用 marked 渲染流式文本，配合 Tailwind 自动格式化图片和链接 */}
+                      <div
+                        className="prose prose-invert max-w-none prose-sm prose-pre:bg-slate-900 prose-pre:border prose-pre:border-slate-700 prose-img:max-w-full prose-img:h-auto prose-img:rounded-lg prose-img:my-2 prose-img:border prose-img:border-slate-700/50 prose-img:shadow-sm prose-a:text-cyan-400 hover:prose-a:text-cyan-300 prose-a:underline"
+                        dangerouslySetInnerHTML={{
+                          __html: marked.parse(msg.content || '')
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))
+        )}
+
+        {/* 打字机加载状态 */}
+        {isTyping && messages[messages.length - 1]?.content === '' && (
+          <div className="flex items-center gap-1.5 px-4 text-xs text-slate-500 font-mono">
+            <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+            <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+            <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-bounce"></span>
+            <span className="ml-1">本地知识引擎正在提取并解析文件实体...</span>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* 底部指令输入台 */}
+      <div className="p-4 bg-slate-950/40 border-t border-slate-800/80 backdrop-blur-md">
+        <div className="max-w-4xl mx-auto flex gap-2 bg-slate-900 border border-slate-700/50 rounded-xl p-1.5 focus-within:border-cyan-500/50 transition-all duration-200 shadow-lg">
           <input
+            type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            placeholder="输入你的问题，系统将检索知识库并合成回答..."
-            className="flex-1 bg-slate-800/50 border border-slate-700/50 rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500/40 focus:glow-emerald transition-all font-light"
+            placeholder={selectedSandbox ? `在 [${selectedSandbox}] 隔离区中发起深度探求...` : "向所有知识库广域探求..."}
+            className="flex-1 bg-transparent text-slate-200 text-sm px-3 focus:outline-none placeholder-slate-500"
+            disabled={isTyping}
           />
           <button
             onClick={handleSend}
-            disabled={!input.trim() || isTyping}
-            className={`px-5 py-3 rounded-xl text-sm font-medium transition-all ${
-              input.trim() && !isTyping
-                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 glow-emerald'
-                : 'bg-slate-800/30 text-slate-600 border border-slate-700/30 cursor-not-allowed'
+            disabled={isTyping || !input.trim()}
+            className={`px-4 py-2 rounded-lg text-xs font-mono font-semibold transition-all duration-200 ${
+              isTyping || !input.trim()
+                ? 'bg-slate-800 text-slate-600 cursor-not-allowed'
+                : 'bg-gradient-to-r from-emerald-500 to-cyan-500 text-slate-950 shadow-[0_0_10px_rgba(34,211,238,0.2)] hover:opacity-90'
             }`}
           >
-            发送 ↵
+            {isTyping ? "RUNNING" : "EXECUTE"}
           </button>
         </div>
       </div>

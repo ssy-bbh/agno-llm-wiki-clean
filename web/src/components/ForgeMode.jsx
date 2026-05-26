@@ -5,17 +5,21 @@ import Inbox from './Inbox'
 import Radar from './Radar'
 import AuditLog from './AuditLog'
 
-export default function ForgeMode() {
+// 💡 修复 1：在组件参数里接收 selectedSandbox
+export default function ForgeMode({ selectedSandbox }) {
   const [selectedNode, setSelectedNode] = useState(null)
-  const [activeTab, setActiveTab] = useState('forge')
 
   return (
     <div className="flex h-full bg-slate-900">
-      {/* Left: Force Graph (70%) */}
-      <div className="w-[70%] relative">
-        <ForceGraph onNodeClick={setSelectedNode} selectedNode={selectedNode} />
+      <div className="w-[70%] relative border-r border-slate-800">
+        {/* 💡 修复 2：把 selectedSandbox 继续传给底层的星图组件 */}
+        <ForceGraph
+          selectedSandbox={selectedSandbox}
+          onNodeClick={setSelectedNode}
+          selectedNode={selectedNode}
+        />
         {selectedNode && (
-          <div className="absolute top-4 left-4 glass rounded-xl px-4 py-2 animate-fade-in">
+          <div className="absolute top-4 left-4 glass rounded-xl px-4 py-2 animate-fade-in z-20">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
               <span className="text-sm text-cyan-300 font-medium">{selectedNode}</span>
@@ -30,34 +34,40 @@ export default function ForgeMode() {
         )}
       </div>
 
-      {/* Right: Control Panel (30%) */}
-      <div className="w-[30%] border-l border-slate-700/60 flex flex-col overflow-hidden bg-slate-950/50">
-        {/* Tab bar */}
-        <div className="flex border-b border-slate-700/60">
-          {['forge', 'inbox', 'radar', 'log'].map(tab => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={`flex-1 py-2.5 text-[11px] font-medium uppercase tracking-wider transition-all border-b-2 ${
-                activeTab === tab
-                  ? 'text-cyan-400 border-cyan-400/50 bg-cyan-500/5'
-                  : 'text-slate-500 border-transparent hover:text-slate-400'
-              }`}
-            >
-              {tab === 'forge' && '☁️ 熔炉'}
-              {tab === 'inbox' && '✅ 审批'}
-              {tab === 'radar' && '📡 雷达'}
-              {tab === 'log' && '📜 档案'}
-            </button>
-          ))}
+      {/* 右侧 30%: 赛博白盒中控台 (全部模块同时展现，支持内部纵向滚动) */}
+      <div className="w-[30%] h-full flex flex-col bg-slate-950/40 overflow-y-auto p-4 space-y-6 scrollbar-thin">
+        {/* 1. 赛博熔炉卡片 */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 shadow-xl backdrop-blur-md">
+          <div className="text-xs font-semibold text-cyan-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+            <span>☁️</span> 赛博熔炉 / 摄入流
+          </div>
+          <CyberForge />
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto">
-          {activeTab === 'forge' && <CyberForge />}
-          {activeTab === 'inbox' && <Inbox />}
-          {activeTab === 'radar' && <Radar />}
-          {activeTab === 'log' && <AuditLog />}
+        {/* 2. 隔离审批区 */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 shadow-xl backdrop-blur-md">
+          <div className="text-xs font-semibold text-yellow-500 uppercase tracking-wider mb-3 flex items-center gap-2">
+            <span>✅</span> 隔离审批区 / Inbox
+          </div>
+          <Inbox />
+        </div>
+
+        {/* 3. 需求雷达 */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 shadow-xl backdrop-blur-md">
+          <div className="text-xs font-semibold text-emerald-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+            <span>📡</span> 外部需求雷达 / Radar
+          </div>
+          <Radar />
+        </div>
+
+        {/* 4. 织网档案室 */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 shadow-xl backdrop-blur-md flex-1 min-h-[250px] flex flex-col">
+          <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+            <span>📜</span> 织网档案室 / Audit Log
+          </div>
+          <div className="flex-1 bg-black/20 rounded-lg p-2 font-mono text-[11px]">
+            <AuditLog />
+          </div>
         </div>
       </div>
     </div>

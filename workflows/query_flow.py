@@ -1,10 +1,12 @@
 """
-workflows/query_flow.py — 终极查询流水线 (支持用户级工作区选择)
+workflows/query_flow.py — 终极查询流水线 (支持用户级工作区选择与历史上下文合流)
 """
 import sys
-import re          # 👇 新增正则库
-import difflib     # 👇 新增相似度算法库
+import re
+import difflib
 from pathlib import Path
+import json
+import asyncio
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -15,6 +17,7 @@ from agents.wiki_query import WikiRouter, WikiResponder
 
 class QueryFlow:
     def __init__(self):
+        # ✅ 完美保留并初始化你真实的智能体组件
         self.router = WikiRouter()
         self.responder = WikiResponder()
         self.wiki_root = PROJECT_ROOT / "data" / "wiki"
@@ -42,7 +45,7 @@ class QueryFlow:
         all_md_files = list(concepts_dir.glob("*.md"))
 
         # ==========================================
-        # 💡 核心修复：建立【多重别名雷达图】
+        # 💡 核心算法保留：建立【多重别名雷达图】
         # ==========================================
         alias_map = {}
         for f in all_md_files:
@@ -63,10 +66,7 @@ class QueryFlow:
             safe_name = clean_concept.replace("/", "_").replace("\\", "_")
             lower_name = safe_name.lower()
 
-            # ==========================================
             # 🛡️ 防线 1：直接命中全名 或 物理文件的拆解代号
-            # （完美解决：LLM 说 "ciou loss"，匹配到物理代号 "ciou loss"）
-            # ==========================================
             if lower_name in alias_map:
                 match_file = alias_map[lower_name]
                 context += f"【🚨本地知识 == {match_file.name} ==】\n{match_file.read_text(encoding='utf-8')}\n\n"
@@ -75,9 +75,7 @@ class QueryFlow:
 
             print(f"  ⚠️ [调度室] 精确/别名匹配失效 [{safe_name}]，启动算法降级嗅探...")
 
-            # ==========================================
             # 🛡️ 防线 2：反向拆解（LLM吐出长词，物理文件是短词）
-            # ==========================================
             parts = [p.strip() for p in re.split(r'[(（)）]', lower_name) if p.strip()]
             found_by_parts = False
             for part in parts:
@@ -91,9 +89,7 @@ class QueryFlow:
             if found_by_parts:
                 continue
 
-            # ==========================================
             # 🛡️ 防线 3：高相似度容错 (依然保持 0.85 的严格阈值)
-            # ==========================================
             close_matches = difflib.get_close_matches(lower_name, available_aliases, n=1, cutoff=0.85)
             if close_matches:
                 match_stem = close_matches[0]
@@ -115,19 +111,16 @@ class QueryFlow:
             return ""
 
         context = ""
-        found_files = set()  # 用集合防止重复读取
+        found_files = set()
 
-        # 获取该工作区下所有的 .md 文件 (包含子文件夹)
         all_md_files = list(workspace_dir.rglob("*.md"))
 
         for keyword in fuzzy_keywords:
             if not keyword.strip():
                 continue
 
-            # 忽略大小写进行比对
             keyword_lower = keyword.lower()
             for file_path in all_md_files:
-                # 如果 AI 猜的关键词出现在了文件名里，且文件没被读过
                 if keyword_lower in file_path.stem.lower() and file_path not in found_files:
                     found_files.add(file_path)
                     try:
@@ -140,9 +133,7 @@ class QueryFlow:
 
     def execute(self, user_question: str, target_workspace: str = ""):
         """
-        核心调度入口。
-        :param user_question: 用户的提问
-        :param target_workspace: 用户在 UI 上选择的工作区。如果为空，则默认外脑回答或全局漫游。
+        🚀 极客控制台 (CLI) 核心调度入口（完美修复了之前断裂的结构）
         """
         print(f"\n👤 【用户提问】: {user_question}")
 
@@ -152,12 +143,10 @@ class QueryFlow:
             print("⚠️ 【警告】: 用户未指定工作区，系统将无法挂载任何本地地图！")
 
         local_concepts = []
+        fuzzy_keywords = []
         needs_web = True
         search_query = user_question
 
-        # ----------------------------------------
-        # 🗺️ 路由: 寻路者仅在指定工作区内搜索
-        # ----------------------------------------
         if target_workspace:
             print("-" * 60)
             print("🗺️ [调度室] 正在呼叫寻路者读取指定工作区的局部地图...")
@@ -166,25 +155,19 @@ class QueryFlow:
                 decision = self.router.route(user_question, index_map)
                 print(f"  -> 🎯 寻路裁决: {decision}")
                 local_concepts = decision.get("local_concepts", [])
+                fuzzy_keywords = decision.get("fuzzy_keywords", [])
                 needs_web = decision.get("needs_web_search", True)
                 search_query = decision.get("search_query", user_question)
             except Exception as e:
                 print(f"❌ 路由模块崩溃: {e}")
-
-        # ----------------------------------------
-        # 🚚 装载弹药 & 外脑调用
-        # ----------------------------------------
-        fuzzy_keywords = decision.get("fuzzy_keywords", [])  # 拿到 AI 的猜测
 
         print("\n" + "-" * 60)
         print("🚚 [调度室] 正在按裁决清单装载弹药...")
 
         local_context = ""
         if target_workspace:
-            # 1. 先精准装载
             if local_concepts:
                 local_context += self._read_local_concepts(target_workspace, local_concepts)
-            # 2. 再进行模糊搜寻装载 (作为补充)
             if fuzzy_keywords:
                 local_context += self._fuzzy_find_local_files(target_workspace, fuzzy_keywords)
 
@@ -197,9 +180,6 @@ class QueryFlow:
                 image_context = f"![{images[0].title}]({images[0].image_url})"
                 print("  -> 👁️ 成功挂载视觉辅助图床。")
 
-        # ----------------------------------------
-        # 🗣️ 最终流式输出
-        # ----------------------------------------
         print("\n" + "-" * 60)
         print("🗣️ [调度室] 弹药装填完毕，Responder 开始解答：\n")
         try:
@@ -212,12 +192,122 @@ class QueryFlow:
         except Exception as e:
             print(f"\n❌ 答疑模块崩溃: {e}")
 
+    # ==========================================
+    # 🔗 核心新增：Web端专用的流式生成器 (完美嵌合上下文记忆)
+    # ==========================================
+    async def stream_execute(self, user_question: str, target_workspace: str, history: list = None):
+        """Web 端专用的流式生成器 (返回 SSE NDJSON)"""
+        if history is None:
+            history = []
+
+        def format_log(msg: str):
+            print(msg)
+            return f"data: {json.dumps({'type': 'log', 'content': msg})}\n\n"
+
+        yield format_log(f"👤 收到提问: {user_question}")
+        await asyncio.sleep(0.01)
+
+        yield format_log(f"📁 锁定工作区: [{target_workspace if target_workspace else '全局漫游'}]")
+        await asyncio.sleep(0.01)
+
+        local_concepts = []
+        fuzzy_keywords = []
+        needs_web = True
+        search_query = user_question
+        decision = {}
+
+        # L2 路由
+        if target_workspace:
+            yield format_log("🗺️ [调度室] 正在呼叫寻路者读取局部地图...")
+            await asyncio.sleep(0.01)
+            index_map = self._read_specific_map(target_workspace)
+            try:
+                decision = self.router.route(user_question, index_map)
+                yield format_log("  -> 🎯 寻路裁决完毕。")
+                await asyncio.sleep(0.01)
+            except Exception as e:
+                yield format_log(f"❌ 路由裁决异常，已自动降级: {e}")
+                await asyncio.sleep(0.01)
+
+            local_concepts = decision.get("local_concepts", [])
+            fuzzy_keywords = decision.get("fuzzy_keywords", [])
+            needs_web = decision.get("needs_web_search", True)
+            search_query = decision.get("search_query", user_question)
+
+        # 装载弹药
+        yield format_log("🚚 [调度室] 正在按裁决清单装载本地弹药...")
+        await asyncio.sleep(0.01)
+        local_context = ""
+        if target_workspace:
+            if local_concepts:
+                local_context += self._read_local_concepts(target_workspace, local_concepts)
+                yield format_log(f"  -> 📂 成功精确装载 {len(local_concepts)} 个概念。")
+                await asyncio.sleep(0.01)
+            if fuzzy_keywords:
+                local_context += self._fuzzy_find_local_files(target_workspace, fuzzy_keywords)
+                yield format_log("  -> 🔍 模糊嗅探装载完毕。")
+                await asyncio.sleep(0.01)
+
+        web_context, image_context = "", ""
+        if needs_web and search_query:
+            yield format_log(f"  -> 🌐 [调度室] 触发全网雷达检索: [{search_query}]")
+            await asyncio.sleep(0.01)
+            web_context = search_web_text(search_query)
+            images = search_multimodal_image(search_query)
+            if images:
+                image_context = f"![{images[0].title}]({images[0].image_url})"
+
+        # 💡 记忆流闭合点：在此处将前端传来的历史回忆，与本地抽取的弹药无缝合流
+        if history:
+            history_str = "【前情对话回忆录】\n"
+            for msg in history[-5:]:  # 提取最近 5 轮，防止 token 溢出
+                role_label = "用户" if msg.get('role') == 'user' else 'AI'
+                history_str += f"{role_label}: {msg.get('content')}\n"
+            history_str += "\n"
+            # 前置拼装，让大模型在看文件前先看一眼刚才聊过什么
+            local_context = history_str + local_context
+
+        yield format_log("🗣️ 历史记忆与本地沙箱弹药装填完毕，开始驱动外脑生成回答：")
+        await asyncio.sleep(0.01)
+
+        # 核心：流式输出你真实的 WikiResponder 大模型回答
+        # 核心：流式输出你真实的 WikiResponder 大模型回答
+        try:
+            response_stream = self.responder.answer(user_question, local_context, web_context, image_context)
+            for chunk in response_stream:
+                text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                if text and text != "None":
+                    yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
+                    await asyncio.sleep(0.01)
+
+            # ==========================================
+            # 💡 完美适配 Python 3.11 的强行追加逻辑
+            # ==========================================
+            if image_context:
+                yield format_log("👁️ [调度室] 正在向前端渲染管道强行注入视觉参考图床...")
+                await asyncio.sleep(0.01)
+
+                # ✅ 1. 先在外部拼装好带换行的 Markdown 文本（大括号内绝无反斜杠）
+                image_markdown = f"\n\n### 🌐 检索参考图片:\n{image_context}\n"
+
+                # ✅ 2. 构建干净的字典对象
+                payload = {"type": "text", "content": image_markdown}
+
+                # ✅ 3. 序列化输出（大括号内部只有 json.dumps，反斜杠在外面，3.11 完美通行）
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(0.01)
+
+        except Exception as e:
+            yield format_log(f"❌ 答疑模块崩溃: {e}")
+            await asyncio.sleep(0.01)
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
 
 # ==========================================
 # 🚀 极客控制台 (CLI 交互入口)
 # ==========================================
 if __name__ == "__main__":
-    # 1. 系统初始化
     flow = QueryFlow()
     available_workspaces = flow._get_workspace_list()
 
@@ -225,7 +315,6 @@ if __name__ == "__main__":
     print("🚀 [LLM-Wiki 终端控制台] 引擎点火完毕！")
     print("=" * 60)
 
-    # 2. 交互式选择工作区
     if not available_workspaces:
         print("\n⚠️ 警告：在 data/wiki 下未检测到任何工作区文件夹！将强制进入全局漫游模式。")
         target_ws = ""
@@ -246,7 +335,6 @@ if __name__ == "__main__":
     print("💡 提示: 输入 'exit' 或 'quit' 可随时退出控制台")
     print("=" * 60)
 
-    # 3. 进入持续问答循环 (REPL)
     while True:
         try:
             user_question = input("\n👤 你的问题: ").strip()
@@ -257,10 +345,8 @@ if __name__ == "__main__":
             if not user_question:
                 continue
 
-            # 扣动扳机，执行带有目标工作区参数的流水线
             flow.execute(user_question, target_workspace=target_ws)
 
         except KeyboardInterrupt:
-            # 捕捉 Ctrl+C，防止程序难看地崩溃
             print("\n\n👋 检测到强制中断，引擎关闭。")
             break

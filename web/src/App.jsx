@@ -16,7 +16,12 @@ export default function App() {
         onSandboxSelect={setSelectedSandbox}
       />
       <main className="flex-1 overflow-hidden relative">
-        {mode === 'query' ? <QueryMode /> : <ForgeMode />}
+        {/* 💡 修复：把 selectedSandbox 传给两个主画布，让它们知道当前在哪个知识库里 */}
+        {mode === 'query' ? (
+          <QueryMode selectedSandbox={selectedSandbox} />
+        ) : (
+          <ForgeMode selectedSandbox={selectedSandbox} />
+        )}
       </main>
     </div>
   )

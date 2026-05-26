@@ -1,120 +1,91 @@
-import { useRef, useCallback, useEffect, useState } from 'react'
+import { useRef, useEffect, useState } from 'react'
 import ForceGraph2D from 'react-force-graph-2d'
-import { mockGraphNodes, mockGraphLinks } from '../data/mockData'
 
-const NODE_COLORS = {
-  core: '#10b981',      // emerald
-  model: '#06b6d4',     // cyan
-  training: '#f59e0b',  // amber
-  architecture: '#a855f7', // purple
-}
-
-const GROUP_LABELS = {
-  core: '核心概念',
-  model: '模型',
-  training: '训练方法',
-  architecture: '架构',
-}
-
-export default function ForceGraph({ onNodeClick, selectedNode }) {
+export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode }) {
   const fgRef = useRef()
-  const [graphData, setGraphData] = useState({ nodes: mockGraphNodes, links: mockGraphLinks })
-  const [hoveredNode, setHoveredNode] = useState(null)
+  const [graphData, setGraphData] = useState({ nodes: [], links: [] })
 
-  // Highlight selected node
+  // 获取数据
   useEffect(() => {
-    if (!fgRef.current || !selectedNode) return
-    const node = graphData.nodes.find(n => n.id === selectedNode)
-    if (node) {
-      fgRef.current.centerAt(node.x, node.y, 500)
-      fgRef.current.zoom(3, 500)
-    }
-  }, [selectedNode])
-
-  const handleNodeClick = useCallback((node) => {
-    onNodeClick?.(node.id)
-  }, [onNodeClick])
-
-  const handleNodeHover = useCallback((node) => {
-    setHoveredNode(node?.id || null)
-    const canvas = fgRef.current?.canvas()
-    if (canvas) {
-      canvas.style.cursor = node ? 'pointer' : 'default'
-    }
-  }, [])
-
-  const paintNode = useCallback((node, ctx) => {
-    const color = NODE_COLORS[node.group] || '#94a3b8'
-    const isHighlighted = node.id === selectedNode || node.id === hoveredNode
-    const radius = isHighlighted ? node.val * 0.8 + 4 : node.val * 0.7
-
-    // Glow effect
-    if (isHighlighted) {
-      ctx.beginPath()
-      ctx.arc(node.x, node.y, radius + 8, 0, 2 * Math.PI, false)
-      ctx.fillStyle = color + '20'
-      ctx.fill()
+    if (!selectedSandbox) {
+      setGraphData({ nodes: [], links: [] })
+      return
     }
 
-    // Node circle
-    ctx.beginPath()
-    ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI, false)
-    ctx.fillStyle = color + (isHighlighted ? 'dd' : 'aa')
-    ctx.fill()
+    fetch(`http://127.0.0.1:8000/api/graph?workspace=${selectedSandbox}`)
+      .then(res => res.json())
+      .then(data => {
+        // 终极防线：收集所有真实存在的节点 ID
+        const validNodeIds = new Set(data.nodes.map(n => n.id))
 
-    // Border
-    ctx.strokeStyle = color
-    ctx.lineWidth = isHighlighted ? 2 : 1
-    ctx.stroke()
+        // 把那些指向了“不存在的节点”的幽灵连线全部过滤掉！
+        const safeLinks = data.links.filter(link =>
+          validNodeIds.has(link.source) && validNodeIds.has(link.target)
+        )
 
-    // Label
-    ctx.fillStyle = isHighlighted ? '#f1f5f9' : '#94a3b8'
-    ctx.font = `${isHighlighted ? '600' : '400'} ${isHighlighted ? 13 : 11}px Inter, sans-serif`
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'middle'
-    ctx.fillText(node.label, node.x, node.y + radius + 14)
-  }, [selectedNode, hoveredNode])
+        // 只把安全的线交给物理引擎
+        setGraphData({ nodes: data.nodes, links: safeLinks })
+      })
+      .catch(err => console.error("星图获取失败:", err))
+  }, [selectedSandbox])
 
   return (
-    <div className="w-full h-full bg-slate-950 relative">
-      {/* Grid background */}
-      <div className="absolute inset-0 opacity-[0.04]" style={{
-        backgroundImage: 'radial-gradient(circle, rgba(148,163,184,0.4) 1px, transparent 1px)',
-        backgroundSize: '30px 30px'
-      }} />
-
-      {/* Legend */}
-      <div className="absolute bottom-4 left-4 glass rounded-lg px-3 py-2 z-10">
-        <div className="text-[10px] text-slate-500 uppercase tracking-widest mb-1.5">图例</div>
-        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-          {Object.entries(GROUP_LABELS).map(([key, label]) => (
-            <div key={key} className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full" style={{ backgroundColor: NODE_COLORS[key] }} />
-              <span className="text-[10px] text-slate-400">{label}</span>
-            </div>
-          ))}
+    <div className="w-full h-full bg-[#020617] relative overflow-hidden">
+      {graphData.nodes.length === 0 ? (
+        <div className="absolute inset-0 flex items-center justify-center text-slate-500 font-mono text-sm">
+          {!selectedSandbox ? "👈 请在左侧选择一个知识沙箱" : "🌌 正在扫描星图数据或沙箱为空..."}
         </div>
-      </div>
+      ) : (
+        <ForceGraph2D
+          ref={fgRef}
+          graphData={graphData}
+          nodeRelSize={5}
 
-      <ForceGraph2D
-        ref={fgRef}
-        graphData={graphData}
-        nodeRelSize={0.6}
-        nodeColor={node => NODE_COLORS[node.group] || '#94a3b8'}
-        nodeCanvasObject={paintNode}
-        nodeCanvasObjectMode={() => 'after'}
-        linkColor={() => 'rgba(71, 85, 105, 0.3)'}
-        linkWidth={1}
-        linkDirectionalParticles={2}
-        linkDirectionalParticleWidth={1.5}
-        linkDirectionalParticleColor={() => 'rgba(34, 211, 238, 0.4)'}
-        backgroundColor="transparent"
-        onNodeClick={handleNodeClick}
-        onNodeHover={handleNodeHover}
-        d3AlphaDecay={0.02}
-        d3VelocityDecay={0.4}
-        cooldownTicks={100}
-      />
+          // 💡 视觉优化 1：为节点添加多彩着色逻辑
+          // 如果节点数据里未来有 'group'（组）或 'type'（类型），我们可以动态着色
+          // 这里我们假定不同的 group 对应不同颜色，如果没有 group 则用默认颜色
+          // 如果想立刻看到效果，可以修改 nodeCanvasObjectMode 为 'replace'，
+          // 并自己用 canvas 绘制不同颜色的圆点。
+          nodeColor={(node) => {
+            // 选定节点：白色
+            if (node.id === selectedNode) return '#ffffff';
+
+            // 示例：根据不同 group 分配不同科幻色 (f87171, 60a5fa, c084fc, fb923c, a3e635, 0ea5e9)
+            if (node.group === 1) return '#f87171'; // 红色
+            if (node.group === 2) return '#60a5fa'; // 蓝色
+            if (node.group === 3) return '#c084fc'; // 紫色
+            if (node.group === 4) return '#fb923c'; // 橙色
+            if (node.group === 5) return '#a3e635'; // 绿色
+
+            // 默认颜色：青色
+            return '#0ea5e9';
+          }}
+
+          // 💡 视觉优化 2：更改连线颜色和透明度
+          linkColor={() => 'rgba(203, 213, 225, 0.15)'} // 极轻柔的暗青色连线
+          linkWidth={1}
+
+          nodeCanvasObjectMode={() => 'after'}
+          nodeCanvasObject={(node, ctx, globalScale) => {
+            if (globalScale >= 2) {
+              const label = node.id
+              const fontSize = 12 / globalScale
+              ctx.font = `${fontSize}px "Fira Code", monospace`
+              ctx.textAlign = 'center'
+              ctx.textBaseline = 'middle'
+              ctx.fillStyle = '#cbd5e1'
+              ctx.fillText(label, node.x, node.y + 6 + fontSize)
+            }
+          }}
+
+          onNodeClick={node => {
+            fgRef.current.centerAt(node.x, node.y, 1000)
+            fgRef.current.zoom(4, 1000)
+            if (onNodeClick) onNodeClick(node.id)
+          }}
+          enableNodeDrag={true}
+        />
+      )}
     </div>
   )
 }
