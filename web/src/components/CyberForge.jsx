@@ -30,7 +30,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
 
     try {
       setProgress(40)
-      const response = await fetch("http://127.0.0.1:8888/api/upload", {
+      const response = await fetch("/api/upload", {
         method: "POST",
         body: formData
       })
@@ -63,7 +63,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     setForgeLogs(prev => [...prev, { text: `🔥 [熔炉点火] 正在建立与后端织网任务 [${actionType}] 的数据链...` }])
 
     try {
-      const response = await fetch('http://127.0.0.1:8888/api/forge', {
+      const response = await fetch('/api/forge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: actionType, workspace: selectedSandbox })

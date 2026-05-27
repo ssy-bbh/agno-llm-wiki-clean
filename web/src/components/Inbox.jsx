@@ -9,7 +9,7 @@ export default function Inbox({ selectedSandbox }) {
   const fetchInbox = () => {
     if (!selectedSandbox) return
     setLoading(true)
-    fetch(`http://127.0.0.1:8888/api/inbox?workspace=${selectedSandbox}`)
+    fetch(`/api/inbox?workspace=${selectedSandbox}`)
       .then(res => res.json())
       .then(data => setItems(data))
       .catch(err => console.error("Inbox 扫描失败", err))
@@ -24,7 +24,7 @@ export default function Inbox({ selectedSandbox }) {
   }, [selectedSandbox])
 
   const handleApprove = (fileId) => {
-    fetch(`http://127.0.0.1:8888/api/inbox/approve?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'POST' })
+    fetch(`/api/inbox/approve?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'POST' })
       .then(res => res.json())
       .then(() => {
         window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE')) // 鸣枪刷新
@@ -32,7 +32,7 @@ export default function Inbox({ selectedSandbox }) {
   }
 
   const handleDelete = (fileId) => {
-    fetch(`http://127.0.0.1:8888/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'DELETE' })
+    fetch(`/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'DELETE' })
       .then(res => res.json())
       .then(() => {
         window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE')) // 鸣枪刷新
@@ -40,7 +40,7 @@ export default function Inbox({ selectedSandbox }) {
   }
 
   const handleEditClick = (fileId) => {
-    fetch(`http://127.0.0.1:8888/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`)
+    fetch(`/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`)
       .then(res => res.json())
       .then(data => setEditingFile({ id: fileId, content: data.content }))
   }
@@ -48,7 +48,7 @@ export default function Inbox({ selectedSandbox }) {
   const handleSaveEdit = () => {
     if (!editingFile) return
     setIsSaving(true)
-    fetch(`http://127.0.0.1:8888/api/inbox/file`, {
+    fetch(`/api/inbox/file`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

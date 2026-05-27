@@ -22,7 +22,7 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
       return
     }
 
-    fetch(`http://127.0.0.1:8888/api/graph?workspace=${selectedSandbox}`)
+    fetch(`/api/graph?workspace=${selectedSandbox}`)
       .then(res => res.json())
       .then(data => {
         const validNodeIds = new Set(data.nodes.map(n => n.id))
@@ -74,7 +74,7 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
       setModalOpen(true)
       setIsLoadingMd(true)
       // 使用 encodeURIComponent 确保中文路径不乱码
-      fetch(`http://127.0.0.1:8888/api/concept?workspace=${selectedSandbox}&name=${encodeURIComponent(node.id)}`)
+      fetch(`/api/concept?workspace=${selectedSandbox}&name=${encodeURIComponent(node.id)}`)
         .then(res => res.json())
         .then(data => setMdContent(data.content))
         .catch(() => setMdContent('❌ 无法读取物理文件，可能遭遇断链。'))

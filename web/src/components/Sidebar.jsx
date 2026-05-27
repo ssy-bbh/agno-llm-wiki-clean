@@ -5,7 +5,7 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
 
   // 💡 将获取沙箱列表的逻辑剥离出来，方便后续复用
   const fetchWorkspaces = () => {
-    fetch('http://127.0.0.1:8888/api/workspaces')
+    fetch('/api/workspaces')
       .then(res => res.json())
       .then(data => {
         const formatted = data.map(name => ({
@@ -29,7 +29,7 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
     if (!name || !name.trim()) return
 
     try {
-      const response = await fetch("http://127.0.0.1:8888/api/workspaces/create", {
+      const response = await fetch("/api/workspaces/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim() })

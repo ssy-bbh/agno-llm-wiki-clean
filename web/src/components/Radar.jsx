@@ -7,7 +7,7 @@ export default function Radar({ selectedSandbox }) {
   const fetchRadar = () => {
     if (!selectedSandbox) return
     setLoading(true)
-    fetch(`http://127.0.0.1:8888/api/radar?workspace=${selectedSandbox}`)
+    fetch(`/api/radar?workspace=${selectedSandbox}`)
       .then(res => res.json())
       .then(data => setBlackholes(data))
       .catch(err => console.error("Radar 扫描失败", err))
