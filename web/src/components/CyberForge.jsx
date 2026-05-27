@@ -95,6 +95,10 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         }
         if (done) break
       }
+
+      // 🚀🚀🚀 核心改动：流式任务结束，朝天鸣枪，通知 Radar 和 Inbox 立刻刷新！ 🚀🚀🚀
+      window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE'))
+
     } catch (err) {
       setForgeLogs(prev => [...prev, { text: `💥 熔炉异常断开: ${err.message}` }])
     } finally {

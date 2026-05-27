@@ -1,84 +1,116 @@
-import { useState } from 'react'
-import { mockInboxItems } from '../data/mockData'
+import { useState, useEffect } from 'react'
 
-export default function Inbox() {
-  const [items, setItems] = useState(mockInboxItems)
-  const [previewing, setPreviewing] = useState(null)
+export default function Inbox({ selectedSandbox }) {
+  const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [editingFile, setEditingFile] = useState(null)
+  const [isSaving, setIsSaving] = useState(false)
 
-  const handleAction = (id, action) => {
-    setItems(prev => prev.filter(item => item.id !== id))
+  const fetchInbox = () => {
+    if (!selectedSandbox) return
+    setLoading(true)
+    fetch(`http://127.0.0.1:8888/api/inbox?workspace=${selectedSandbox}`)
+      .then(res => res.json())
+      .then(data => setItems(data))
+      .catch(err => console.error("Inbox 扫描失败", err))
+      .finally(() => setLoading(false))
   }
 
-  if (items.length === 0) {
+  useEffect(() => {
+    fetchInbox()
+    const handleKbUpdate = () => fetchInbox()
+    window.addEventListener('KB_PHYSICAL_UPDATE', handleKbUpdate)
+    return () => window.removeEventListener('KB_PHYSICAL_UPDATE', handleKbUpdate)
+  }, [selectedSandbox])
+
+  const handleApprove = (fileId) => {
+    fetch(`http://127.0.0.1:8888/api/inbox/approve?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'POST' })
+      .then(res => res.json())
+      .then(() => {
+        window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE')) // 鸣枪刷新
+      })
+  }
+
+  const handleDelete = (fileId) => {
+    fetch(`http://127.0.0.1:8888/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'DELETE' })
+      .then(res => res.json())
+      .then(() => {
+        window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE')) // 鸣枪刷新
+      })
+  }
+
+  const handleEditClick = (fileId) => {
+    fetch(`http://127.0.0.1:8888/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`)
+      .then(res => res.json())
+      .then(data => setEditingFile({ id: fileId, content: data.content }))
+  }
+
+  const handleSaveEdit = () => {
+    if (!editingFile) return
+    setIsSaving(true)
+    fetch(`http://127.0.0.1:8888/api/inbox/file`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        workspace: selectedSandbox,
+        file_id: editingFile.id,
+        content: editingFile.content
+      })
+    })
+      .then(res => res.json())
+      .then(() => {
+        setEditingFile(null)
+        window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE')) // 鸣枪刷新
+      })
+      .finally(() => setIsSaving(false))
+  }
+
+  if (!selectedSandbox) return <div className="text-xs text-slate-600 font-mono italic p-2">INBOX OFFLINE.</div>
+
+  if (editingFile) {
     return (
-      <div className="p-6 text-center">
-        <div className="text-3xl mb-2 opacity-40">✅</div>
-        <p className="text-sm text-slate-500">所有草稿已处理完毕</p>
-        <p className="text-[10px] text-slate-600 mt-1">系统将在有新草稿时通知您</p>
+      <div className="p-2 space-y-2 flex flex-col h-full">
+        <div className="flex justify-between items-center text-xs font-mono text-amber-400">
+          <span>📝 正在干预: {editingFile.id}</span>
+          <button onClick={() => setEditingFile(null)} className="text-slate-500 hover:text-slate-300">[返回]</button>
+        </div>
+        <textarea
+          className="flex-1 w-full bg-slate-900/50 border border-slate-700 rounded p-2 text-xs text-slate-300 font-mono resize-none focus:outline-none focus:border-amber-500/50"
+          value={editingFile.content}
+          onChange={(e) => setEditingFile({ ...editingFile, content: e.target.value })}
+        />
+        <button
+          onClick={handleSaveEdit}
+          disabled={isSaving}
+          className="w-full py-1.5 bg-amber-500/20 text-amber-400 border border-amber-500/50 hover:bg-amber-500/30 rounded text-xs font-mono disabled:opacity-50"
+        >
+          {isSaving ? 'SAVING...' : '💾 保存修改并放行'}
+        </button>
       </div>
     )
   }
 
   return (
-    <div className="p-3 space-y-2">
-      {/* Warning Header */}
-      <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
-        <span className="text-amber-400 animate-pulse">⚠️</span>
-        <span className="text-xs text-amber-300 font-medium">{items.length} 项待确认</span>
-      </div>
-
-      {/* Items */}
-      {items.map(item => (
-        <div
-          key={item.id}
-          className="glass rounded-lg p-3 animate-slide-up transition-all hover:border-slate-600/60"
-        >
-          {/* Header */}
-          <div className="flex items-start justify-between">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" />
-                <span className="text-sm font-medium text-slate-200 font-mono">{item.title}</span>
+    <div className="space-y-2 p-1">
+      {loading && items.length === 0 ? (
+        <div className="text-xs text-amber-500/50 font-mono animate-pulse p-2">SCANNING INBOX...</div>
+      ) : items.length === 0 ? (
+        <div className="p-2"><div className="text-xs text-slate-400 font-mono">📥 隔离区当前为空</div></div>
+      ) : (
+        items.map((item, idx) => (
+          <div key={idx} className="p-2 border border-slate-700/50 rounded bg-slate-800/20 group hover:border-amber-500/30 transition-colors">
+            <div className="flex justify-between items-start mb-1">
+              <span className="text-xs font-mono text-amber-400 font-bold">{item.title}</span>
+              <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button onClick={() => handleEditClick(item.id)} className="text-[10px] text-blue-400 hover:text-blue-300">[✏️]</button>
+                <button onClick={() => handleApprove(item.id)} className="text-[10px] text-emerald-400 hover:text-emerald-300">[✓]</button>
+                <button onClick={() => handleDelete(item.id)} className="text-[10px] text-red-400 hover:text-red-300">[✕]</button>
               </div>
-              <p className="text-[10px] text-slate-500 mt-0.5 ml-4">{item.source}</p>
             </div>
+            <div className="text-[10px] text-slate-400 line-clamp-2 leading-relaxed">{item.excerpt}</div>
           </div>
-
-          {/* Preview panel */}
-          {previewing === item.id && (
-            <div className="mt-2 p-3 bg-black/40 rounded-lg border border-slate-700/40 text-xs text-slate-400 font-mono leading-relaxed">
-              <div className="text-slate-500 text-[10px] mb-1">— 内容预览 —</div>
-              <p># {item.title.replace('.md', '')}</p>
-              <p className="text-slate-600 mt-1">Abstract: 本文档由系统自动生成，描述核心概念...</p>
-              <p className="text-slate-600 mt-0.5">## Key Concepts</p>
-              <p className="text-slate-600 ml-2">- 概念 A</p>
-              <p className="text-slate-600 ml-2">- 概念 B</p>
-            </div>
-          )}
-
-          {/* Actions */}
-          <div className="flex gap-1.5 mt-3 pt-2 border-t border-slate-700/30">
-            <button
-              onClick={() => setPreviewing(previewing === item.id ? null : item.id)}
-              className="flex-1 py-1.5 rounded-md bg-slate-800/60 border border-slate-700/40 text-[10px] text-slate-400 hover:text-cyan-400 hover:border-cyan-500/30 transition-all font-medium"
-            >
-              👀 预览
-            </button>
-            <button
-              onClick={() => handleAction(item.id, 'approve')}
-              className="flex-1 py-1.5 rounded-md bg-slate-800/60 border border-slate-700/40 text-[10px] text-slate-400 hover:text-emerald-400 hover:border-emerald-500/30 transition-all font-medium"
-            >
-              ✔️ 入库
-            </button>
-            <button
-              onClick={() => handleAction(item.id, 'reject')}
-              className="flex-1 py-1.5 rounded-md bg-slate-800/60 border border-slate-700/40 text-[10px] text-slate-400 hover:text-red-400 hover:border-red-500/30 transition-all font-medium"
-            >
-              ❌ 废弃
-            </button>
-          </div>
-        </div>
-      ))}
+        ))
+      )}
     </div>
   )
 }

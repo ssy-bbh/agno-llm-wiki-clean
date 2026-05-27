@@ -1,72 +1,79 @@
-import { mockRadarItems } from '../data/mockData'
+import { useState, useEffect } from 'react'
 
-export default function Radar() {
+export default function Radar({ selectedSandbox }) {
+  const [blackholes, setBlackholes] = useState([])
+  const [loading, setLoading] = useState(false)
+
+  const fetchRadar = () => {
+    if (!selectedSandbox) return
+    setLoading(true)
+    fetch(`http://127.0.0.1:8888/api/radar?workspace=${selectedSandbox}`)
+      .then(res => res.json())
+      .then(data => setBlackholes(data))
+      .catch(err => console.error("Radar 扫描失败", err))
+      .finally(() => setLoading(false))
+  }
+
+  useEffect(() => {
+    // 1. 沙箱切换，初始嗅探
+    fetchRadar()
+
+    // 2. 注册事件监听，听到物理变动广播就刷新
+    const handleKbUpdate = () => fetchRadar()
+    window.addEventListener('KB_PHYSICAL_UPDATE', handleKbUpdate)
+
+    // 3. 销毁时解绑
+    return () => window.removeEventListener('KB_PHYSICAL_UPDATE', handleKbUpdate)
+  }, [selectedSandbox])
+
+  if (!selectedSandbox) {
+    return <div className="text-xs text-slate-600 font-mono italic p-2">RADAR OFFLINE. ANCHOR REQUIRED.</div>
+  }
+
   return (
-    <div className="p-3 space-y-2">
-      {/* Header */}
-      <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/40 border border-slate-700/40">
-        <span className="text-slate-400">📡</span>
-        <div>
-          <p className="text-xs text-slate-300 font-medium">需求雷达</p>
-          <p className="text-[10px] text-slate-500">用户搜索落空记录 · 待补全的概念</p>
+    <div className="space-y-3 p-1">
+      {loading && blackholes.length === 0 ? (
+        <div className="text-xs text-emerald-500/50 font-mono animate-pulse p-2">SWEEPING TOPOLOGY GRAPH...</div>
+      ) : blackholes.length === 0 ? (
+        <div className="p-2 space-y-1">
+          <div className="text-xs text-emerald-400 font-mono">✅ 拓扑结构极度健康</div>
+          <div className="text-[10px] text-slate-500">当前沙箱未探测到高频断链，无需填补黑洞。</div>
         </div>
-      </div>
-
-      {/* Items */}
-      {mockRadarItems.map(item => {
-        const pct = Math.round((item.count / item.total) * 100)
-        const isCritical = item.count >= item.total
-        const color = isCritical ? 'red' : item.color
-        const borderColor = color === 'red' ? 'border-red-500/30' : 'border-yellow-500/20'
-        const dotColor = color === 'red' ? 'bg-red-400' : 'bg-yellow-400'
-        const textColor = color === 'red' ? 'text-red-300' : 'text-yellow-300'
-
-        return (
-          <div
-            key={item.id}
-            className={`glass rounded-lg p-3 border-l-2 ${borderColor} hover:bg-slate-800/40 transition-all cursor-pointer group`}
-          >
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className={`w-2 h-2 rounded-full ${dotColor} ${isCritical ? 'animate-pulse' : ''}`} />
-                <span className={`text-sm font-mono font-medium ${textColor}`}>
-                  [{item.term}]
-                </span>
+      ) : (
+        <>
+          {blackholes.map((hole, idx) => {
+            const isCritical = hole.urgency >= 60; // 5次及以上红温预警
+            return (
+              <div key={idx} className="space-y-1.5 group">
+                <div className="flex justify-between items-end">
+                  <span className={`text-[11px] font-mono font-medium transition-colors ${
+                    isCritical ? 'text-red-400 group-hover:text-red-300' : 'text-slate-300 group-hover:text-emerald-300'
+                  }`}>
+                    {hole.concept}
+                    {isCritical && <span className="ml-2 text-[9px] text-red-500 animate-pulse">⚠️ 亟待填补</span>}
+                  </span>
+                  <span className="text-[9px] font-mono text-slate-500">
+                    引力: <span className={isCritical ? "text-red-500 font-bold" : "text-emerald-400"}>{hole.mentions}</span>
+                  </span>
+                </div>
+                <div className="h-1.5 w-full bg-slate-900 rounded-full overflow-hidden border border-slate-800">
+                  <div
+                    className={`h-full rounded-full transition-all duration-700 ease-out relative overflow-hidden bg-gradient-to-r ${
+                      isCritical ? 'from-red-600 to-red-400' : 'from-emerald-600 to-emerald-400'
+                    }`}
+                    style={{ width: `${hole.urgency}%` }}
+                  >
+                    <div className="absolute top-0 bottom-0 left-0 right-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full animate-[shimmer_2s_infinite]" />
+                  </div>
+                </div>
               </div>
-              <span className="text-[10px] text-slate-500 font-mono">{item.count}/{item.total}</span>
-            </div>
-
-            {/* Progress bar */}
-            <div className="mt-2 w-full h-1 bg-slate-700/50 rounded-full overflow-hidden">
-              <div
-                className={`h-full rounded-full transition-all duration-500 ${
-                  isCritical ? 'bg-red-500/60' : 'bg-yellow-500/40'
-                }`}
-                style={{ width: `${pct}%` }}
-              />
-            </div>
-
-            {/* Action hint */}
-            <div className="mt-1.5 text-[10px] text-slate-600 group-hover:text-slate-400 transition-colors">
-              {isCritical ? '🔴 已达阈值 · 建议立即补全' : '🟡 持续出现 · 考虑创建页面'}
-            </div>
+            );
+          })}
+          <div className="pt-2 text-[9px] text-slate-500 font-mono border-t border-slate-800/60 flex justify-between">
+            <span>* 点击控制台 [填补黑洞] 即可进行实例化</span>
           </div>
-        )
-      })}
-
-      {/* Summary */}
-      <div className="mt-3 px-3 py-2 rounded-lg bg-slate-800/30 border border-slate-700/30">
-        <div className="flex items-center justify-between text-[10px]">
-          <span className="text-slate-500">总监控词数</span>
-          <span className="text-slate-300 font-mono">{mockRadarItems.length}</span>
-        </div>
-        <div className="flex items-center justify-between text-[10px] mt-1">
-          <span className="text-slate-500">已达阈值</span>
-          <span className="text-red-400 font-mono">
-            {mockRadarItems.filter(i => i.count >= i.total).length}
-          </span>
-        </div>
-      </div>
+        </>
+      )}
     </div>
   )
 }

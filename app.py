@@ -32,7 +32,7 @@ app.add_middleware(
 # 初始化核心工作流实例
 query_flow = QueryFlow()
 lint_flow = LintFlow()
-autofill_flow = AutoFillFlow(threshold=2)  # 被引用 2 次即自动触发填补真空
+autofill_flow = AutoFillFlow(threshold=5)  # 被引用 5 次即自动触发填补真空
 
 
 # ==========================================
@@ -191,6 +191,133 @@ async def get_workspaces():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==========================================
+# 📥 6. 隔离审批区接口 (Inbox)
+# ==========================================
+@app.get("/api/inbox")
+async def get_inbox(workspace: str):
+    """只扫描带有草稿烙印的待审实体"""
+    if not workspace: return []
+    concepts_dir = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts"
+    if not concepts_dir.exists(): return []
+
+    # 💡 组装安全烙印，防止前端意外吞噬
+    DRAFT_TAG = "<" + "!-- AUTOFILL_DRAFT --" + ">"
+
+    files = []
+    try:
+        for f in concepts_dir.glob("*.md"):
+            if f.stem.lower() == "index": continue
+
+            content = f.read_text(encoding="utf-8")
+            # 💡 核心拦截：如果没有草稿烙印，直接跳过
+            if DRAFT_TAG not in content:
+                continue
+
+            stat = f.stat()
+            # 截取内容时，剔除烙印
+            clean_excerpt = re.sub(r'<.*?AUTOFILL_DRAFT.*?>', '', content)
+            clean_excerpt = re.sub(r'[#*\[\]\n]', ' ', clean_excerpt)[:40].strip()
+
+            files.append({
+                "id": f.stem,
+                "title": f.stem,
+                "excerpt": f"{clean_excerpt}..." if clean_excerpt else "无正文内容...",
+                "timestamp": stat.st_mtime
+            })
+
+        files.sort(key=lambda x: x["timestamp"], reverse=True)
+        return files[:4]
+    except Exception as e:
+        return []
+
+
+@app.post("/api/inbox/approve")
+async def approve_inbox_file(workspace: str, file_id: str):
+    """静默放行：物理撕毁文件中的草稿烙印"""
+    DRAFT_TAG_LINE = "<" + "!-- AUTOFILL_DRAFT --" + ">\n"
+    DRAFT_TAG_INLINE = "<" + "!-- AUTOFILL_DRAFT --" + ">"
+
+    filepath = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts" / f"{file_id}.md"
+    if filepath.exists():
+        content = filepath.read_text(encoding="utf-8")
+        clean_content = content.replace(DRAFT_TAG_LINE, "").replace(DRAFT_TAG_INLINE, "")
+        filepath.write_text(clean_content, encoding="utf-8")
+    return {"status": "success"}
+
+
+# ==========================================
+# 📡 7. 需求雷达接口 (Radar) - 正式版 (5次60分)
+# ==========================================
+@app.get("/api/radar")
+async def get_radar(workspace: str):
+    if not workspace: return []
+
+    from pathlib import Path
+    import re
+    from collections import Counter
+
+    concepts_dir = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts"
+    if not concepts_dir.exists():
+        return []
+
+    existing_files = list(concepts_dir.glob("*.md"))
+    link_counter = Counter()
+
+    try:
+        # 1. 全局扫描提取引力链接
+        for file_path in existing_files:
+            content = file_path.read_text(encoding="utf-8")
+            links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
+
+            for link in links:
+                clean_link = link.strip()
+                if not clean_link: continue
+                link_counter[clean_link] += 1
+
+        # 2. 精确别名解构，识别假死链
+        def _get_real_target_if_exists(ghost_name: str, files: list) -> str:
+            def _get_aliases(text: str) -> set:
+                aliases = set()
+                clean_text = text.lower().replace("-", "").replace("_", "").replace(" ", "")
+                if clean_text: aliases.add(clean_text)
+                match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
+                if match:
+                    part1 = match.group(1).lower().replace("-", "").replace("_", "").replace(" ", "")
+                    part2 = match.group(2).lower().replace("-", "").replace("_", "").replace(" ", "")
+                    if part1: aliases.add(part1)
+                    if part2: aliases.add(part2)
+                return aliases
+
+            ghost_aliases = _get_aliases(ghost_name)
+            for ex_file in files:
+                ex_aliases = _get_aliases(ex_file.stem)
+                if ghost_aliases & ex_aliases:
+                    return ex_file.stem
+            return ""
+
+        # 3. 统计并筛选黑洞节点 (>=1次即可上榜)
+        target_ghosts = []
+        for link, count in link_counter.items():
+            real_target = _get_real_target_if_exists(link, existing_files)
+            if not real_target and link.lower() != "index" and count >= 1:
+                target_ghosts.append((link, count))
+
+        target_ghosts.sort(key=lambda x: x[1], reverse=True)
+
+        # 4. 计分并返回前端 (1次12分，5次60分触发红温，封顶100分)
+        radar_data = []
+        for name, count in target_ghosts[:5]:
+            score = min(100, count * 12)
+            radar_data.append({
+                "concept": name,
+                "urgency": score,
+                "mentions": count
+            })
+
+        return radar_data
+    except Exception:
+        return []
 @app.get("/api/graph")
 async def get_graph(workspace: str):
     """精准定位 concepts 路径，通过正则提取真实 [[双链]] 拓扑"""
@@ -235,6 +362,46 @@ async def get_graph(workspace: str):
         raise HTTPException(status_code=500, detail=f"星图拓扑解析失败: {str(e)}")
 
 
+# ==========================================
+# ⚖️ 8. Inbox 物理审批流接口 (读取/覆写/销毁)
+# ==========================================
+class FileEditRequest(BaseModel):
+    workspace: str
+    file_id: str
+    content: str
+
+
+@app.get("/api/inbox/file")
+async def get_inbox_file(workspace: str, file_id: str):
+    DRAFT_TAG_LINE = "<" + "!-- AUTOFILL_DRAFT --" + ">\n"
+
+    filepath = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts" / f"{file_id}.md"
+    if not filepath.exists(): raise HTTPException(status_code=404)
+    # 返回给前端编辑时，隐藏这个丑陋的烙印
+    content = filepath.read_text(encoding="utf-8").replace(DRAFT_TAG_LINE, "")
+    return {"content": content}
+
+
+@app.put("/api/inbox/file")
+async def update_inbox_file(req: FileEditRequest):
+    """人工介入，覆写大模型草稿并正式落盘（同时撕毁烙印）"""
+    DRAFT_TAG_LINE = "<" + "!-- AUTOFILL_DRAFT --" + ">\n"
+
+    filepath = Path(__file__).resolve().parent / "data" / "wiki" / req.workspace / "concepts" / f"{req.file_id}.md"
+    if not filepath.exists(): raise HTTPException(status_code=404)
+    # 保存时确保不带草稿烙印
+    clean_content = req.content.replace(DRAFT_TAG_LINE, "")
+    filepath.write_text(clean_content, encoding="utf-8")
+    return {"status": "success"}
+
+
+@app.delete("/api/inbox/file")
+async def delete_inbox_file(workspace: str, file_id: str):
+    filepath = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts" / f"{file_id}.md"
+    if filepath.exists():
+        filepath.unlink()
+        return {"status": "success"}
+    raise HTTPException(status_code=404)
 if __name__ == "__main__":
     import uvicorn
 

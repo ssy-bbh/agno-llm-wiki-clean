@@ -14,9 +14,9 @@ from tools.edit_tools import _resolve
 
 
 class AutoFillFlow:
-    def __init__(self, threshold: int = 2):
+    def __init__(self, threshold: int = 5):
         """
-        :param threshold: 触发自动填补的最小入度（默认被提及 2 次及以上就触发）
+        :param threshold: 触发自动填补的最小入度（默认被提及 5 次及以上就触发）
         """
         self.threshold = threshold
         self.writer = WikiWriter()
@@ -160,7 +160,15 @@ class AutoFillFlow:
 
                 if report and report.get("actions"):
                     self.writer.execute(report)
-                    yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功: concepts/{node}.md")
+
+                    # 💡 核心新增：强制给新生成的实体打上隐形的“待审批草稿”烙印
+                    target_file = concepts_dir / f"{node}.md"
+                    if target_file.exists():
+                        old_content = target_file.read_text(encoding="utf-8")
+                        # 将隐形标记压入文件最头部
+                        target_file.write_text("<" + "!-- AUTOFILL_DRAFT --" + ">\n" + old_content, encoding="utf-8")
+
+                    yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: concepts/{node}.md")
                 else:
                     yield format_log(f"  -> ⏭️ 智能主编拒绝生成词条: [{node}]")
                 await asyncio.sleep(0.01)
