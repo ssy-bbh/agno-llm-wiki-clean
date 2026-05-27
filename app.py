@@ -402,6 +402,31 @@ async def delete_inbox_file(workspace: str, file_id: str):
         filepath.unlink()
         return {"status": "success"}
     raise HTTPException(status_code=404)
+
+
+# ==========================================
+# 📖 9. 物理节点读取接口 (Concept Viewer)
+# ==========================================
+@app.get("/api/concept")
+async def get_concept(workspace: str, name: str):
+    """用于星图二次点击时，读取并展示具体的 MD 物理文件内容"""
+    if not workspace or not name:
+        return {"content": "参数错误：沙箱或节点名称丢失"}
+
+    from pathlib import Path
+
+    # 拼装路径: data/wiki/沙箱名/concepts/节点名.md
+    file_path = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts" / f"{name}.md"
+
+    if file_path.exists():
+        try:
+            content = file_path.read_text(encoding="utf-8")
+            return {"content": content}
+        except Exception as e:
+            return {"content": f"文件读取异常: {str(e)}"}
+    else:
+        return {"content": "⚠️ 该概念仅作为图谱中的【黑洞引用】存在，尚未被大模型实例化生成物理文件。"}
+
 if __name__ == "__main__":
     import uvicorn
 
