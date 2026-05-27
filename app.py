@@ -42,6 +42,93 @@ class ChatRequest(BaseModel):
     query: str
     workspace: Optional[str] = ""
     history: List[Dict[str, Any]] = []
+    intent_override: Optional[str] = None  # 前端可强制指定意图（调试用）
+
+
+# ==========================================
+# 🧠 轻量意图路由器 (极简 LLM Agent 一次调用)
+# ==========================================
+class Intent:
+    CHAT    = "chat"      # 寒暄闲聊 → LLM 直接回复
+    SCAN    = "scan"      # 扫描探索 → 列出 concepts 清单
+    SUMMARY = "summary"   # 概览总结 → 读取 index.md 生成摘要
+    QUERY   = "query"     # 具体知识查询 → 走完整 QueryFlow
+    ERROR   = "error"     # 空输入 / 无效请求
+
+
+from pydantic import BaseModel as _PydanticModel, Field as _Field
+from typing import Literal as _Literal
+
+
+class _IntentDecision(_PydanticModel):
+    """意图分类器的结构化输出"""
+    intent: _Literal["chat", "scan", "summary", "query"] = _Field(
+        description="用户意图分类：chat(闲聊)/scan(扫描知识列表)/summary(知识库概览)/query(具体知识查询)"
+    )
+
+
+class IntentRouter:
+    """极简意图路由 Agent —— 一次轻量 LLM 调用完成分类"""
+
+    def __init__(self):
+        from core.llm_factory import get_qwen_model
+        from agno.agent import Agent
+
+        self.agent = Agent(
+            model=get_qwen_model(),
+            instructions=[
+                "你是一个意图分类器。根据用户的输入，判断其真实意图。"
+                "只输出一个意图标签，不要解释。"
+                "\n分类标准："
+                "- chat：打招呼、问候、闲聊、夸赞 AI、问 AI 身份、简短回应（谢谢/好的/哈哈）"
+                "- scan：询问知识库里有什么概念/节点/内容，要求列出清单、展示目录"
+                "- summary：要求总结/概览/介绍整个知识库或某个沙箱的内容结构"
+                "- query：提出具体的知识性问题，需要检索资料才能回答"
+                "\n判定原则："
+                "- 空输入直接返回 error"
+                "- 不确定时优先 query（宁可多检索也不要误判）"
+            ],
+            output_schema=_IntentDecision,
+            stream=False,
+        )
+
+    def classify(self, query: str) -> str:
+        """分类用户意图，返回 intent 标签"""
+        if not query or not query.strip():
+            return Intent.ERROR
+
+        q = query.strip()
+        # 超短消息（≤3 字且不含标点/汉字），直接判定 chat
+        import re
+        if len(q) <= 3 and re.match(r'^[\s\u4e00-\u9fa5a-zA-Z]{1,3}$', q):
+            return Intent.CHAT
+
+        try:
+            result = self.agent.run(q)
+            if hasattr(result.content, 'model_dump'):
+                return result.content.model_dump()['intent']
+            if hasattr(result.content, 'intent'):
+                return result.content.intent
+            # fallback: 如果结构化解析失败，尝试从文本中提取
+            text = str(result.content).lower()
+            for tag in ['chat', 'scan', 'summary', 'query']:
+                if tag in text:
+                    return tag
+        except Exception:
+            pass
+
+        return Intent.QUERY
+
+
+# 全局单例（复用，避免重复创建 Agent）
+_intent_router = None
+
+
+def classify_intent(query: str) -> str:
+    global _intent_router
+    if _intent_router is None:
+        _intent_router = IntentRouter()
+    return _intent_router.classify(query)
 
 
 class ForgeRequest(BaseModel):
@@ -54,16 +141,66 @@ class SandboxCreate(BaseModel):
 
 
 # ==========================================
-# 🗣️ 1. 探求模式接口 (Query Mode)
+# 🗣️ 1. 探求模式接口 (Query Mode) — 五向意图路由
 # ==========================================
+@app.get("/api/intent/debug")
+async def debug_intent(query: str):
+    """调试端点：查看意图分类结果（不执行实际操作）"""
+    return {"intent": classify_intent(query), "query": query}
+
+
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
-    """接通隔离沙箱与历史长河的流式应答中枢"""
+    """流式应答中枢 — 五向意图分发器 (chat / scan / summary / query / error)"""
     try:
+        query = request.query.strip()
+        workspace = request.workspace
+
+        # 前端可强制覆盖意图（调试用）
+        if request.intent_override and request.intent_override in (
+            Intent.CHAT, Intent.SCAN, Intent.SUMMARY, Intent.QUERY
+        ):
+            intent = request.intent_override
+        else:
+            intent = classify_intent(query)
+
+        print(f"🧠 [意图路由] '{query[:40]}' -> {intent}")
+
+        # ─── 分轨处理 ───
+
+        if intent == Intent.ERROR:
+            # 🛤️ 轨道 0：空请求
+            async def error_stream():
+                yield f"data: {json.dumps({'type': 'text', 'content': '⚠️ 请输入你的问题或指令。'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return StreamingResponse(error_stream(), media_type="text/event-stream")
+
+        if intent == Intent.CHAT:
+            # 🛤️ 轨道 A：闲聊模式 → 直接回复，不调检索管线
+            return StreamingResponse(
+                _stream_chat_reply(query, history=request.history),
+                media_type="text/event-stream"
+            )
+
+        if intent == Intent.SCAN:
+            # 🛤️ 轨道 B：扫描模式 → 列出 concepts 清单
+            return StreamingResponse(
+                _stream_scan_response(query, workspace),
+                media_type="text/event-stream"
+            )
+
+        if intent == Intent.SUMMARY:
+            # 🛤️ 轨道 C：概览模式 → 读取 index.md 生成总结
+            return StreamingResponse(
+                _stream_summary_response(query, workspace),
+                media_type="text/event-stream"
+            )
+
+        # 🛤️ 轨道 D：QUERY 模式 (默认) → 走完整 QueryFlow 检索管线
         return StreamingResponse(
             query_flow.stream_execute(
-                user_question=request.query,
-                target_workspace=request.workspace,
+                user_question=query,
+                target_workspace=workspace,
                 history=request.history
             ),
             media_type="text/event-stream"
@@ -71,6 +208,213 @@ async def chat_endpoint(request: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ==========================================
+#  意图分轨处理函数
+# ==========================================
+
+async def _stream_chat_reply(query: str, history: list = None):
+    """闲聊轨道：直接让 LLM 以赛博朋克口吻回复，不检索知识库"""
+    from core.llm_factory import get_qwen_model
+    from agno.agent import Agent
+
+    agent = Agent(
+        model=get_qwen_model(),
+        instructions=[
+            "你是一个 AI 向导，回答简短、有趣、有个性。"
+            "不要调用任何外部工具或知识库，直接基于你的常识回复。"
+            "回复控制在 100 字以内。"
+        ],
+        stream=True,
+    )
+
+    # 拼装上下文
+    system_prompt = f"用户说：{query}"
+    if history:
+        ctx = "【前情回顾】\n"
+        for msg in history[-5:]:
+            role = "用户" if msg.get('role') == 'user' else 'AI'
+            ctx += f"{role}: {msg.get('content')}\n"
+        system_prompt = f"{ctx}\n用户最新消息：{query}"
+
+    try:
+        response = agent.run(system_prompt)
+        for chunk in response:
+            text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            if text and text != "None":
+                yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'text', 'content': f'⚠️ 闲聊模块异常: {str(e)}'})}\n\n"
+
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
+def _get_all_workspaces() -> list:
+    """列出所有沙箱名，按 mtime 倒序"""
+    wiki_base = Path(__file__).resolve().parent / "data" / "wiki"
+    if not wiki_base.exists():
+        return []
+    workspaces = [d for d in wiki_base.iterdir() if d.is_dir()]
+    workspaces.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    return [w.name for w in workspaces]
+
+
+def _get_default_workspace() -> str:
+    """自动选取默认工作区（最新修改的那个）"""
+    all_ws = _get_all_workspaces()
+    return all_ws[0] if all_ws else ""
+
+
+async def _stream_scan_response(query: str, workspace: str):
+    """扫描轨道：未指定沙箱 → 全局扫描所有沙箱；指定了 → 只扫该沙箱"""
+    import asyncio
+    from pathlib import Path
+
+    wiki_base = Path(__file__).resolve().parent / "data" / "wiki"
+
+    # ── 未指定沙箱：全局概览（只展示沙箱名 + 节点数，不展开具体节点） ──
+    if not workspace or not workspace.strip():
+        all_ws = _get_all_workspaces()
+        if not all_ws:
+            content = "🔭 系统中尚未创建任何知识沙箱。\n\n请先创建沙箱并摄入原始资料。"
+            yield f"data: {json.dumps({'type': 'log', 'content': '📡 [全局扫描] 未找到任何沙箱'})}\n\n"
+            for i in range(0, len(content), 15):
+                yield f"data: {json.dumps({'type': 'text', 'content': content[i:i+15]})}\n\n"
+                await asyncio.sleep(0.02)
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'type': 'log', 'content': f'📡 [全局扫描] 正在扫描 {len(all_ws)} 个沙箱 ...'})}\n\n"
+        await asyncio.sleep(0.3)
+
+        total_nodes = 0
+        ws_stats = []
+
+        for ws_name in all_ws:
+            concepts_dir = wiki_base / ws_name / "concepts"
+            count = 0
+            if concepts_dir.exists():
+                count = len([f for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
+            total_nodes += count
+            ws_stats.append((ws_name, count))
+
+        # 构建简洁概览
+        lines = [f"📡 全局扫描完毕，共检测到 **{len(all_ws)}** 个沙箱 / **{total_nodes}** 个知识节点：\n"]
+        lines.append("| 沙箱 | 节点数 | 状态 |")
+        lines.append("|------|--------|------|")
+        for ws_name, count in ws_stats:
+            status = "✅ 已激活" if count > 0 else "⭕ 虚空"
+            lines.append(f"| {ws_name} | {count} | {status} |")
+
+        lines.append("\n💡 在左侧切换沙箱隔离区可深入查看具体节点，或直接输入具体问题。")
+        content = "\n".join(lines)
+
+        chunk_size = 15
+        for i in range(0, len(content), chunk_size):
+            yield f"data: {json.dumps({'type': 'text', 'content': content[i:i+chunk_size]})}\n\n"
+            await asyncio.sleep(0.02)
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return
+
+    # ── 指定了沙箱：只扫该沙箱 ──
+    concepts_dir = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts"
+    available = []
+    if concepts_dir.exists():
+        available = sorted(
+            [f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"]
+        )
+
+    if available:
+        group_size = 8
+        groups = [available[i:i + group_size] for i in range(0, len(available), group_size)]
+        display_lines = [f"📡 扫描完毕，在沙箱 **{workspace}** 中检测到 **{len(available)}** 个已实例化的知识节点：\n"]
+        for idx, group in enumerate(groups):
+            display_lines.append(f"{' | '.join(f'`{c}`' for c in group)}")
+        display_lines.append(f"\n💡 点击图谱上的节点，或直接在下方输入具体问题，即可深入探索。")
+        content = "\n".join(display_lines)
+    else:
+        content = (f"🔭 扫描完毕：沙箱 **{workspace}** 中尚未生成任何知识节点。\n\n"
+                   f"知识宇宙还是一片虚空 —— 试着拖拽一些原始资料到赛博熔炉中进行首次摄入吧！")
+
+    yield f"data: {json.dumps({'type': 'log', 'content': f'📡 [扫描] 正在读取沙箱 [{workspace}] ...'})}\n\n"
+    await asyncio.sleep(0.3)
+
+    chunk_size = 15
+    for i in range(0, len(content), chunk_size):
+        chunk = content[i:i + chunk_size]
+        yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+        await asyncio.sleep(0.02)
+
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
+async def _stream_summary_response(query: str, workspace: str):
+    """概览轨道：读取 index.md，让 LLM 生成知识库总结"""
+    import asyncio
+    from pathlib import Path
+    from core.llm_factory import get_qwen_model
+    from agno.agent import Agent
+
+    # 沙箱未指定时自动兜底
+    if not workspace or not workspace.strip():
+        workspace = _get_default_workspace()
+        if not workspace:
+            content = "📋 系统中尚未创建任何知识沙箱，无法生成概览。"
+            for i in range(0, len(content), 15):
+                yield f"data: {json.dumps({'type': 'text', 'content': content[i:i+15]})}\n\n"
+                await asyncio.sleep(0.02)
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+
+    index_path = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "index.md"
+
+    yield f"data: {json.dumps({'type': 'log', 'content': f'📋 [概览] 正在读取导航地图 ...'})}\n\n"
+    await asyncio.sleep(0.3)
+
+    if index_path.exists():
+        index_content = index_path.read_text(encoding="utf-8")
+
+        # 如果 index.md 很短（空知识库），直接回复
+        if len(index_content.strip()) < 50:
+            content = (f"📋 沙箱 **{workspace}** 的导航地图几乎空白。\n\n"
+                       f"知识库尚未建立结构化的导航体系 —— 建议先进行知识摄入。")
+            chunk_size = 15
+            for i in range(0, len(content), chunk_size):
+                yield f"data: {json.dumps({'type': 'text', 'content': content[i:i + chunk_size]})}\n\n"
+                await asyncio.sleep(0.02)
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+
+        # 让 LLM 基于 index.md 生成总结
+        agent = Agent(
+            model=get_qwen_model(),
+            instructions=[
+                "你是一位知识库架构师。根据以下导航地图（index.md），用简洁、结构化的语言"
+                "总结当前知识库的核心内容领域、覆盖范围和知识结构。"
+                "回答控制在 200 字以内，使用 Markdown 格式。"
+            ],
+            stream=True,
+        )
+
+        prompt = f"【用户问题】: {query}\n\n【导航地图】:\n{index_content[:4000]}"
+        try:
+            response = agent.run(prompt)
+            for chunk in response:
+                text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                if text and text != "None":
+                    yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'text', 'content': f'⚠️ 概览模块异常: {str(e)}'})}\n\n"
+    else:
+        content = (f"📋 沙箱 **{workspace}** 中尚未建立导航地图（index.md）。\n\n"
+                   f"建议先摄入一些原始资料，让系统自动生成知识结构。")
+        chunk_size = 15
+        for i in range(0, len(content), chunk_size):
+            yield f"data: {json.dumps({'type': 'text', 'content': content[i:i + chunk_size]})}\n\n"
+            await asyncio.sleep(0.02)
+
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 # ==========================================
 # 🕸️ 2. 织网模式清洗调度流接口 (Forge Mode)
