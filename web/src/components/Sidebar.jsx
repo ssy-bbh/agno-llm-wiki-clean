@@ -11,8 +11,7 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
         const formatted = data.map(name => ({
           id: name,
           name: name,
-          status: 'active',
-          files: '?'
+          status: 'active'
         }))
         setSandboxes(formatted)
       })
@@ -39,7 +38,7 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
       if (!response.ok) {
           const errorData = await response.text()
           throw new Error(`[HTTP ${response.status}] 详情: ${errorData}`)
-}
+      }
 
       // 创建成功后立刻刷新左侧列表
       fetchWorkspaces()
@@ -112,7 +111,7 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
             <button
               key={sb.id}
               onClick={() => onSandboxSelect(sb.id === selectedSandbox ? null : sb.id)}
-              className={`w-full text-left px-3 py-2.5 rounded-lg border transition-all duration-200 group ${
+              className={`w-full text-left px-3 py-3 rounded-lg border transition-all duration-200 group ${
                 sb.id === selectedSandbox
                   ? 'bg-slate-700/40 border-cyan-500/40 glow-cyan'
                   : 'bg-slate-800/30 border-slate-700/30 hover:border-slate-600/50 hover:bg-slate-800/50'
@@ -127,9 +126,6 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
                 <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
                   sb.id === selectedSandbox ? 'bg-cyan-400 animate-pulse shadow-[0_0_5px_rgba(34,211,238,0.8)]' : 'bg-slate-500'
                 }`} />
-              </div>
-              <div className="flex items-center gap-3 mt-1">
-                <span className="text-[10px] text-slate-500">{sb.files} files</span>
               </div>
             </button>
           ))}
