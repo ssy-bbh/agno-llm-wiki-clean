@@ -11,6 +11,7 @@
 | `wiki_analyst.py` | Qwen-Max | 无（纯文本分析） | **只读分析**：侦察兵，从资料提取概念+摘要，输出 `AnalysisReport` | ✅ |
 | `wiki_writer.py` | 无（纯执行器） | `edit_tools` | **只写执行**：接收 Report，执行 create/edit/append_link | ✅ |
 | `wiki_editor.py` | Qwen-Max | 无（纯决策） | **主编**：比对新旧知识，输出 `EditorReport` 融合动作 | ✅ |
+| `wiki_query.py` | Qwen-Max | 无（纯决策） | **查询路由器**：`WikiRouter` 决定本地概念命中 + 模糊搜索 + 是否需要联网 | ✅ |
 | `ppt_maker.py` | — | `ppt_tools` | PPT 生成 | 🔧 WIP |
 | `vision_analyst.py` | — | `vision_tools` | 视觉分析 | 🔧 WIP |
 
@@ -49,42 +50,38 @@ wiki_analyst (只读分析) ──AnalysisReport──▶ wiki_writer (只写执
 | **决策层** | 融合新旧知识 | `wiki_editor` | 只读决策，输出 `EditorReport` + `Action` |
 | **执行层** | 持久化到磁盘 | `wiki_writer` | 只写不分析，纯执行器 |
 
-## Map-Reduce 知识摄取引擎 (`IngestFlow`)
+## 查询路由器 (wiki_query.py)
 
-知识摄取采用 **Map-Reduce 并发架构**，大幅提升处理效率：
+`WikiRouter` 是查询链路的决策 Agent，输出 `RouteDecision`：
 
+```python
+class RouteDecision(BaseModel):
+    local_concepts: List[str]   # 精确命中的 [[概念名称]] 列表
+    fuzzy_keywords: List[str]   # 同义词/缩写/核心术语（扩大搜索面）
+    needs_web_search: bool      # 是否需要联网搜索
+    search_query: str           # 外部搜索的精准查询词
 ```
-原始文档 ──▶ 切分知识块 ──▶ [Phase 1: MAP] 并发提取 ──▶ [Phase 2: SHUFFLE] 概念聚类 ──▶ [Phase 3: REDUCE] 逐概念融合
-                            12线程并发                       同义词解构                      主编逐个融合+写盘
+
+## Prompt 内联机制
+
+所有 Agent 的 `instructions` 字符串直接内联在各自的 `.py` 文件中，**不再依赖 `prompts/` 目录**。
+
+```python
+# 示例：wiki_analyst.py 内联 instructions
+class WikiAnalyst(Agent):
+    instructions = """你是一个知识库侦察兵..."""
 ```
 
-- **Phase 1 MAP**：12 线程并发调用 `WikiAnalyst` 提取各知识块的核心概念
-- **Phase 2 SHUFFLE**：基于双语解构引擎（`英文名 (中文)` 格式）按概念聚类碎片知识
-- **Phase 3 REDUCE**：逐个概念启动新鲜 `WikiEditor` 进行融合，Token 超限自动截断
-
-## 工作流 (Workflows)
-
-| 工作流 | 文件 | 功能 | 状态 |
-|---|---|---|---|
-| 知识摄入 | `workflows/ingest_flow.py` | Map-Reduce 知识摄取流水线 | ✅ |
-| 审查织网 | `workflows/lint_flow.py` | 扫描双链，自动建立 Backlinks，清理死链 | ✅ |
-| 查询路由 | `workflows/query_flow.py` | 意图路由：本地 Wiki vs 全网搜索，汇总输出 | ✅ |
-| 幽灵节点填补 | `workflows/autofill_flow.py` | 探测真空节点（高频引用但无页面），自动合成 | ✅ |
+`protocols/` 下的协议文件（`purpose.md` / `schema.md`）作为知识库规范的独立维护层，Agent 运行时按需读取参考。
 
 ## 关键文件
 
 | 路径 | 说明 |
 |---|---|
 | `core/llm_factory.py` | 模型工厂，`get_qwen_model()` 统一提供 LLM 实例 |
-| `prompts/wiki_prompt.py` | `build_analyst_system_prompt()` / `build_writer_system_prompt()` |
-| `prompts/research_prompt.py` | `get_deep_research_instructions()` |
-| `tools/edit_tools.py` | Wiki 页面编辑工具集（含 `_resolve` 活路径解析） |
-| `tools/document_parser.py` | 文档解析与分块（`extract_text` / `chunk_text`） |
+| `tools/edit_tools.py` | Wiki 页面编辑工具集（含 `_resolve` 活路径解析 + `threading.local()` 上下文） |
+| `tools/document_parser.py` | 文档解析与分块（pdfplumber `extract_text` / `chunk_text`） |
 | `tools/search_tools.py` | 搜索工具集 |
-| `workflows/ingest_flow.py` | 知识摄取流水线编排（Map-Reduce） |
-| `workflows/lint_flow.py` | 知识库审查与反向链接织网 |
-| `workflows/query_flow.py` | 查询路由工作流（Team + Agent 编排） |
-| `workflows/autofill_flow.py` | 幽灵节点自动实例化引擎 |
 
 ## 核心数据结构
 

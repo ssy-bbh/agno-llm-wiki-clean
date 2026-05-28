@@ -1,53 +1,60 @@
 # data/ — 数据输入输出区
 
-读写分离的物理拓扑。舍弃了笼统的"输入/输出"概念，严格执行读写分离。
+读写分离 + 用户物理隔离。
 
 ## 目录结构
 
 ```
 data/
-├── raw/                    # 【只读】原始来源层
+├── memory.db               # SQLite 会话记忆（Agno SqliteDb）
+│
+├── raw/{user_id}/          # 【只读】原始来源层（按用户隔离）
 │   └── *.pdf / *.docx / *.md / *.png ...
 │
-└── wiki/                   # 【可写】维基编译层，LLM 全权维护
-    ├── concepts/           # 知识概念页面
-    ├── entities/           # 实体页面（人物、项目、产品等）
-    ├── index.md            # 全局导航地图（每次查询/写入前必读）
-    └── log.md              # Append-only 审计日志（只能追加，不能编辑）
+└── wiki/{user_id}/         # 【可写】维基编译层（按用户隔离）
+    └── {workspace}/        # 沙箱
+        ├── concepts/       # 知识概念页面（*.md）
+        │   └── mocs/       # MOC (Map of Content) 索引页面
+        └── index.md        # 沙箱级导航地图
+```
+
+## 路径解析
+
+所有路径通过 `core/path_resolver.py` 统一解析：
+
+```python
+from core.path_resolver import get_wiki_root, get_concepts_dir, get_index_path
+
+# data/wiki/sybh/邯钢资料论文/concepts/
+concepts = get_concepts_dir("sybh", "邯钢资料论文")
+
+# data/wiki/sybh/邯钢资料论文/index.md
+index = get_index_path("sybh", "邯钢资料论文")
+
+# data/raw/sybh/
+raw = get_raw_root("sybh")
 ```
 
 ## 读写权限矩阵
 
 | 目录 | Agent 读 | Agent 写 | 人类编辑 |
 |------|---------|---------|---------|
-| `raw/` | ✅ | ❌ 禁止 | ✅ 上传新文件 |
-| `wiki/concepts/` | ✅ | ✅ via edit_tools | ✅ |
-| `wiki/entities/` | ✅ | ✅ via edit_tools | ✅ |
-| `wiki/index.md` | ✅ | ✅ via edit_tools | ✅ |
-| `wiki/log.md` | ✅ | ✅ 仅 append | ❌ 禁止 |
+| `raw/{user_id}/` | ✅ | ❌ 禁止 | ✅ 上传新文件 |
+| `wiki/{user_id}/{ws}/concepts/` | ✅ | ✅ via edit_tools | ✅ |
+| `wiki/{user_id}/{ws}/index.md` | ✅ | ✅ via edit_tools | ✅ |
 
-## index.md — 全局导航
+## index.md — 沙箱导航
 
-知识库的**全局寻址核心**，包含：
-- 顶层分类结构（Concepts / Entities）
-- 最近更新清单
-- 孤立页面警告
+每个沙箱的**全局寻址核心**，包含：
+- 概念目录清单
+- 最近更新记录
 - 跨领域关联索引
 
 每次 `ingest_flow` 完成后必须同步更新；`lint_flow` 定期检查其一致性。
 
-## log.md — 审计日志
-
-Append-only 格式：
-
-```markdown
-- **2026-04-22 16:00** | CREATE | attention-mechanism.md | 新建 concept 页面
-- **2026-04-22 16:01** | EDIT | transformer-architecture.md | 追加 [[attention-mechanism]]
-- **2026-04-22 16:05** | LINT | | ✅ 未发现问题
-```
-
 ## 安全边界
 
-- `file_tools.py` 强制校验路径，禁止 `../` 跳出 `data/wiki/`
+- `path_resolver.py` 按 `user_id` 隔离路径，用户无法访问他人数据
+- `file_tools.py` 强制校验路径，禁止 `../` 跳出 `data/wiki/{user_id}/`
 - `edit_tools.py` 所有写入必须通过 `str_replace()` 或 `append_to_log()`
 - 原始数据在 `raw/` 中永不修改，支持重新编译（Re-compile）

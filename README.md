@@ -19,7 +19,7 @@
 | 层 | 职责 | 修改方式 |
 |---|---|---|
 | **Protocols** (`protocols/`) | **做什么**——知识库使命边界、双链语法、页面模板、操作 SOP | 编辑 `.md` 文件，无需触碰 Python |
-| **Prompts** (`prompts/`) | **怎么说**——模型语气、输出格式、角色设定 | 编辑 Python 字符串 |
+| **Prompts** (各 Agent 内联) | **怎么说**——模型语气、输出格式、角色设定 | 编辑 Agent `.py` 中的 `instructions` 字符串 |
 
 像改文档一样调整策略，无需修改源码。
 
@@ -35,17 +35,17 @@
 - **撰稿人**（`wiki_writer`）：纯 Python 执行器，接收 Report 后操作文件系统
 - 分析与执行分离、决策与写入分离，中间传递 Pydantic 结构化报告
 
-### 3. 读写分离
+### 3. 读写分离 + 用户隔离
 
 ```
-data/raw/    → 只读来源层，大模型只能消费，不能写入
-data/wiki/   → 维基编译层，大模型全权写入
-LanceDB      → 语义兜底，仅在 index.md 超载时启用
+data/raw/{user_id}/    → 只读来源层，大模型只能消费，不能写入
+data/wiki/{user_id}/   → 维基编译层，大模型全权写入（按用户物理隔离）
+data/memory.db         → SQLite 会话记忆（Agno SqliteDb）
 ```
 
 - `file_tools` 路径锁死 `data/wiki/`，严格拒绝目录遍历
+- `path_resolver.py` 统一解析所有路径，确保用户只能访问自己的数据
 - `index.md` 是全局导航地图，每次读写**必读**
-- `log.md` 是 append-only 审计日志
 
 ### 4. Map-Reduce 并发摄入 + Workflow 确定性
 
@@ -55,6 +55,7 @@ LanceDB      → 语义兜底，仅在 index.md 超载时启用
 | `lint_flow` | 死链检测 → Backlinks 织网 → 孤立页面报告 | 定期审查 |
 | `query_flow` | Team[local_wiki + web_researcher] → Summarizer 汇总 | 查询路由 |
 | `autofill_flow` | 扫描双链 → 探测真空节点 → 自动合成填充 | 知识黑洞自愈 |
+| `report_flow` | TopicScanner → BulkRetriever → ReportSynthesizer | 批量报告生成 |
 
 `ingest_flow` 采用三阶段 Map-Reduce 架构：Phase 1 12线程并发提取 → Phase 2 同义词聚类 → Phase 3 逐概念融合写入，兼顾效率与质量。
 
@@ -63,39 +64,36 @@ LanceDB      → 语义兜底，仅在 index.md 超载时启用
 ## 架构总览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     app.py (FastAPI)                     │
-│              AgentOS · Router · SqliteDb                 │
-└────────────┬──────────────────────────┬──────────────────┘
-             │                          │
-    ┌────────▼────────┐        ┌────────▼──────────┐
-    │   Agents 层      │        │  Workflows 层      │
-    │  web_researcher │        │  ingest_flow       │
-    │  local_wiki     │        │  lint_flow         │
-    │  wiki_analyst ◄─┼───────►│  query_flow        │
-    │  wiki_writer    │  CoT   │  autofill_flow     │
-    │  wiki_editor    │        │                    │
-    │  ppt_maker      │        │                    │
-    │  vision_analyst │        │                    │
-    └────────┬────────┘        └───────────┬────────┘
-             │                             │
-    ┌────────▼─────────────────────────────▼───┐
-    │           Tools & Protocols               │
-    │  search / file / edit / ppt / vision      │
-    │  purpose.md / schema.md (协议层)          │
-    └────────────────────┬──────────────────────┘
-                         │
-              ┌──────────▼──────────┐
-              │    Data 层           │
-              │  raw/  (只读来源)    │
-              │  wiki/ (编译输出)    │
-              └──────────┬──────────┘
-                         │
-              ┌──────────▼──────────┐
-              │   Storage 层         │
-              │  SQLite 会话记忆     │
-              │  LanceDB 向量检索    │
-              └─────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        app.py (FastAPI)                           │
+│          JWT Auth · IntentRouter · SSE Streaming                  │
+└────────────┬───────────────────────────────────────┬──────────────┘
+             │                                       │
+    ┌────────▼────────┐                   ┌──────────▼──────────┐
+    │   core/ 基座层    │                   │   Workflows 层       │
+    │  auth.py (JWT)   │                   │  ingest_flow        │
+    │  path_resolver   │                   │  lint_flow          │
+    │  model_router    │                   │  query_flow         │
+    │  task_log        │                   │  autofill_flow      │
+    │  llm_factory     │                   │  report_flow        │
+    └────────┬────────┘                   └──────────┬──────────┘
+             │                                       │
+    ┌────────▼────────┐                   ┌──────────▼──────────┐
+    │   Agents 层      │                   │  Tools & Protocols  │
+    │  web_researcher │◀──────CoT────────▶│  edit / search /    │
+    │  local_wiki     │                   │  file / document    │
+    │  wiki_analyst   │                   │  ppt / vision       │
+    │  wiki_writer    │                   │                     │
+    │  wiki_editor    │                   │  purpose.md         │
+    │  wiki_query     │                   │  schema.md          │
+    └────────┬────────┘                   └──────────┬──────────┘
+             │                                       │
+    ┌────────▼───────────────────────────────────────▼───┐
+    │                    Data 层 (用户隔离)                │
+    │  data/wiki/{user_id}/{workspace}/concepts/*.md     │
+    │  data/raw/{user_id}/                               │
+    │  data/memory.db (SQLite 会话记忆)                   │
+    └────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -104,14 +102,18 @@ LanceDB      → 语义兜底，仅在 index.md 超载时启用
 
 ```
 agno-llm-wiki-demo/
-├── .env                    # API Key 配置
-├── requirements.txt        # 依赖
-├── app.py                  # FastAPI + AgentOS 入口
+├── .env                    # API Key + 白名单 + 配置
+├── .env.example            # 配置模板
+├── requirements.txt        # 依赖（17 个包）
+├── app.py                  # FastAPI 入口（JWT + SSE + 全部 API 端点）
 │
 ├── core/                   # 核心基座层
+│   ├── auth.py             # JWT 认证、注册、白名单、角色管理
 │   ├── config.py           # pydantic Settings 全局配置
-│   ├── llm_factory.py      # 模型工厂：Qwen-Max / Qwen-VL
-│   └── memory_manager.py   # SQLite 会话记忆 + LanceDB 向量存储
+│   ├── llm_factory.py      # 模型工厂：OpenAILike + Qwen
+│   ├── model_router.py     # 多供应商 LLM 路由（BYOK）
+│   ├── path_resolver.py    # 统一路径解析（用户隔离）
+│   └── task_log.py         # 任务日志（环形缓冲 + SSE 推送）
 │
 ├── protocols/              # 维基协议层
 │   ├── purpose.md          # 知识库使命边界、核心论点
@@ -120,71 +122,47 @@ agno-llm-wiki-demo/
 ├── tools/                  # 技能工具箱
 │   ├── search_tools.py     # DuckDuckGo + Newspaper4k
 │   ├── file_tools.py       # 读写隔离，路径锁在 data/wiki/
-│   ├── edit_tools.py       # str_replace + create_page + append_to_log
+│   ├── edit_tools.py       # str_replace + create_page + threading.local() 上下文
+│   ├── document_parser.py  # PDF 解析（pdfplumber）+ 文本分块
 │   ├── ppt_tools.py        # python-pptx 封装（扩展中）
 │   └── vision_tools.py     # 图片/OCR（扩展中）
 │
-├── prompts/                # 提示词工程库
-│   ├── boss_prompt.py      # 主管路由：Research / Wiki / PPT
-│   ├── research_prompt.py  # 深度研究协议
-│   └── ppt_prompt.py       # PPT排版指令
-│
 ├── agents/                 # 原子智能体
 │   ├── web_researcher.py   # 联网搜索
-│   ├── local_wiki.py       # 本地知识库（LanceDB）
+│   ├── local_wiki.py       # 本地知识库查询
 │   ├── wiki_analyst.py     # 只读分析，输出 AnalysisReport
 │   ├── wiki_writer.py      # 只写执行：create/edit/append_link
 │   ├── wiki_editor.py      # 比对新旧知识，生成 EditorReport
+│   ├── wiki_query.py       # 查询路由决策（WikiRouter）
 │   ├── ppt_maker.py        # PPT生成（扩展中）
 │   └── vision_analyst.py   # 视觉分析（扩展中）
 │
 ├── workflows/              # 确定性工作流
-│   ├── ingest_flow.py      # 摄入流水线：Map-Reduce 三阶段并发
-│   ├── lint_flow.py        # 审查流水线：死链检测 + 反向链接织网
-│   ├── query_flow.py       # 查询路由：Team[local_wiki+web_researcher]→汇总
-│   └── autofill_flow.py    # 幽灵节点填补：探测真空节点并自动合成
+│   ├── ingest_flow.py      # 摄入：Map-Reduce 三阶段并发
+│   ├── lint_flow.py        # 审查：死链检测 + 反向链接织网
+│   ├── query_flow.py       # 查询：Team[local_wiki+web_researcher]→汇总
+│   ├── autofill_flow.py    # 幽灵节点填补：探测真空节点并自动合成
+│   └── report_flow.py      # 报告生成：TopicScanner→BulkRetriever→ReportSynthesizer
 │
-├── data/                   # 数据层（读写分离）
-│   ├── raw/               # 只读来源层
-│   └── wiki/              # 维基编译层（LLM全权写入）
-│       ├── concepts/      # 概念页面
-│       ├── entities/      # 实体页面
-│       ├── index.md       # 全局导航地图
-│       └── log.md         # Append-only审计日志
+├── data/                   # 数据层（读写分离 + 用户隔离）
+│   ├── raw/{user_id}/     # 只读来源层（按用户隔离）
+│   ├── wiki/{user_id}/    # 维基编译层（按用户隔离）
+│   │   └── {workspace}/   # 沙箱
+│   │       ├── concepts/  # 概念页面
+│   │       └── index.md   # 导航地图
+│   └── memory.db          # SQLite 会话记忆
 │
 ├── web/                   # Web 前端（React + Vite + Tailwind）
-│   ├── src/               # 源码
-│   │   ├── components/    # UI 组件（侧栏 / 探求 / 织网 / 力导向图）
+│   ├── src/
+│   │   ├── components/    # UI 组件（15 个）
+│   │   ├── contexts/      # React Context（AuthContext）
 │   │   ├── data/          # Mock 数据
-│   │   └── store/         # 状态管理
-│   ├── index.html
-│   ├── package.json
-│   ├── tailwind.config.js
-│   └── vite.config.js
+│   │   └── App.jsx        # 路由入口
+│   └── dist/              # 生产构建产物（由 app.py 静态服务）
 │
 └── storage/                # 记忆持久化（.gitignore）
-    ├── sqlite/            # 会话记忆
-    └── lancedb/           # 向量索引
-```
-
----
-
-## 入口文件
-
-```python
-from agno.os import AgentOS
-from agents.local_wiki import get_local_wiki
-from workflows.query_flow import get_query_workflow
-
-wiki_expert = get_local_wiki()
-router_workflow = get_query_workflow()
-
-agent_os = AgentOS(
-    agents=[],
-    workflows=[router_workflow],
-    db=SqliteDb(db_file="tmp/agent_os.db"),
-    tracing=True
-)
+    ├── sqlite/
+    └── lancedb/
 ```
 
 ---
@@ -194,41 +172,66 @@ agent_os = AgentOS(
 ### 后端启动
 
 ```bash
-# 1. 安装 Python 依赖
+# 1. 安装 Python 依赖（需要 Python 3.11+）
 pip install -r requirements.txt
 
-# 2. 配置 API Key（编辑 .env）
-QWEN_API_KEY=sk-xxxxxxxxxxxxxxxx
+# 2. 配置环境变量（复制模板并编辑）
+cp .env.example .env
+# 编辑 .env：填入 QWEN_API_KEY、ALLOWED_USERS 等
 
-# 3. 上传原始资料
-# 将 PDF / 图片 / 文档放入 data/raw/
-
-# 4. 启动后端服务
+# 3. 启动后端服务（生产模式，自带静态文件服务）
 python app.py
-# 后端默认监听 http://localhost:8000
+# 后端监听 http://localhost:8888
 ```
 
-### 前端启动（另开终端）
+### 前端开发（可选，生产环境直接用后端静态服务）
 
 ```bash
-# 进入前端目录
 cd web
-
-# 安装前端依赖
 npm install
-
-# 启动开发服务器
-npm run dev
-# 前端自动打开 http://localhost:3000
+npm run dev      # 开发服务器 → http://localhost:5173（自动代理到 8888）
+npm run build    # 构建生产包到 web/dist/
 ```
 
-### 联调说明
+### 访问
 
-- 前端部分使用 Mock 数据，可独立运行预览 UI
-- 对接后端时，在对应组件中将 `setTimeout` 假请求替换为 `fetch` 调用
-- 后端 FastAPI 已配置 CORS，前端 `localhost:3000` 可直接访问
+- **生产模式**：直接访问 `http://localhost:8888`（后端服务前端静态文件 + SPA 回退）
+- **开发模式**：访问 `http://localhost:5173`（Vite 热更新 + 代理 API 到 8888）
 
-> ⚠️ **暂不提供 Docker 部署方案**，Dockerfile 仍在调试中。
+---
+
+## API 端点一览
+
+| 分类 | 端点 | 方法 | 说明 |
+|------|------|------|------|
+| **认证** | `/api/auth/register` | POST | 注册（白名单控制） |
+| | `/api/auth/login` | POST | 登录，返回 JWT Token |
+| | `/api/auth/me` | GET | 当前用户信息 |
+| **会话** | `/api/sessions` | GET | 会话列表 |
+| | `/api/sessions/create` | POST | 创建会话 |
+| | `/api/sessions/{id}` | DELETE | 删除会话 |
+| | `/api/sessions/{id}/messages` | GET | 读取会话历史消息 |
+| **知识库** | `/api/workspaces` | GET | 沙箱列表 |
+| | `/api/workspaces/create` | POST | 创建沙箱 |
+| | `/api/upload` | POST | 上传文件并触发摄入 |
+| | `/api/graph` | GET | 力导向图数据 |
+| | `/api/concept` | GET | 读取概念 Markdown 内容 |
+| | `/api/inbox` | GET | 隔离审批区 |
+| | `/api/inbox/approve` | POST | 批准草稿 |
+| | `/api/inbox/reject` | POST | 拒绝草稿 |
+| | `/api/radar` | GET | 需求雷达 |
+| **对话** | `/api/chat` | POST | SSE 流式对话（意图路由） |
+| | `/api/forge` | POST | 触发 lint/autofill |
+| | `/api/report` | POST | 批量报告生成 |
+| **设置** | `/api/settings/providers` | GET | 可用 LLM 供应商列表 |
+| | `/api/settings/api-key` | POST | 保存用户 API Key |
+| **管理** | `/api/admin/users` | GET | 用户列表（管理员） |
+| | `/api/admin/sessions` | GET | 全局会话（管理员） |
+| | `/api/admin/logs` | GET | 系统日志 SSE（管理员） |
+| | `/api/admin/server-status` | GET | 服务器状态 |
+| | `/api/admin/task-logs` | GET | 任务日志列表 |
+| | `/api/admin/task-logs/{user}/{ws}` | GET/DELETE | 任务日志详情 |
+| | `/api/admin/task-logs/{user}/{ws}/stream` | GET | 任务日志 SSE 流 |
 
 ---
 
@@ -240,18 +243,22 @@ npm run dev
 
 | 依赖 | 用途 |
 |---|---|
-| `agno>=1.0` | 多智能体编排框架 |
-| `openai` | LLM API 客户端 |
-| `python-dotenv` | 环境变量管理 |
-| `duckduckgo-search` | 联网搜索 |
-| `newspaper4k` | 网页正文提取 |
-| `lancedb` | 向量数据库（长尾兜底） |
-| `sqlalchemy` | ORM / SQLite 持久化 |
+| `agno==2.5.17` | 多智能体编排框架 |
 | `fastapi` | Web 框架 |
 | `uvicorn` | ASGI 服务器 |
+| `pydantic` / `pydantic-settings` | 数据验证 + 配置管理 |
+| `PyJWT` | JWT Token 签发与验证 |
+| `bcrypt` | 密码哈希 |
+| `SQLAlchemy` | ORM / SQLite |
+| `openai` | LLM API 客户端（OpenAILike 兼容） |
+| `httpx` | HTTP 客户端 |
+| `python-dotenv` | 环境变量管理 |
+| `python-multipart` | 文件上传 |
 | `pdfplumber` | PDF 解析 |
-| `python-pptx` | PPT 生成（扩展中） |
-| `pillow` | 图像处理（扩展中） |
+| `python-docx` | Word 文档解析 |
+| `jinja2` | 模板引擎 |
+| `requests` | HTTP 工具 |
+| `starlette` / `anyio` | ASGI 基础 |
 
 ---
 
@@ -261,20 +268,26 @@ npm run dev
 
 - [x] 项目目录结构与基础框架
 - [x] Protocols 协议层（purpose.md / schema.md）
-- [x] Tools 工具箱（search / file / edit）
-- [x] Prompts 提示词库（boss / research / wiki / ppt）
-- [x] 核心 Agents（web_researcher / local_wiki / wiki_analyst / wiki_writer / wiki_editor）
-- [x] Workflows（ingest_flow / lint_flow / query_flow）
+- [x] Tools 工具箱（search / file / edit / document_parser）
+- [x] 核心 Agents（web_researcher / local_wiki / wiki_analyst / wiki_writer / wiki_editor / wiki_query）
+- [x] Workflows（ingest / lint / query / autofill / report）
 - [x] 读写分离数据拓扑 + index.md 全局导航
-- [x] LanceDB 向量兜底检索
 - [x] 两步思维链（分析师→主编→撰稿人三级流水线）
 - [x] Map-Reduce 并发摄入引擎（12线程 + 同义词聚类 + 逐概念融合）
-- [x] 幽灵节点自动填补（autofill_flow 双向链接扫描 + 真空合成）
+- [x] 幽灵节点自动填补（autofill_flow）
+- [x] **JWT 认证系统**（注册白名单、角色管理、Token 鉴权）
+- [x] **用户级物理隔离**（`data/wiki/{user_id}/{workspace}/`）
+- [x] **多轮会话记忆**（Agno SqliteDb + 会话历史 API）
+- [x] **LLM 意图路由器**（IntentRouter Agent 替代正则启发式）
+- [x] **并发安全**（threading.local() 替代 os.environ）
+- [x] **Web 前端 SPA**（React + Tailwind + 力导向图 + KaTeX 数学渲染）
+- [x] **管理员控制台**（用户管理、会话监控、任务日志 SSE、系统日志）
+- [x] **批量报告生成**（report_flow：TopicScanner→BulkRetriever→ReportSynthesizer）
+- [x] **BYOK 模型选择**（用户自带 API Key + 多供应商路由）
 
 ### 🔧 扩展中
 
-- [ ] app.py 完整接入 Wiki Agents 和 Workflows
-- [ ] PPT 生成管线（ppt_tools / ppt_maker / ppt_prompt）
+- [ ] PPT 生成管线（ppt_tools / ppt_maker）
 - [ ] 视觉分析管线（vision_tools / vision_analyst）
 
 ### 📌 规划中
@@ -282,10 +295,8 @@ npm run dev
 - [ ] `index.md` 超载自动拆分（>500 行阈值）
 - [ ] 增量摄入：同一来源二次更新（diff + merge）
 - [ ] 冲突解决：多来源引用同一概念的合并策略
-- [ ] 上下文智能剪枝：按标题分块 + 语义匹配，减少主编输入负载
 - [ ] `lint_flow.py` LLM 自动修复死链（当前仅报告）
-- [x] Web 前端 SPA：探求模式对话 + 织网模式力导向图 + 审批/雷达/熔炉控制台
+- [ ] XSS 防护（DOMPurify）+ CORS 白名单 + 上传文件校验
+- [ ] 速率限制 + 数据导出
 
 ---
-
-
