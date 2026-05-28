@@ -207,17 +207,26 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> dict:
     """
     FastAPI 依赖：从 Authorization header 提取当前用户。
+    支持 ?token= query 参数作为 fallback（用于 SSE/EventSource）。
     返回 {"user_id": str, "username": str}
     """
-    if not credentials:
+    token = None
+    if credentials:
+        token = credentials.credentials
+    else:
+        # Fallback: 从 query 参数获取 token（SSE/EventSource 不支持自定义 header）
+        token = request.query_params.get("token")
+
+    if not token:
         raise HTTPException(status_code=401, detail="未提供认证令牌")
 
     try:
-        payload = decode_token(credentials.credentials)
+        payload = decode_token(token)
         return {
             "user_id": payload["sub"],
             "username": payload.get("username", payload["sub"]),
@@ -230,10 +239,11 @@ async def get_current_user(
 
 
 async def get_admin_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> dict:
     """FastAPI 依赖：必须是 admin 角色"""
-    user = await get_current_user(credentials)
+    user = await get_current_user(request, credentials)
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可访问")
     return user

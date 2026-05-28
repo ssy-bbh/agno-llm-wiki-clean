@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -475,6 +475,79 @@ async def admin_list_all_sessions(
         return sessions
     finally:
         conn.close()
+
+
+@app.get("/api/admin/logs")
+async def admin_stream_logs(request: Request, admin=Depends(get_admin_user)):
+    """管理员实时日志流 (SSE) — 推送 systemd journal"""
+    import subprocess
+
+    async def log_stream():
+        # 先发送最近 200 行历史日志
+        try:
+            result = subprocess.run(
+                ["journalctl", "-u", "llm-wiki", "-n", "200", "--no-pager", "-o", "short-iso"],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in result.stdout.splitlines():
+                yield f"data: {json.dumps({'type': 'log', 'content': line})}\n\n"
+        except Exception as e:
+            # 非 systemd 环境（本地开发），读取 uvicorn 日志文件或提示
+            yield f"data: {json.dumps({'type': 'log', 'content': f'⚠️ 无法读取 journalctl: {e}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'log', 'content': '提示: journalctl 仅在 systemd 管理的服务器上可用'})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'log', 'content': '── 历史日志结束，以下为实时推送 ──'})}\n\n"
+
+        # 实时跟踪新日志
+        try:
+            proc = subprocess.Popen(
+                ["journalctl", "-u", "llm-wiki", "-f", "--no-pager", "-o", "short-iso"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            import asyncio
+            while True:
+                line = await asyncio.get_event_loop().run_in_executor(
+                    None, proc.stdout.readline
+                )
+                if not line:
+                    break
+                line = line.rstrip('\n')
+                if line:
+                    yield f"data: {json.dumps({'type': 'log', 'content': line})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'log', 'content': f'⚠️ 日志流断开: {e}'})}\n\n"
+
+    return StreamingResponse(log_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/admin/server-status")
+async def admin_server_status(admin=Depends(get_admin_user)):
+    """服务器运行状态概览"""
+    import subprocess
+    info = {}
+    try:
+        r = subprocess.run(["systemctl", "is-active", "llm-wiki"], capture_output=True, text=True, timeout=5)
+        info["service"] = r.stdout.strip()
+    except Exception:
+        info["service"] = "unknown"
+    try:
+        r = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
+        info["uptime"] = r.stdout.strip()
+    except Exception:
+        info["uptime"] = "unknown"
+    try:
+        r = subprocess.run(["df", "-h", "/mnt/vdb"], capture_output=True, text=True, timeout=5)
+        lines = r.stdout.strip().splitlines()
+        info["disk"] = lines[-1] if len(lines) > 1 else "unknown"
+    except Exception:
+        info["disk"] = "unknown"
+    try:
+        r = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5)
+        lines = r.stdout.strip().splitlines()
+        info["memory"] = lines[1] if len(lines) > 1 else "unknown"
+    except Exception:
+        info["memory"] = "unknown"
+    return info
 
 
 @app.get("/api/admin/sessions/{session_id}/messages")
