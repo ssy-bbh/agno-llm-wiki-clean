@@ -484,6 +484,8 @@ async def admin_stream_logs(request: Request, admin=Depends(get_admin_user)):
     import subprocess
 
     async def log_stream():
+        import asyncio
+        proc = None
         # 先发送最近 200 行历史日志
         try:
             result = subprocess.run(
@@ -493,7 +495,6 @@ async def admin_stream_logs(request: Request, admin=Depends(get_admin_user)):
             for line in result.stdout.splitlines():
                 yield f"data: {json.dumps({'type': 'log', 'content': line})}\n\n"
         except Exception as e:
-            # 非 systemd 环境（本地开发），读取 uvicorn 日志文件或提示
             yield f"data: {json.dumps({'type': 'log', 'content': f'⚠️ 无法读取 journalctl: {e}'})}\n\n"
             yield f"data: {json.dumps({'type': 'log', 'content': '提示: journalctl 仅在 systemd 管理的服务器上可用'})}\n\n"
 
@@ -505,7 +506,6 @@ async def admin_stream_logs(request: Request, admin=Depends(get_admin_user)):
                 ["journalctl", "-u", "llm-wiki", "-f", "--no-pager", "-o", "short-iso"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
-            import asyncio
             while True:
                 line = await asyncio.get_event_loop().run_in_executor(
                     None, proc.stdout.readline
@@ -515,8 +515,17 @@ async def admin_stream_logs(request: Request, admin=Depends(get_admin_user)):
                 line = line.rstrip('\n')
                 if line:
                     yield f"data: {json.dumps({'type': 'log', 'content': line})}\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
         except Exception as e:
             yield f"data: {json.dumps({'type': 'log', 'content': f'⚠️ 日志流断开: {e}'})}\n\n"
+        finally:
+            if proc:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
 
     return StreamingResponse(log_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -573,6 +582,7 @@ async def admin_stream_task_logs(user_id: str, workspace: str, request: Request,
     import asyncio
 
     async def stream():
+        import asyncio
         last_ts = 0
         # 先发送历史日志
         history = task_log.get_logs(user_id=user_id, workspace=workspace, limit=200)
@@ -581,17 +591,18 @@ async def admin_stream_task_logs(user_id: str, workspace: str, request: Request,
             last_ts = max(last_ts, entry.get("timestamp", 0))
         yield f"data: {json.dumps({'time': '', 'message': '── 历史日志结束，以下为实时推送 ──', 'level': 'info'})}\n\n"
 
-        # 实时轮询新日志
-        while True:
-            if await request.is_disconnected():
-                break
-            new_logs = task_log.get_logs(user_id=user_id, workspace=workspace, limit=50, since=last_ts)
-            for entry in new_logs:
-                ts = entry.get("timestamp", 0)
-                if ts > last_ts:
-                    yield f"data: {json.dumps(entry)}\n\n"
-                    last_ts = ts
-            await asyncio.sleep(0.5)
+        # 实时轮询新日志 — 用 try/except 检测断开（is_disconnected 在 uvicorn 下不可靠）
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                new_logs = task_log.get_logs(user_id=user_id, workspace=workspace, limit=50, since=last_ts)
+                for entry in new_logs:
+                    ts = entry.get("timestamp", 0)
+                    if ts > last_ts:
+                        yield f"data: {json.dumps(entry)}\n\n"
+                        last_ts = ts
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

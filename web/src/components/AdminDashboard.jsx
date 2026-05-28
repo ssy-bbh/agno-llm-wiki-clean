@@ -166,7 +166,7 @@ function TasksTab({ apiFetch, users }) {
     stopStream()
     setLogs([])
     setIsStreaming(true)
-    const token = localStorage.getItem('token')
+    const token = sessionStorage.getItem('wiki_token')
     const url = `/api/admin/task-logs/${encodeURIComponent(userId)}/${encodeURIComponent(workspace)}/stream?token=${encodeURIComponent(token)}`
     const es = new EventSource(url)
     esRef.current = es
@@ -353,7 +353,7 @@ function ConsoleTab({ apiFetch }) {
   const startStream = () => {
     if (esRef.current) return
     setIsStreaming(true)
-    const token = localStorage.getItem('token')
+    const token = sessionStorage.getItem('wiki_token')
     const es = new EventSource(`/api/admin/logs?token=${encodeURIComponent(token)}`)
     esRef.current = es
     es.onmessage = (e) => {
