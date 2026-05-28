@@ -1164,6 +1164,40 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
 
 
 # ==========================================
+# 📖 概念详情 (Concept Detail)
+# ==========================================
+@app.get("/api/concept")
+async def get_concept(workspace: str, name: str, user=Depends(get_current_user)):
+    """读取指定概念的 Markdown 文件内容"""
+    user_id = user["user_id"]
+    if not workspace or not name:
+        raise HTTPException(status_code=400, detail="缺少 workspace 或 name 参数")
+
+    base_dir = get_wiki_root(user_id) / workspace
+    concepts_dir = base_dir / "concepts"
+
+    # 先精确匹配 concepts/{name}.md，再 rglob 递归搜索
+    candidates = []
+    exact = concepts_dir / f"{name}.md"
+    if exact.exists():
+        candidates.append(exact)
+    else:
+        # rglob 在子目录中查找
+        for fp in concepts_dir.rglob(f"{name}.md"):
+            candidates.append(fp)
+            break
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail=f"概念 [{name}] 不存在于沙箱 [{workspace}]")
+
+    try:
+        content = candidates[0].read_text(encoding="utf-8")
+        return {"content": content, "name": name, "path": str(candidates[0].relative_to(base_dir))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
 # 📥 6. 隔离审批区 (Inbox)
 # ==========================================
 DRAFT_TAG = "<" + "!-- AUTOFILL_DRAFT --" + ">"
