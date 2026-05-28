@@ -130,7 +130,7 @@ class LintFlow:
             sys.exit(1)
         sandboxes = [d for d in wiki_root.iterdir() if d.is_dir()]
         if not sandboxes:
-            print(f"❌ 在 {WIKI_ROOT} 下没有找到任何知识库沙箱。")
+            print(f"❌ 在 {wiki_root} 下没有找到任何知识库沙箱。")
             sys.exit(1)
 
         print("\n" + "=" * 60)
