@@ -9,7 +9,7 @@ from agents.wiki_analyst import WikiAnalyst
 from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
-from tools.edit_tools import _resolve
+from tools.edit_tools import _resolve, set_context
 
 
 class IngestFlow:
@@ -80,12 +80,22 @@ class IngestFlow:
         except Exception as e:
             return chunk_id, chunk, None, f"报错: {str(e)}"
 
-    def run(self, input_source: str):
-        print("\n" + "=" * 60)
-        print("🚀 [IngestFlow] 启动终极 Map-Reduce 知识摄入引擎...")
+    def run(self, input_source: str, kb_name: str = "", user_id: str = ""):
+        """
+        知识摄入入口。
+        kb_name: 目标沙箱名称（通过参数传递，避免 os.environ 竞态）
+        user_id: 用户 ID（用于路径隔离）
+        """
+        # 在调用任何 _resolve 前，设置线程安全上下文
+        set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
 
+        print("\n" + "=" * 60)
+        print(f"🚀 [IngestFlow] 启动 Map-Reduce 引擎 | 沙箱: {kb_name} | 用户: {user_id}")
+
+        # 设置文档名到上下文
         path = Path(input_source)
         if path.exists() and path.is_file():
+            set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=path.stem)
             print(f"📄 目标语料：{path.name}")
             raw_text = extract_text(str(path))
             chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
@@ -250,25 +260,22 @@ if __name__ == "__main__":
 
         # 锁定沙箱名
         kb_name = input_target.stem
-        os.environ["ACTIVE_KB"] = kb_name
+        set_context(kb_name=kb_name)
         print(f"📁 知识流向: 锁定专属沙箱 -> [data/wiki/{kb_name}/]")
 
         for idx, file_path in enumerate(files, 1):
-            os.environ["ACTIVE_SUBDIR"] = ""
-            os.environ["ACTIVE_DOC_NAME"] = file_path.stem
+            set_context(kb_name=kb_name, doc_name=file_path.stem)
 
             print("\n" + "-" * 50)
             print(f"🚀 [批量进度 {idx}/{len(files)}] 正在解析: {file_path.name}")
-            flow.run(str(file_path))
+            flow.run(str(file_path), kb_name=kb_name)
 
         print(f"\n✅✅ 沙箱 [{kb_name}] 的批量提炼任务已全部完成！")
 
     # 如果选择了单个文件，则自动以文件名开辟新沙箱
     elif input_target.is_file():
         kb_name = input_target.stem
-        os.environ["ACTIVE_KB"] = kb_name
-        os.environ["ACTIVE_SUBDIR"] = ""
-        os.environ["ACTIVE_DOC_NAME"] = input_target.stem
+        set_context(kb_name=kb_name, doc_name=input_target.stem)
 
         print(f"\n📁 知识流向: 为该文件单独开辟沙箱 -> [data/wiki/{kb_name}/]")
-        flow.run(str(input_target))
+        flow.run(str(input_target), kb_name=kb_name)

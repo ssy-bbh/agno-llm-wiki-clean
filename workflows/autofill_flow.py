@@ -10,7 +10,8 @@ from collections import Counter
 
 from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
-from tools.edit_tools import _resolve
+from tools.edit_tools import _resolve, set_context
+from core.path_resolver import get_wiki_root
 
 
 class AutoFillFlow:
@@ -25,7 +26,7 @@ class AutoFillFlow:
         if not text: return ""
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
-    async def stream_run(self, kb_name: str):
+    async def stream_run(self, kb_name: str, user_id: str = ""):
         """
         🚀 Web 端专用的真空节点流式实例化引擎
         """
@@ -35,11 +36,10 @@ class AutoFillFlow:
         yield format_log(f"🕳️ [AutoFill Flow] 启动知识黑洞探测器 | 🎯 锁定目标沙箱: {kb_name}")
         await asyncio.sleep(0.01)
 
-        # 💡 强制切置底层环境变量，确保 _resolve 工具寻路绝不窜台
-        os.environ["ACTIVE_KB"] = kb_name
-        os.environ["ACTIVE_SUBDIR"] = ""
+        # 设置线程安全上下文（替代 os.environ，解决并发竞态）
+        set_context(user_id=user_id, kb_name=kb_name, sub_dir="")
 
-        concepts_dir = Path(__file__).resolve().parent.parent / "data" / "wiki" / kb_name / "concepts"
+        concepts_dir = get_wiki_root(user_id) / kb_name / "concepts"
         if not concepts_dir.exists():
             yield format_log("❌ 错误：concepts 核心概念仓不存在，图谱为空，无法探测。")
             return

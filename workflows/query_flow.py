@@ -1,5 +1,5 @@
 """
-workflows/query_flow.py — 终极查询流水线 (支持用户级工作区选择与历史上下文合流)
+workflows/query_flow.py — 查询流水线 (v0.2 用户级隔离版)
 """
 import sys
 import re
@@ -14,19 +14,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.search_tools import search_web_text, search_multimodal_image
 from agents.wiki_query import WikiRouter, WikiResponder
+from core.path_resolver import get_wiki_root, list_workspaces
+
 
 class QueryFlow:
-    def __init__(self):
-        # ✅ 完美保留并初始化你真实的智能体组件
+    def __init__(self, user_id: str = ""):
+        self.user_id = user_id
         self.router = WikiRouter()
         self.responder = WikiResponder()
-        self.wiki_root = PROJECT_ROOT / "data" / "wiki"
+        self.wiki_root = get_wiki_root(user_id)
 
     def _get_workspace_list(self) -> list:
-        """提供给前端的 API：获取当前所有合法的工作区名称"""
-        if not self.wiki_root.exists():
-            return []
-        return [d.name for d in self.wiki_root.iterdir() if d.is_dir()]
+        return list_workspaces(self.user_id)
 
     def _read_specific_map(self, workspace_name: str) -> str:
         map_path = self.wiki_root / workspace_name / "index.md"
@@ -35,7 +34,7 @@ class QueryFlow:
         return "该工作区暂无导航地图。"
 
     def _read_local_concepts(self, workspace_name: str, concepts: list) -> str:
-        """物理动作：在选定的工作区内提取特定概念（双向拆解 + 别名雷达网 + difflib 容错）"""
+        """在选定的工作区内提取特定概念（双向拆解 + 别名雷达网 + difflib 容错）"""
         context = ""
         concepts_dir = self.wiki_root / workspace_name / "concepts"
 
@@ -44,309 +43,280 @@ class QueryFlow:
 
         all_md_files = list(concepts_dir.glob("*.md"))
 
-        # ==========================================
-        # 💡 核心算法保留：建立【多重别名雷达图】
-        # ==========================================
+        # 建立多重别名雷达图
         alias_map = {}
         for f in all_md_files:
             stem = f.stem.lower()
-            alias_map[stem] = f  # 1. 注册完整原名
-
-            # 2. 对物理文件名也进行中英文括号拆解，注册分身代号
+            alias_map[stem] = f
             file_parts = [p.strip() for p in re.split(r'[(（)）]', stem) if p.strip()]
             for p in file_parts:
-                if p not in alias_map:  # 优先保留最原始的映射，防冲突
+                if p not in alias_map:
                     alias_map[p] = f
 
         available_aliases = list(alias_map.keys())
 
         for concept in concepts:
-            # 基础脱壳
             clean_concept = concept.replace("[", "").replace("]", "").strip()
             safe_name = clean_concept.replace("/", "_").replace("\\", "_")
             lower_name = safe_name.lower()
 
-            # 🛡️ 防线 1：直接命中全名 或 物理文件的拆解代号
+            # 防线 1：直接命中
             if lower_name in alias_map:
                 match_file = alias_map[lower_name]
                 context += f"【🚨本地知识 == {match_file.name} ==】\n{match_file.read_text(encoding='utf-8')}\n\n"
-                print(f"  -> 📂 [装载弹药] 成功提取物理笔记: {match_file.name}")
+                print(f"  -> 📂 提取: {match_file.name}")
                 continue
 
-            print(f"  ⚠️ [调度室] 精确/别名匹配失效 [{safe_name}]，启动算法降级嗅探...")
-
-            # 🛡️ 防线 2：反向拆解（LLM吐出长词，物理文件是短词）
+            # 防线 2：反向拆解
             parts = [p.strip() for p in re.split(r'[(（)）]', lower_name) if p.strip()]
-            found_by_parts = False
+            found = False
             for part in parts:
                 if part in alias_map:
                     part_file = alias_map[part]
-                    context += f"【🚨本地拆解挂载 == {part_file.name} ==】\n{part_file.read_text(encoding='utf-8')}\n\n"
-                    print(f"  -> 🔍 [反向拆解] 成功通过别名 [{part}] 命中物理笔记: {part_file.name}")
-                    found_by_parts = True
+                    context += f"【🚨本地拆解 == {part_file.name} ==】\n{part_file.read_text(encoding='utf-8')}\n\n"
+                    print(f"  -> 🔍 反向拆解命中: {part_file.name}")
+                    found = True
                     break
-
-            if found_by_parts:
+            if found:
                 continue
 
-            # 🛡️ 防线 3：高相似度容错 (依然保持 0.85 的严格阈值)
-            close_matches = difflib.get_close_matches(lower_name, available_aliases, n=1, cutoff=0.85)
-            if close_matches:
-                match_stem = close_matches[0]
-                match_file = alias_map[match_stem]
-                context += f"【🚨本地相似挂载 == {match_file.name} ==】\n{match_file.read_text(encoding='utf-8')}\n\n"
-                print(f"  -> 🧲 [相似纠错] 成功通过高相似度 ({lower_name} -> {match_stem}) 命中笔记: {match_file.name}")
+            # 防线 3：相似度容错
+            close = difflib.get_close_matches(lower_name, available_aliases, n=1, cutoff=0.85)
+            if close:
+                match_file = alias_map[close[0]]
+                context += f"【🚨本地相似 == {match_file.name} ==】\n{match_file.read_text(encoding='utf-8')}\n\n"
+                print(f"  -> 🧲 相似纠错: {match_file.name}")
             else:
-                print(f"  ❌ [调度室] 彻底未找到相关笔记: [{safe_name}]")
+                print(f"  ❌ 未找到: [{safe_name}]")
 
         return context
 
     def _fuzzy_find_local_files(self, workspace_name: str, fuzzy_keywords: list) -> str:
-        """物理动作：根据 AI 的猜测，在工作区内进行地毯式模糊搜索"""
         if not fuzzy_keywords:
             return ""
-
         workspace_dir = self.wiki_root / workspace_name
         if not workspace_dir.exists():
             return ""
 
         context = ""
-        found_files = set()
+        found = set()
+        all_md = list(workspace_dir.rglob("*.md"))
 
-        all_md_files = list(workspace_dir.rglob("*.md"))
-
-        for keyword in fuzzy_keywords:
-            if not keyword.strip():
+        for kw in fuzzy_keywords:
+            if not kw.strip():
                 continue
-
-            keyword_lower = keyword.lower()
-            for file_path in all_md_files:
-                if keyword_lower in file_path.stem.lower() and file_path not in found_files:
-                    found_files.add(file_path)
+            kw_lower = kw.lower()
+            for fp in all_md:
+                if kw_lower in fp.stem.lower() and fp not in found:
+                    found.add(fp)
                     try:
-                        context += f"【🚨本地模糊匹配命中 == {file_path.name} ==】\n{file_path.read_text(encoding='utf-8')}\n\n"
-                        print(f"  -> 🔍 [雷达嗅探] 模糊匹配成功：关键词 [{keyword}] 命中了物理笔记 [{file_path.name}]")
-                    except Exception as e:
+                        context += f"【🚨模糊命中 == {fp.name} ==】\n{fp.read_text(encoding='utf-8')}\n\n"
+                    except Exception:
                         pass
-
         return context
 
     def execute(self, user_question: str, target_workspace: str = ""):
-        """
-        🚀 极客控制台 (CLI) 核心调度入口（完美修复了之前断裂的结构）
-        """
-        print(f"\n👤 【用户提问】: {user_question}")
+        """CLI 入口"""
+        print(f"\n👤 {user_question}")
+        if not target_workspace:
+            print("⚠️ 未指定工作区")
+            return
+
+        index_map = self._read_specific_map(target_workspace)
+        try:
+            decision = self.router.route(user_question, index_map)
+        except Exception as e:
+            print(f"❌ 路由崩溃: {e}")
+            return
+
+        local_context = ""
+        lc = decision.get("local_concepts", [])
+        fk = decision.get("fuzzy_keywords", [])
+        if lc:
+            local_context += self._read_local_concepts(target_workspace, lc)
+        if fk:
+            local_context += self._fuzzy_find_local_files(target_workspace, fk)
+
+        web_context, image_context = "", ""
+        if decision.get("needs_web_search", True):
+            sq = decision.get("search_query", user_question)
+            web_context = search_web_text(sq)
+            images = search_multimodal_image(sq)
+            if images:
+                image_context = f"![{images[0].title}]({images[0].image_url})"
+
+        try:
+            for chunk in self.responder.answer(user_question, local_context, web_context, image_context):
+                text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                if text and text != "None":
+                    print(text, end="", flush=True)
+            print()
+        except Exception as e:
+            print(f"\n❌ {e}")
+
+    async def stream_execute(
+        self,
+        user_question: str,
+        target_workspace: str,
+        history: list = None,
+        user_id: str = "",
+        session_id: str = "",
+    ):
+        """Web 端流式生成器 (SSE)"""
+        if history is None:
+            history = []
+
+        # 如果传入了 user_id 且与实例不同，临时切换
+        if user_id and user_id != self.user_id:
+            self.user_id = user_id
+            self.wiki_root = get_wiki_root(user_id)
+
+        def log(msg):
+            print(f"  [{self.user_id}] {msg}")
+            return f"data: {json.dumps({'type': 'log', 'content': msg})}\n\n"
+
+        yield log(f"👤 收到提问: {user_question}")
+        await asyncio.sleep(0.01)
+        yield log(f"📁 工作区: [{target_workspace or '全局漫游'}]")
+        await asyncio.sleep(0.01)
+
+        local_concepts, fuzzy_keywords = [], []
+        needs_web, search_query = True, user_question
 
         if target_workspace:
-            print(f"📁 【锁定工作区】: 用户已明确指定为 -> [{target_workspace}]")
-        else:
-            print("⚠️ 【警告】: 用户未指定工作区，系统将无法挂载任何本地地图！")
-
-        local_concepts = []
-        fuzzy_keywords = []
-        needs_web = True
-        search_query = user_question
-
-        if target_workspace:
-            print("-" * 60)
-            print("🗺️ [调度室] 正在呼叫寻路者读取指定工作区的局部地图...")
+            yield log("🗺️ 读取局部地图...")
             index_map = self._read_specific_map(target_workspace)
+            index_preview = index_map[:200].replace("\n", " ") if index_map else "(空)"
+            yield log(f"   📋 地图摘要: {index_preview}...")
+            await asyncio.sleep(0.01)
+
             try:
                 decision = self.router.route(user_question, index_map)
-                print(f"  -> 🎯 寻路裁决: {decision}")
                 local_concepts = decision.get("local_concepts", [])
                 fuzzy_keywords = decision.get("fuzzy_keywords", [])
                 needs_web = decision.get("needs_web_search", True)
                 search_query = decision.get("search_query", user_question)
+
+                yield log(f"🎯 寻路裁决完毕")
+                yield log(f"   🧩 识别本地概念: {local_concepts or '(无)'}")
+                yield log(f"   🔤 模糊关键词: {fuzzy_keywords or '(无)'}")
+                yield log(f"   🌐 是否需要联网: {'是' if needs_web else '否'}")
+                yield log(f"   🔎 联网搜索词: [{search_query}]")
+                await asyncio.sleep(0.01)
+
+                # 打印路由原始决策到后端控制台
+                print(f"  [DEBUG] Router decision: {json.dumps(decision, ensure_ascii=False, indent=2)}")
             except Exception as e:
-                print(f"❌ 路由模块崩溃: {e}")
+                yield log(f"❌ 路由异常: {e}")
+                import traceback
+                traceback.print_exc()
 
-        print("\n" + "-" * 60)
-        print("🚚 [调度室] 正在按裁决清单装载弹药...")
-
+        yield log("🚚 装载本地弹药...")
         local_context = ""
         if target_workspace:
             if local_concepts:
                 local_context += self._read_local_concepts(target_workspace, local_concepts)
+                for c in local_concepts:
+                    # 检查是否真的命中了文件
+                    concepts_dir = self.wiki_root / target_workspace / "concepts"
+                    matched = False
+                    if concepts_dir.exists():
+                        for f in concepts_dir.glob("*.md"):
+                            if c.lower().replace(" ", "") in f.stem.lower().replace(" ", ""):
+                                matched = True
+                                yield log(f"   📂 精确命中: {f.name}")
+                                break
+                    if not matched:
+                        yield log(f"   ❌ 本地未找到: [{c}]")
+                yield log(f"   ✅ 精确装载完成: {len(local_concepts)} 个概念")
             if fuzzy_keywords:
+                pre_len = len(local_context)
                 local_context += self._fuzzy_find_local_files(target_workspace, fuzzy_keywords)
+                post_len = len(local_context)
+                hit_count = local_context[pre_len:].count("🚨模糊命中")
+                yield log(f"   🔍 模糊嗅探: {len(fuzzy_keywords)} 个关键词, 命中 {hit_count} 个文件")
+
+        if local_context:
+            yield log(f"   📦 本地弹药总量: {len(local_context)} 字符")
+        else:
+            yield log(f"   📭 本地弹药为空 (无相关概念)")
+        await asyncio.sleep(0.01)
 
         web_context, image_context = "", ""
+        images = None
         if needs_web and search_query:
-            print(f"  -> 🌐 [调度室] 授权触发外脑，检索词: [{search_query}]")
+            yield log(f"🌐 全网检索: [{search_query}]")
             web_context = search_web_text(search_query)
+            yield log(f"   📄 联网文本: {len(web_context)} 字符")
             images = search_multimodal_image(search_query)
             if images:
-                image_context = f"![{images[0].title}]({images[0].image_url})"
-                print("  -> 👁️ 成功挂载视觉辅助图床。")
+                img = images[0]
+                # 用来源网页 URL 而非 CDN 直链（防盗链）
+                ref_url = getattr(img, 'host_page_url', '') or img.image_url
+                image_context = f"{img.title}: {ref_url}"
+                yield log(f"   🖼️ 参考来源: {img.title}")
+            else:
+                yield log(f"   🖼️ 无相关图片")
 
-        print("\n" + "-" * 60)
-        print("🗣️ [调度室] 弹药装填完毕，Responder 开始解答：\n")
-        try:
-            response_stream = self.responder.answer(user_question, local_context, web_context, image_context)
-            for chunk in response_stream:
-                text = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                if text and text != "None":
-                    print(text, end="", flush=True)
-            print("\n")
-        except Exception as e:
-            print(f"\n❌ 答疑模块崩溃: {e}")
-
-    # ==========================================
-    # 🔗 核心新增：Web端专用的流式生成器 (完美嵌合上下文记忆)
-    # ==========================================
-    async def stream_execute(self, user_question: str, target_workspace: str, history: list = None):
-        """Web 端专用的流式生成器 (返回 SSE NDJSON)"""
-        if history is None:
-            history = []
-
-        def format_log(msg: str):
-            print(msg)
-            return f"data: {json.dumps({'type': 'log', 'content': msg})}\n\n"
-
-        yield format_log(f"👤 收到提问: {user_question}")
-        await asyncio.sleep(0.01)
-
-        yield format_log(f"📁 锁定工作区: [{target_workspace if target_workspace else '全局漫游'}]")
-        await asyncio.sleep(0.01)
-
-        local_concepts = []
-        fuzzy_keywords = []
-        needs_web = True
-        search_query = user_question
-        decision = {}
-
-        # L2 路由
-        if target_workspace:
-            yield format_log("🗺️ [调度室] 正在呼叫寻路者读取局部地图...")
-            await asyncio.sleep(0.01)
-            index_map = self._read_specific_map(target_workspace)
-            try:
-                decision = self.router.route(user_question, index_map)
-                yield format_log("  -> 🎯 寻路裁决完毕。")
-                await asyncio.sleep(0.01)
-            except Exception as e:
-                yield format_log(f"❌ 路由裁决异常，已自动降级: {e}")
-                await asyncio.sleep(0.01)
-
-            local_concepts = decision.get("local_concepts", [])
-            fuzzy_keywords = decision.get("fuzzy_keywords", [])
-            needs_web = decision.get("needs_web_search", True)
-            search_query = decision.get("search_query", user_question)
-
-        # 装载弹药
-        yield format_log("🚚 [调度室] 正在按裁决清单装载本地弹药...")
-        await asyncio.sleep(0.01)
-        local_context = ""
-        if target_workspace:
-            if local_concepts:
-                local_context += self._read_local_concepts(target_workspace, local_concepts)
-                yield format_log(f"  -> 📂 成功精确装载 {len(local_concepts)} 个概念。")
-                await asyncio.sleep(0.01)
-            if fuzzy_keywords:
-                local_context += self._fuzzy_find_local_files(target_workspace, fuzzy_keywords)
-                yield format_log("  -> 🔍 模糊嗅探装载完毕。")
-                await asyncio.sleep(0.01)
-
-        web_context, image_context = "", ""
-        if needs_web and search_query:
-            yield format_log(f"  -> 🌐 [调度室] 触发全网雷达检索: [{search_query}]")
-            await asyncio.sleep(0.01)
-            web_context = search_web_text(search_query)
-            images = search_multimodal_image(search_query)
-            if images:
-                image_context = f"![{images[0].title}]({images[0].image_url})"
-
-        # 💡 记忆流闭合点：在此处将前端传来的历史回忆，与本地抽取的弹药无缝合流
+        # 历史记忆合流
         if history:
-            history_str = "【前情对话回忆录】\n"
-            for msg in history[-5:]:  # 提取最近 5 轮，防止 token 溢出
-                role_label = "用户" if msg.get('role') == 'user' else 'AI'
-                history_str += f"{role_label}: {msg.get('content')}\n"
-            history_str += "\n"
-            # 前置拼装，让大模型在看文件前先看一眼刚才聊过什么
-            local_context = history_str + local_context
+            hist_str = "【前情对话】\n"
+            for msg in history[-5:]:
+                role = "用户" if msg.get('role') == 'user' else 'AI'
+                hist_str += f"{role}: {msg.get('content')}\n"
+            local_context = hist_str + "\n" + local_context
 
-        yield format_log("🗣️ 历史记忆与本地沙箱弹药装填完毕，开始驱动外脑生成回答：")
+        yield log("🗣️ 弹药装填完毕，开始生成回答：")
         await asyncio.sleep(0.01)
 
-        # 核心：流式输出你真实的 WikiResponder 大模型回答
-        # 核心：流式输出你真实的 WikiResponder 大模型回答
         try:
-            response_stream = self.responder.answer(user_question, local_context, web_context, image_context)
-            for chunk in response_stream:
+            for chunk in self.responder.answer(user_question, local_context, web_context, image_context):
                 text = chunk.content if hasattr(chunk, 'content') else str(chunk)
                 if text and text != "None":
                     yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
                     await asyncio.sleep(0.01)
 
-            # ==========================================
-            # 💡 完美适配 Python 3.11 的强行追加逻辑
-            # ==========================================
-            if image_context:
-                yield format_log("👁️ [调度室] 正在向前端渲染管道强行注入视觉参考图床...")
-                await asyncio.sleep(0.01)
-
-                # ✅ 1. 先在外部拼装好带换行的 Markdown 文本（大括号内绝无反斜杠）
-                image_markdown = f"\n\n### 🌐 检索参考图片:\n{image_context}\n"
-
-                # ✅ 2. 构建干净的字典对象
-                payload = {"type": "text", "content": image_markdown}
-
-                # ✅ 3. 序列化输出（大括号内部只有 json.dumps，反斜杠在外面，3.11 完美通行）
-                yield f"data: {json.dumps(payload)}\n\n"
-                await asyncio.sleep(0.01)
-
+            if images:
+                img = images[0]
+                ref_url = getattr(img, 'host_page_url', '') or img.image_url
+                ref_md = f"\n\n---\n### 🌐 检索参考来源\n🔗 [{img.title}]({ref_url})\n"
+                yield f"data: {json.dumps({'type': 'text', 'content': ref_md})}\n\n"
         except Exception as e:
-            yield format_log(f"❌ 答疑模块崩溃: {e}")
-            await asyncio.sleep(0.01)
+            yield log(f"❌ 答疑崩溃: {e}")
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
-# ==========================================
-# 🚀 极客控制台 (CLI 交互入口)
-# ==========================================
+# CLI 入口
 if __name__ == "__main__":
     flow = QueryFlow()
-    available_workspaces = flow._get_workspace_list()
+    workspaces = flow._get_workspace_list()
 
     print("\n" + "=" * 60)
-    print("🚀 [LLM-Wiki 终端控制台] 引擎点火完毕！")
+    print("🚀 LLM-Wiki 终端控制台")
     print("=" * 60)
 
-    if not available_workspaces:
-        print("\n⚠️ 警告：在 data/wiki 下未检测到任何工作区文件夹！将强制进入全局漫游模式。")
+    if not workspaces:
+        print("\n⚠️ 未检测到工作区！")
         target_ws = ""
     else:
-        print("\n📂 请选择你要挂载的本地工作区：")
-        print("  [0] 🌍 全局漫游 (不挂载本地知识，纯粹依靠大模型和外脑)")
-        for idx, ws in enumerate(available_workspaces, 1):
-            print(f"  [{idx}] 📁 {ws}")
-
-        choice = input("\n👉 请输入编号 (按回车默认 0): ").strip()
-
+        print("\n📂 选择工作区：")
+        print("  [0] 🌍 全局漫游")
+        for i, ws in enumerate(workspaces, 1):
+            print(f"  [{i}] 📁 {ws}")
+        choice = input("\n👉 编号: ").strip()
         target_ws = ""
-        if choice.isdigit() and 0 < int(choice) <= len(available_workspaces):
-            target_ws = available_workspaces[int(choice) - 1]
+        if choice.isdigit() and 0 < int(choice) <= len(workspaces):
+            target_ws = workspaces[int(choice) - 1]
 
-    print("\n" + "=" * 60)
-    print(f"✅ 系统锁定完毕！当前运行状态：[{target_ws if target_ws else '🌍 全局漫游'}]")
-    print("💡 提示: 输入 'exit' 或 'quit' 可随时退出控制台")
-    print("=" * 60)
+    print(f"\n✅ 锁定: [{target_ws or '全局漫游'}]")
 
     while True:
         try:
-            user_question = input("\n👤 你的问题: ").strip()
-
-            if user_question.lower() in ['exit', 'quit']:
-                print("\n👋 引擎关闭，再见！")
+            q = input("\n👤 问题: ").strip()
+            if q.lower() in ('exit', 'quit'):
                 break
-            if not user_question:
-                continue
-
-            flow.execute(user_question, target_workspace=target_ws)
-
+            if q:
+                flow.execute(q, target_workspace=target_ws)
         except KeyboardInterrupt:
-            print("\n\n👋 检测到强制中断，引擎关闭。")
             break

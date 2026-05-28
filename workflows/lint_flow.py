@@ -5,8 +5,7 @@ import json
 import asyncio
 from pathlib import Path
 
-# 锁定 Wiki 目录的绝对坐标
-WIKI_ROOT = Path(__file__).resolve().parent.parent / "data" / "wiki"
+from core.path_resolver import get_wiki_root
 
 
 class LintFlow:
@@ -18,7 +17,7 @@ class LintFlow:
     def __init__(self):
         self.link_pattern = re.compile(r'\[\[(.*?)\]\]')
 
-    async def stream_run(self, kb_name: str):
+    async def stream_run(self, kb_name: str, user_id: str = ""):
         """
         🚀 Web端专用的流式审查与织网方法 (返回符合 SSE 标准的日志流)
         """
@@ -26,7 +25,7 @@ class LintFlow:
         def format_log(msg: str):
             return f"data: {json.dumps({'type': 'log', 'content': msg})}\n\n"
 
-        target_kb_dir = WIKI_ROOT / kb_name
+        target_kb_dir = get_wiki_root(user_id) / kb_name
         if not target_kb_dir.exists():
             yield format_log(f"❌ 错误：在物理硬盘上未检测到目标沙箱路径: {target_kb_dir}")
             return
@@ -125,10 +124,11 @@ class LintFlow:
 
     def _select_sandbox(self) -> Path:
         """保留单机 CLI 运行时的交互式终端菜单"""
-        if not WIKI_ROOT.exists():
-            print(f"❌ 根目录不存在: {WIKI_ROOT}")
+        wiki_root = get_wiki_root()
+        if not wiki_root.exists():
+            print(f"❌ 根目录不存在: {wiki_root}")
             sys.exit(1)
-        sandboxes = [d for d in WIKI_ROOT.iterdir() if d.is_dir()]
+        sandboxes = [d for d in wiki_root.iterdir() if d.is_dir()]
         if not sandboxes:
             print(f"❌ 在 {WIKI_ROOT} 下没有找到任何知识库沙箱。")
             sys.exit(1)

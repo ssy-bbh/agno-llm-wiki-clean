@@ -1,126 +1,216 @@
+"""
+app.py — LLM-Wiki OS 后端中枢 (v0.2.0)
+JWT 用户隔离 + 多轮会话记忆 + API Key 管理 + 报告合成
+"""
 import os
 import sys
 import re
 import json
+import uuid
+import time
 import threading
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 # 确保能正常加载同级及子目录模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# ── 内部模块 ──
+from core.path_resolver import (
+    get_wiki_root, get_raw_root, get_concepts_dir, get_index_path,
+    get_memory_db_path, ensure_user_dirs, list_workspaces, get_default_workspace,
+    PROJECT_ROOT,
+)
+from core.auth import (
+    AuthRequest, AuthResponse,
+    register_user, login_user,
+    get_current_user, get_optional_user, get_admin_user,
+    save_user_api_key, get_user_api_keys,
+)
+from core.model_router import get_model_for_user, get_default_model, list_providers
 
 from workflows.query_flow import QueryFlow
 from workflows.lint_flow import LintFlow
 from workflows.autofill_flow import AutoFillFlow
 from workflows.ingest_flow import IngestFlow
 
-app = FastAPI(title="LLM-Wiki OS Backend", version="0.1.0")
 
-# 允许跨域连接前端研发环境
+# ==========================================
+# 🚀 应用生命周期
+# ==========================================
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """启动 / 关闭钩子"""
+    # 启动时初始化
+    _init_memory_db()
+    print("🧠 LLM-Wiki OS v0.2.0 已启动")
+    yield
+    print("👋 LLM-Wiki OS 正在关闭...")
+
+
+app = FastAPI(title="LLM-Wiki OS Backend", version="0.2.0", lifespan=lifespan)
+
+# CORS（生产环境应改为白名单）
+_cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 初始化核心工作流实例
-query_flow = QueryFlow()
-lint_flow = LintFlow()
-autofill_flow = AutoFillFlow(threshold=5)  # 被引用 5 次即自动触发填补真空
+
+# ==========================================
+# 🧠 Agno 记忆数据库（单例）
+# ==========================================
+_memory_db = None
+
+
+def _init_memory_db():
+    global _memory_db
+    from agno.db.sqlite import SqliteDb
+    db_path = get_memory_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    _memory_db = SqliteDb(db_file=str(db_path))
+    # 启用 WAL 模式以支持并发读写
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.close()
+    print(f"📦 Memory DB: {db_path}")
+
+
+def get_memory_db():
+    """获取全局 Agno SqliteDb 实例"""
+    if _memory_db is None:
+        _init_memory_db()
+    return _memory_db
 
 
 # ==========================================
-# 🧱 Pydantic 数据载荷安全防线
+# 🏭 工作流工厂（按 user_id 动态创建）
+# ==========================================
+_query_flow_cache: Dict[str, QueryFlow] = {}
+
+
+def get_query_flow(user_id: str = "") -> QueryFlow:
+    """获取用户专属 QueryFlow 实例"""
+    if user_id not in _query_flow_cache:
+        _query_flow_cache[user_id] = QueryFlow(user_id=user_id)
+    return _query_flow_cache[user_id]
+
+
+# LintFlow / AutoFillFlow 保持全局，但传入 user_id
+lint_flow = LintFlow()
+autofill_flow = AutoFillFlow(threshold=5)
+
+
+# ==========================================
+# 📋 Pydantic 数据模型
 # ==========================================
 class ChatRequest(BaseModel):
     query: str
     workspace: Optional[str] = ""
     history: List[Dict[str, Any]] = []
-    intent_override: Optional[str] = None  # 前端可强制指定意图（调试用）
+    intent_override: Optional[str] = None
+    session_id: Optional[str] = ""
+
+
+class ForgeRequest(BaseModel):
+    action: str
+    workspace: str
+
+
+class SandboxCreate(BaseModel):
+    name: str
+
+
+class FileEditRequest(BaseModel):
+    workspace: str
+    file_id: str
+    content: str
+
+
+class ApiKeySaveRequest(BaseModel):
+    provider: str
+    api_key: str
+    base_url: str = ""
+    model_id: str = ""
+
+
+class ReportRequest(BaseModel):
+    topic: str
+    workspace: str
+    outline: Optional[str] = ""
+    session_id: Optional[str] = ""
 
 
 # ==========================================
-# 🧠 轻量意图路由器 (极简 LLM Agent 一次调用)
+# 🧠 意图路由器 (LLM Agent)
 # ==========================================
 class Intent:
-    CHAT    = "chat"      # 寒暄闲聊 → LLM 直接回复
-    SCAN    = "scan"      # 扫描探索 → 列出 concepts 清单
-    SUMMARY = "summary"   # 概览总结 → 读取 index.md 生成摘要
-    QUERY   = "query"     # 具体知识查询 → 走完整 QueryFlow
-    ERROR   = "error"     # 空输入 / 无效请求
+    CHAT = "chat"
+    SCAN = "scan"
+    SUMMARY = "summary"
+    QUERY = "query"
+    ERROR = "error"
 
 
-from pydantic import BaseModel as _PydanticModel, Field as _Field
-from typing import Literal as _Literal
+from pydantic import BaseModel as _PB, Field as _F
+from typing import Literal as _L
 
 
-class _IntentDecision(_PydanticModel):
-    """意图分类器的结构化输出"""
-    intent: _Literal["chat", "scan", "summary", "query"] = _Field(
-        description="用户意图分类：chat(闲聊)/scan(扫描知识列表)/summary(知识库概览)/query(具体知识查询)"
+class _IntentDecision(_PB):
+    intent: _L["chat", "scan", "summary", "query"] = _F(
+        description="chat(闲聊)/scan(扫描)/summary(概览)/query(知识查询)"
     )
 
 
 class IntentRouter:
-    """极简意图路由 Agent —— 一次轻量 LLM 调用完成分类"""
-
     def __init__(self):
-        from core.llm_factory import get_qwen_model
         from agno.agent import Agent
-
         self.agent = Agent(
-            model=get_qwen_model(),
+            model=get_default_model(),
             instructions=[
-                "你是一个意图分类器。根据用户的输入，判断其真实意图。"
-                "只输出一个意图标签，不要解释。"
-                "\n分类标准："
-                "- chat：打招呼、问候、闲聊、夸赞 AI、问 AI 身份、简短回应（谢谢/好的/哈哈）"
-                "- scan：询问知识库里有什么概念/节点/内容，要求列出清单、展示目录"
-                "- summary：要求总结/概览/介绍整个知识库或某个沙箱的内容结构"
-                "- query：提出具体的知识性问题，需要检索资料才能回答"
-                "\n判定原则："
-                "- 空输入直接返回 error"
-                "- 不确定时优先 query（宁可多检索也不要误判）"
+                "你是一个意图分类器。根据用户输入判断意图。",
+                "- chat：打招呼、闲聊、夸赞、问AI身份",
+                "- scan：询问知识库有什么概念/节点",
+                "- summary：总结/概览知识库",
+                "- query：具体知识问题，需检索资料",
+                "不确定时优先 query。"
             ],
             output_schema=_IntentDecision,
             stream=False,
         )
 
     def classify(self, query: str) -> str:
-        """分类用户意图，返回 intent 标签"""
         if not query or not query.strip():
             return Intent.ERROR
-
         q = query.strip()
-        # 超短消息（≤3 字且不含标点/汉字），直接判定 chat
-        import re
         if len(q) <= 3 and re.match(r'^[\s\u4e00-\u9fa5a-zA-Z]{1,3}$', q):
             return Intent.CHAT
-
         try:
             result = self.agent.run(q)
             if hasattr(result.content, 'model_dump'):
                 return result.content.model_dump()['intent']
             if hasattr(result.content, 'intent'):
                 return result.content.intent
-            # fallback: 如果结构化解析失败，尝试从文本中提取
             text = str(result.content).lower()
             for tag in ['chat', 'scan', 'summary', 'query']:
                 if tag in text:
                     return tag
         except Exception:
             pass
-
         return Intent.QUERY
 
 
-# 全局单例（复用，避免重复创建 Agent）
 _intent_router = None
 
 
@@ -131,32 +221,317 @@ def classify_intent(query: str) -> str:
     return _intent_router.classify(query)
 
 
-class ForgeRequest(BaseModel):
-    action: str  # "reweave" 或 "fill_blackhole"
-    workspace: str
-
-
-class SandboxCreate(BaseModel):
-    name: str
+# ==========================================
+# 🏥 健康检查
+# ==========================================
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "version": "0.2.0",
+        "timestamp": time.time(),
+        "memory_db": str(get_memory_db_path()),
+    }
 
 
 # ==========================================
-# 🗣️ 1. 探求模式接口 (Query Mode) — 五向意图路由
+# 🔐 认证端点
+# ==========================================
+@app.post("/api/auth/register", response_model=AuthResponse)
+async def api_register(req: AuthRequest):
+    try:
+        return register_user(req.username, req.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+async def api_login(req: AuthRequest):
+    try:
+        return login_user(req.username, req.password)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/auth/me")
+async def api_me(user=Depends(get_current_user)):
+    return {"user_id": user["user_id"], "username": user["username"]}
+
+
+# ==========================================
+# 🔑 API Key 管理
+# ==========================================
+@app.get("/api/settings/providers")
+async def api_list_providers(user=Depends(get_current_user)):
+    """列出所有模型提供商 + 用户已配置的"""
+    providers = list_providers()
+    user_keys = get_user_api_keys(user["user_id"])
+    for p in providers:
+        p["configured"] = p["id"] in user_keys
+        if p["id"] in user_keys:
+            p["user_config"] = user_keys[p["id"]]
+    return providers
+
+
+@app.post("/api/settings/api-key")
+async def api_save_key(req: ApiKeySaveRequest, user=Depends(get_current_user)):
+    """保存用户 API Key"""
+    if not req.api_key or len(req.api_key) < 8:
+        raise HTTPException(status_code=400, detail="API Key 太短")
+    ok = save_user_api_key(user["user_id"], req.provider, req.api_key, req.base_url, req.model_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"status": "success", "provider": req.provider}
+
+
+# ==========================================
+# 📝 会话历史管理
+# ==========================================
+@app.get("/api/sessions")
+async def api_list_sessions(
+    workspace: str = Query(default=""),
+    user=Depends(get_current_user),
+):
+    """列出用户在指定工作区的历史会话"""
+    db = get_memory_db()
+    user_id = user["user_id"]
+    from agno.db.base import SessionType
+    all_sessions = db.get_sessions(user_id=user_id, session_type=SessionType.AGENT)
+
+    # 按工作区前缀过滤
+    prefix = f"{user_id}:{workspace}:" if workspace else f"{user_id}:"
+    filtered = []
+    for s in all_sessions:
+        sid = s.session_id if hasattr(s, 'session_id') else (s.get('session_id', '') if isinstance(s, dict) else '')
+        if sid.startswith(prefix):
+            entry = {
+                "session_id": sid,
+                "created_at": getattr(s, 'created_at', None) or (s.get('created_at') if isinstance(s, dict) else None),
+                "updated_at": getattr(s, 'updated_at', None) or (s.get('updated_at') if isinstance(s, dict) else None),
+            }
+            # 尝试提取 session name
+            session_data = getattr(s, 'session_data', None) or (s.get('session_data') if isinstance(s, dict) else None)
+            if session_data and isinstance(session_data, dict):
+                entry["name"] = session_data.get("session_name", "")
+            else:
+                entry["name"] = ""
+            filtered.append(entry)
+
+    # 按 updated_at 倒序
+    filtered.sort(key=lambda x: x.get("updated_at") or 0, reverse=True)
+    return filtered
+
+
+@app.post("/api/sessions/create")
+async def api_create_session(
+    workspace: str = Query(default=""),
+    user=Depends(get_current_user),
+):
+    """创建新会话，返回 session_id"""
+    uid = user["user_id"]
+    ws = workspace or "global"
+    session_id = f"{uid}:{ws}:{uuid.uuid4().hex[:12]}"
+    return {"session_id": session_id, "workspace": ws}
+
+
+@app.delete("/api/sessions/{session_id}")
+async def api_delete_session(session_id: str, user=Depends(get_current_user)):
+    """删除指定会话"""
+    uid = user["user_id"]
+    if not session_id.startswith(f"{uid}:"):
+        raise HTTPException(status_code=403, detail="无权删除此会话")
+
+    db = get_memory_db()
+    try:
+        db.delete_session(session_id)
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sessions/{session_id}/messages")
+async def api_get_session_messages(session_id: str, user=Depends(get_current_user)):
+    """获取指定会话的历史消息"""
+    uid = user["user_id"]
+    if not session_id.startswith(f"{uid}:"):
+        raise HTTPException(status_code=403, detail="无权查看此会话")
+
+    try:
+        import sqlite3 as _sqlite
+        db_path = str(get_memory_db_path())
+        conn = _sqlite.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT runs FROM agno_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if not row:
+                return {"session_id": session_id, "messages": []}
+
+            messages = []
+            runs_raw = row[0]
+            if runs_raw:
+                runs = json.loads(runs_raw) if isinstance(runs_raw, str) else runs_raw
+                if isinstance(runs, str):
+                    runs = json.loads(runs)
+                for run in runs:
+                    if isinstance(run, str):
+                        run = json.loads(run)
+                    run_msgs = run.get('messages', [])
+                    if isinstance(run_msgs, str):
+                        run_msgs = json.loads(run_msgs)
+                    for m in run_msgs:
+                        if isinstance(m, str):
+                            m = json.loads(m)
+                        role = m.get('role', '')
+                        content = m.get('content', '')
+                        if role in ('user', 'assistant') and content:
+                            messages.append({"role": role, "content": str(content)[:5000]})
+
+            return {"session_id": session_id, "messages": messages}
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# 🔍 管理员监控 API
+# ==========================================
+@app.get("/api/admin/users")
+async def admin_list_users(admin=Depends(get_admin_user)):
+    """列出所有用户及其统计信息"""
+    import sqlite3 as _sqlite
+    conn = _sqlite.connect(str(get_memory_db_path()))
+    try:
+        # 从 users.db 获取用户列表
+        uconn = _sqlite.connect(str(PROJECT_ROOT / "data" / "users.db"))
+        uconn.row_factory = _sqlite.Row
+        try:
+            users = uconn.execute(
+                "SELECT user_id, username, role, created_at FROM users ORDER BY created_at DESC"
+            ).fetchall()
+            result = []
+            for u in users:
+                # 统计该用户的会话数
+                session_count = conn.execute(
+                    "SELECT COUNT(*) FROM agno_sessions WHERE user_id = ?", (u["user_id"],)
+                ).fetchone()[0]
+                # 最新消息时间
+                last_row = conn.execute(
+                    "SELECT MAX(updated_at) FROM agno_sessions WHERE user_id = ?", (u["user_id"],)
+                ).fetchone()
+                last_active = last_row[0] if last_row and last_row[0] else None
+                result.append({
+                    "user_id": u["user_id"],
+                    "username": u["username"],
+                    "role": u["role"] if "role" in u.keys() else "user",
+                    "created_at": u["created_at"],
+                    "session_count": session_count,
+                    "last_active": last_active,
+                })
+            return result
+        finally:
+            uconn.close()
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/sessions")
+async def admin_list_all_sessions(
+    user_id: str = Query(default=""),
+    admin=Depends(get_admin_user),
+):
+    """列出所有用户的会话（管理员视角）"""
+    import sqlite3 as _sqlite
+    db_path = str(get_memory_db_path())
+    conn = _sqlite.connect(db_path)
+    conn.row_factory = _sqlite.Row
+    try:
+        if user_id:
+            rows = conn.execute(
+                "SELECT session_id, user_id, session_data, created_at, updated_at FROM agno_sessions WHERE user_id = ? ORDER BY updated_at DESC",
+                (user_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT session_id, user_id, session_data, created_at, updated_at FROM agno_sessions ORDER BY updated_at DESC LIMIT 200"
+            ).fetchall()
+
+        sessions = []
+        for r in rows:
+            entry = {
+                "session_id": r["session_id"],
+                "user_id": r["user_id"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "name": "",
+            }
+            sd = json.loads(r["session_data"]) if r["session_data"] else {}
+            if isinstance(sd, dict):
+                entry["name"] = sd.get("session_name", "")
+            sessions.append(entry)
+        return sessions
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/sessions/{session_id}/messages")
+async def admin_get_session_messages(session_id: str, admin=Depends(get_admin_user)):
+    """管理员查看任意用户的会话消息"""
+    import sqlite3 as _sqlite
+    db_path = str(get_memory_db_path())
+    conn = _sqlite.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT runs, user_id FROM agno_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if not row:
+            return {"session_id": session_id, "messages": []}
+
+        messages = []
+        runs_raw = row[0]
+        if runs_raw:
+            runs = json.loads(runs_raw) if isinstance(runs_raw, str) else runs_raw
+            if isinstance(runs, str):
+                runs = json.loads(runs)
+            for run in runs:
+                if isinstance(run, str):
+                    run = json.loads(run)
+                run_msgs = run.get('messages', [])
+                if isinstance(run_msgs, str):
+                    run_msgs = json.loads(run_msgs)
+                for m in run_msgs:
+                    if isinstance(m, str):
+                        m = json.loads(m)
+                    role = m.get('role', '')
+                    content = m.get('content', '')
+                    if role in ('user', 'assistant') and content:
+                        messages.append({"role": role, "content": str(content)[:5000]})
+
+        return {"session_id": session_id, "user_id": row[1], "messages": messages}
+    finally:
+        conn.close()
+
+
+# ==========================================
+# 🗣️ 1. 探求模式接口 (Query Mode)
 # ==========================================
 @app.get("/api/intent/debug")
-async def debug_intent(query: str):
-    """调试端点：查看意图分类结果（不执行实际操作）"""
+async def debug_intent(query: str, user=Depends(get_current_user)):
     return {"intent": classify_intent(query), "query": query}
 
 
 @app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
-    """流式应答中枢 — 五向意图分发器 (chat / scan / summary / query / error)"""
+async def chat_endpoint(request: ChatRequest, user=Depends(get_current_user)):
+    """流式应答中枢 — 五向意图分发器"""
     try:
         query = request.query.strip()
         workspace = request.workspace
+        user_id = user["user_id"]
+        session_id = request.session_id or f"{user_id}:{workspace or 'global'}:{uuid.uuid4().hex[:12]}"
 
-        # 前端可强制覆盖意图（调试用）
         if request.intent_override and request.intent_override in (
             Intent.CHAT, Intent.SCAN, Intent.SUMMARY, Intent.QUERY
         ):
@@ -164,71 +539,171 @@ async def chat_endpoint(request: ChatRequest):
         else:
             intent = classify_intent(query)
 
-        print(f"🧠 [意图路由] '{query[:40]}' -> {intent}")
-
-        # ─── 分轨处理 ───
+        print(f"🧠 [{user_id}] '{query[:40]}' -> {intent}")
 
         if intent == Intent.ERROR:
-            # 🛤️ 轨道 0：空请求
             async def error_stream():
                 yield f"data: {json.dumps({'type': 'text', 'content': '⚠️ 请输入你的问题或指令。'})}\n\n"
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return StreamingResponse(error_stream(), media_type="text/event-stream")
 
         if intent == Intent.CHAT:
-            # 🛤️ 轨道 A：闲聊模式 → 直接回复，不调检索管线
             return StreamingResponse(
-                _stream_chat_reply(query, history=request.history),
-                media_type="text/event-stream"
+                _wrap_stream_with_save(
+                    _stream_chat_reply(query, history=request.history, user_id=user_id, session_id=session_id),
+                    user_id, session_id, query
+                ),
+                media_type="text/event-stream",
             )
 
         if intent == Intent.SCAN:
-            # 🛤️ 轨道 B：扫描模式 → 列出 concepts 清单
             return StreamingResponse(
-                _stream_scan_response(query, workspace),
-                media_type="text/event-stream"
+                _wrap_stream_with_save(
+                    _stream_scan_response(query, workspace, user_id),
+                    user_id, session_id, query
+                ),
+                media_type="text/event-stream",
             )
 
         if intent == Intent.SUMMARY:
-            # 🛤️ 轨道 C：概览模式 → 读取 index.md 生成总结
             return StreamingResponse(
-                _stream_summary_response(query, workspace),
-                media_type="text/event-stream"
+                _wrap_stream_with_save(
+                    _stream_summary_response(query, workspace, user_id, session_id),
+                    user_id, session_id, query
+                ),
+                media_type="text/event-stream",
             )
 
-        # 🛤️ 轨道 D：QUERY 模式 (默认) → 走完整 QueryFlow 检索管线
+        # QUERY 模式
+        qf = get_query_flow(user_id)
         return StreamingResponse(
-            query_flow.stream_execute(
-                user_question=query,
-                target_workspace=workspace,
-                history=request.history
+            _wrap_stream_with_save(
+                qf.stream_execute(
+                    user_question=query,
+                    target_workspace=workspace,
+                    history=request.history,
+                    user_id=user_id,
+                    session_id=session_id,
+                ),
+                user_id, session_id, query
             ),
-            media_type="text/event-stream"
+            media_type="text/event-stream",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
+#  📦 会话持久化（统一存储所有意图的对话）
+# ==========================================
+def _save_session_message(user_id: str, session_id: str, user_msg: str, assistant_msg: str):
+    """将一轮对话追加到 agno_sessions 表"""
+    import sqlite3 as _sqlite
+    db_path = str(get_memory_db_path())
+    conn = _sqlite.connect(db_path)
+    try:
+        # 确保表存在
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agno_sessions (
+                session_id TEXT PRIMARY KEY,
+                session_type TEXT DEFAULT 'agent',
+                agent_id TEXT,
+                team_id TEXT,
+                workflow_id TEXT,
+                user_id TEXT,
+                session_data TEXT,
+                agent_data TEXT,
+                team_data TEXT,
+                workflow_data TEXT,
+                metadata TEXT,
+                runs TEXT,
+                summary TEXT,
+                created_at REAL,
+                updated_at REAL
+            )
+        """)
+
+        now = time.time()
+        new_run = {
+            "run_id": uuid.uuid4().hex,
+            "user_id": user_id,
+            "session_id": session_id,
+            "messages": [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": assistant_msg[:5000]},
+            ],
+            "created_at": now,
+            "status": "completed",
+        }
+
+        row = conn.execute(
+            "SELECT runs, session_data FROM agno_sessions WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+
+        if row:
+            runs = json.loads(row[0]) if row[0] else []
+            runs.append(new_run)
+            conn.execute(
+                "UPDATE agno_sessions SET runs = ?, updated_at = ? WHERE session_id = ?",
+                (json.dumps(runs, ensure_ascii=False), now, session_id)
+            )
+        else:
+            # 新会话：用第一条用户消息作为会话名
+            session_name = user_msg[:30].strip()
+            if len(user_msg) > 30:
+                session_name += "..."
+            session_data = json.dumps({"session_name": session_name}, ensure_ascii=False)
+            conn.execute(
+                "INSERT INTO agno_sessions (session_id, session_type, user_id, session_data, runs, created_at, updated_at) VALUES (?, 'agent', ?, ?, ?, ?, ?)",
+                (session_id, user_id, session_data, json.dumps([new_run], ensure_ascii=False), now, now)
+            )
+        conn.commit()
+    except Exception as e:
+        print(f"  [WARN] save session error: {e}")
+    finally:
+        conn.close()
+
+
+async def _wrap_stream_with_save(stream_gen, user_id, session_id, user_query):
+    """包装 SSE 流，在流结束时自动保存对话到 DB"""
+    assistant_text = ""
+    try:
+        async for chunk in stream_gen:
+            # 从 SSE chunk 中提取 assistant 文本
+            if chunk.startswith("data: "):
+                try:
+                    data = json.loads(chunk[6:].strip())
+                    if data.get("type") == "text":
+                        assistant_text += data.get("content", "")
+                except:
+                    pass
+            yield chunk
+    finally:
+        if assistant_text:
+            _save_session_message(user_id, session_id, user_query, assistant_text)
+
+
+# ==========================================
 #  意图分轨处理函数
 # ==========================================
-
-async def _stream_chat_reply(query: str, history: list = None):
-    """闲聊轨道：直接让 LLM 以赛博朋克口吻回复，不检索知识库"""
-    from core.llm_factory import get_qwen_model
+async def _stream_chat_reply(query: str, history: list = None, user_id: str = "", session_id: str = ""):
+    """闲聊轨道：LLM 直接回复，挂载 db 实现多轮记忆"""
     from agno.agent import Agent
 
+    model = get_model_for_user(user_id)
     agent = Agent(
-        model=get_qwen_model(),
+        model=model,
         instructions=[
-            "你是一个 AI 向导，回答简短、有趣、有个性。"
-            "不要调用任何外部工具或知识库，直接基于你的常识回复。"
-            "回复控制在 100 字以内。"
+            "你是一个 AI 向导，回答简短、有趣、有个性。",
+            "不要调用任何外部工具或知识库，直接基于你的常识回复。",
+            "回复控制在 100 字以内。",
         ],
         stream=True,
     )
 
-    # 拼装上下文
     system_prompt = f"用户说：{query}"
     if history:
         ctx = "【前情回顾】\n"
@@ -245,36 +720,17 @@ async def _stream_chat_reply(query: str, history: list = None):
                 yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
     except Exception as e:
         yield f"data: {json.dumps({'type': 'text', 'content': f'⚠️ 闲聊模块异常: {str(e)}'})}\n\n"
-
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
-def _get_all_workspaces() -> list:
-    """列出所有沙箱名，按 mtime 倒序"""
-    wiki_base = Path(__file__).resolve().parent / "data" / "wiki"
-    if not wiki_base.exists():
-        return []
-    workspaces = [d for d in wiki_base.iterdir() if d.is_dir()]
-    workspaces.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    return [w.name for w in workspaces]
-
-
-def _get_default_workspace() -> str:
-    """自动选取默认工作区（最新修改的那个）"""
-    all_ws = _get_all_workspaces()
-    return all_ws[0] if all_ws else ""
-
-
-async def _stream_scan_response(query: str, workspace: str):
-    """扫描轨道：未指定沙箱 → 全局扫描所有沙箱；指定了 → 只扫该沙箱"""
+async def _stream_scan_response(query: str, workspace: str, user_id: str = ""):
+    """扫描轨道：全局 or 指定沙箱"""
     import asyncio
-    from pathlib import Path
 
-    wiki_base = Path(__file__).resolve().parent / "data" / "wiki"
+    wiki_base = get_wiki_root(user_id)
 
-    # ── 未指定沙箱：全局概览（只展示沙箱名 + 节点数，不展开具体节点） ──
     if not workspace or not workspace.strip():
-        all_ws = _get_all_workspaces()
+        all_ws = list_workspaces(user_id)
         if not all_ws:
             content = "🔭 系统中尚未创建任何知识沙箱。\n\n请先创建沙箱并摄入原始资料。"
             yield f"data: {json.dumps({'type': 'log', 'content': '📡 [全局扫描] 未找到任何沙箱'})}\n\n"
@@ -289,76 +745,61 @@ async def _stream_scan_response(query: str, workspace: str):
 
         total_nodes = 0
         ws_stats = []
-
         for ws_name in all_ws:
-            concepts_dir = wiki_base / ws_name / "concepts"
+            concepts_dir = get_concepts_dir(user_id, ws_name)
             count = 0
             if concepts_dir.exists():
                 count = len([f for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
             total_nodes += count
             ws_stats.append((ws_name, count))
 
-        # 构建简洁概览
         lines = [f"📡 全局扫描完毕，共检测到 **{len(all_ws)}** 个沙箱 / **{total_nodes}** 个知识节点：\n"]
         lines.append("| 沙箱 | 节点数 | 状态 |")
         lines.append("|------|--------|------|")
         for ws_name, count in ws_stats:
             status = "✅ 已激活" if count > 0 else "⭕ 虚空"
             lines.append(f"| {ws_name} | {count} | {status} |")
-
-        lines.append("\n💡 在左侧切换沙箱隔离区可深入查看具体节点，或直接输入具体问题。")
+        lines.append("\n💡 在左侧切换沙箱隔离区可深入查看具体节点。")
         content = "\n".join(lines)
-
-        chunk_size = 15
-        for i in range(0, len(content), chunk_size):
-            yield f"data: {json.dumps({'type': 'text', 'content': content[i:i+chunk_size]})}\n\n"
+        for i in range(0, len(content), 15):
+            yield f"data: {json.dumps({'type': 'text', 'content': content[i:i+15]})}\n\n"
             await asyncio.sleep(0.02)
-
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
         return
 
-    # ── 指定了沙箱：只扫该沙箱 ──
-    concepts_dir = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts"
+    # 指定沙箱扫描
+    concepts_dir = get_concepts_dir(user_id, workspace)
     available = []
     if concepts_dir.exists():
-        available = sorted(
-            [f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"]
-        )
+        available = sorted([f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
 
     if available:
         group_size = 8
         groups = [available[i:i + group_size] for i in range(0, len(available), group_size)]
-        display_lines = [f"📡 扫描完毕，在沙箱 **{workspace}** 中检测到 **{len(available)}** 个已实例化的知识节点：\n"]
-        for idx, group in enumerate(groups):
+        display_lines = [f"📡 扫描完毕，在沙箱 **{workspace}** 中检测到 **{len(available)}** 个知识节点：\n"]
+        for group in groups:
             display_lines.append(f"{' | '.join(f'`{c}`' for c in group)}")
-        display_lines.append(f"\n💡 点击图谱上的节点，或直接在下方输入具体问题，即可深入探索。")
+        display_lines.append(f"\n💡 点击图谱节点或直接输入问题即可深入探索。")
         content = "\n".join(display_lines)
     else:
-        content = (f"🔭 扫描完毕：沙箱 **{workspace}** 中尚未生成任何知识节点。\n\n"
-                   f"知识宇宙还是一片虚空 —— 试着拖拽一些原始资料到赛博熔炉中进行首次摄入吧！")
+        content = (f"🔭 沙箱 **{workspace}** 中尚未生成任何知识节点。\n\n"
+                   f"试着拖拽一些原始资料到赛博熔炉中进行首次摄入吧！")
 
     yield f"data: {json.dumps({'type': 'log', 'content': f'📡 [扫描] 正在读取沙箱 [{workspace}] ...'})}\n\n"
     await asyncio.sleep(0.3)
-
-    chunk_size = 15
-    for i in range(0, len(content), chunk_size):
-        chunk = content[i:i + chunk_size]
-        yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+    for i in range(0, len(content), 15):
+        yield f"data: {json.dumps({'type': 'text', 'content': content[i:i+15]})}\n\n"
         await asyncio.sleep(0.02)
-
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
-async def _stream_summary_response(query: str, workspace: str):
-    """概览轨道：读取 index.md，让 LLM 生成知识库总结"""
+async def _stream_summary_response(query: str, workspace: str, user_id: str = "", session_id: str = ""):
+    """概览轨道：读取 index.md + LLM 总结，挂载 db"""
     import asyncio
-    from pathlib import Path
-    from core.llm_factory import get_qwen_model
     from agno.agent import Agent
 
-    # 沙箱未指定时自动兜底
     if not workspace or not workspace.strip():
-        workspace = _get_default_workspace()
+        workspace = get_default_workspace(user_id)
         if not workspace:
             content = "📋 系统中尚未创建任何知识沙箱，无法生成概览。"
             for i in range(0, len(content), 15):
@@ -367,36 +808,33 @@ async def _stream_summary_response(query: str, workspace: str):
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
 
-    index_path = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "index.md"
-
-    yield f"data: {json.dumps({'type': 'log', 'content': f'📋 [概览] 正在读取导航地图 ...'})}\n\n"
+    index_path = get_index_path(user_id, workspace)
+    yield f"data: {json.dumps({'type': 'log', 'content': '📋 [概览] 正在读取导航地图 ...'})}\n\n"
     await asyncio.sleep(0.3)
 
     if index_path.exists():
         index_content = index_path.read_text(encoding="utf-8")
-
-        # 如果 index.md 很短（空知识库），直接回复
         if len(index_content.strip()) < 50:
-            content = (f"📋 沙箱 **{workspace}** 的导航地图几乎空白。\n\n"
-                       f"知识库尚未建立结构化的导航体系 —— 建议先进行知识摄入。")
-            chunk_size = 15
-            for i in range(0, len(content), chunk_size):
-                yield f"data: {json.dumps({'type': 'text', 'content': content[i:i + chunk_size]})}\n\n"
+            content = f"📋 沙箱 **{workspace}** 的导航地图几乎空白。\n\n建议先进行知识摄入。"
+            for i in range(0, len(content), 15):
+                yield f"data: {json.dumps({'type': 'text', 'content': content[i:i+15]})}\n\n"
                 await asyncio.sleep(0.02)
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
 
-        # 让 LLM 基于 index.md 生成总结
+        model = get_model_for_user(user_id)
         agent = Agent(
-            model=get_qwen_model(),
+            model=model,
+            db=get_memory_db(),
+            user_id=user_id,
+            session_id=session_id,
+            num_history_runs=5,
             instructions=[
-                "你是一位知识库架构师。根据以下导航地图（index.md），用简洁、结构化的语言"
-                "总结当前知识库的核心内容领域、覆盖范围和知识结构。"
-                "回答控制在 200 字以内，使用 Markdown 格式。"
+                "你是一位知识库架构师。根据导航地图总结核心内容领域和知识结构。",
+                "回答控制在 200 字以内，使用 Markdown 格式。",
             ],
             stream=True,
         )
-
         prompt = f"【用户问题】: {query}\n\n【导航地图】:\n{index_content[:4000]}"
         try:
             response = agent.run(prompt)
@@ -407,372 +845,351 @@ async def _stream_summary_response(query: str, workspace: str):
         except Exception as e:
             yield f"data: {json.dumps({'type': 'text', 'content': f'⚠️ 概览模块异常: {str(e)}'})}\n\n"
     else:
-        content = (f"📋 沙箱 **{workspace}** 中尚未建立导航地图（index.md）。\n\n"
-                   f"建议先摄入一些原始资料，让系统自动生成知识结构。")
-        chunk_size = 15
-        for i in range(0, len(content), chunk_size):
-            yield f"data: {json.dumps({'type': 'text', 'content': content[i:i + chunk_size]})}\n\n"
+        content = f"📋 沙箱 **{workspace}** 中尚未建立导航地图。\n\n建议先摄入原始资料。"
+        for i in range(0, len(content), 15):
+            yield f"data: {json.dumps({'type': 'text', 'content': content[i:i+15]})}\n\n"
             await asyncio.sleep(0.02)
-
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
+
 # ==========================================
-# 🕸️ 2. 织网模式清洗调度流接口 (Forge Mode)
+# 🕸️ 2. 织网模式 (Forge Mode)
 # ==========================================
 @app.post("/api/forge")
-async def forge_endpoint(request: ForgeRequest):
-    """🕸️ 织网模式控制中枢：动态调度后端异步清洗引擎，向前端推流熔炉实时日志"""
+async def forge_endpoint(request: ForgeRequest, user=Depends(get_current_user)):
     if not request.workspace:
-        raise HTTPException(status_code=400, detail="必须指定具体的隔离沙箱才能启动织网熔炉！")
+        raise HTTPException(status_code=400, detail="必须指定隔离沙箱！")
+
+    user_id = user["user_id"]
 
     async def run_forge_task():
         try:
             if request.action == "reweave":
-                async for log in lint_flow.stream_run(request.workspace):
+                async for log in lint_flow.stream_run(request.workspace, user_id=user_id):
                     yield log
             elif request.action == "fill_blackhole":
-                async for log in autofill_flow.stream_run(request.workspace):
+                async for log in autofill_flow.stream_run(request.workspace, user_id=user_id):
                     yield log
             else:
-                yield f"data: {json.dumps({'type': 'log', 'content': '❌ 拒绝执行：未知的织网运维指令。'})}\n\n"
+                yield f"data: {json.dumps({'type': 'log', 'content': '❌ 未知的织网指令。'})}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'log', 'content': f'💥 熔炉核心崩溃: {str(e)}'})}\n\n"
-
-        # 释放结束信号
+            yield f"data: {json.dumps({'type': 'log', 'content': f'💥 熔炉崩溃: {str(e)}'})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(run_forge_task(), media_type="text/event-stream")
 
 
 # ==========================================
-# 🗂️ 3. 新建沙箱物理开荒接口 (Sandbox Create)
+# 🗂️ 3. 沙箱管理
 # ==========================================
 @app.post("/api/workspaces/create")
-async def create_workspace(req: SandboxCreate):
-    """🗂️ 物理开荒：在 data/wiki/ 和 data/raw/ 下同时创建新的知识沙箱文件夹"""
-    if not req.name:
-        raise HTTPException(status_code=400, detail="沙箱名称不能为空！")
-
-    # 严格过滤非法路径字符，防止路径穿越攻击
+async def create_workspace(req: SandboxCreate, user=Depends(get_current_user)):
+    user_id = user["user_id"]
     safe_name = re.sub(r'[\\/*?:"<>|]', "", req.name).strip()
     if not safe_name:
         raise HTTPException(status_code=400, detail="非法的沙箱名称！")
 
-    project_root = Path(__file__).resolve().parent
-    wiki_dir = project_root / "data" / "wiki" / safe_name / "concepts"
-    raw_dir = project_root / "data" / "raw" / safe_name
+    wiki_dir = get_wiki_root(user_id) / safe_name / "concepts"
+    raw_dir = get_raw_root(user_id) / safe_name
 
     try:
         wiki_dir.mkdir(parents=True, exist_ok=True)
         raw_dir.mkdir(parents=True, exist_ok=True)
         return {"status": "success", "workspace": safe_name}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"物理开荒失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"开荒失败: {str(e)}")
 
 
 # ==========================================
-# 📥 4. 原始语料多文件批量落盘摄入接口 (Batch Ingest)
+# 📥 4. 文件上传（含校验）
 # ==========================================
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md", ".pptx", ".ppt", ".xlsx", ".csv", ".html"}
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+
+
 @app.post("/api/upload")
-async def upload_batch_endpoint(workspace: str = Form(...), files: List[UploadFile] = File(...)):
-    """📥 批量摄入流网关：接收多个原始语料，保存至对应沙箱目录，并后台排队批量摄入"""
+async def upload_batch_endpoint(
+    workspace: str = Form(...),
+    files: List[UploadFile] = File(...),
+    user=Depends(get_current_user),
+):
+    user_id = user["user_id"]
     if not workspace:
         raise HTTPException(status_code=400, detail="必须指定目标沙箱！")
     if not files:
         raise HTTPException(status_code=400, detail="未检测到任何文件！")
 
-    project_root = Path(__file__).resolve().parent
-    raw_dir = project_root / "data" / "raw" / workspace
+    # 文件校验
+    for f in files:
+        ext = Path(f.filename).suffix.lower() if f.filename else ""
+        if ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
+        if f.size and f.size > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"文件 {f.filename} 超过 50MB 限制")
+
+    raw_dir = get_raw_root(user_id) / workspace
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     saved_paths = []
     try:
-        # 1. 极速前台落盘
-        for file in files:
-            file_path = raw_dir / file.filename
-            contents = await file.read()
+        for f in files:
+            file_path = raw_dir / f.filename
+            contents = await f.read()
             file_path.write_bytes(contents)
             saved_paths.append(file_path)
 
-        # 2. 开启后台守护线程：循环调度 IngestFlow 逐个炼丹，绝不卡死前端
+        # 后台线程：用参数传递代替 os.environ 污染
         def run_background_batch():
             flow = IngestFlow()
             for fp in saved_paths:
-                print(f"\n🚀 [后台任务] 正在排队提取语料: {fp.name} -> 目标沙箱: {workspace}")
-                os.environ["ACTIVE_KB"] = workspace
-                os.environ["ACTIVE_SUBDIR"] = ""
-                os.environ["ACTIVE_DOC_NAME"] = fp.stem
+                print(f"\n🚀 [{user_id}] 提取: {fp.name} -> {workspace}")
                 try:
-                    flow.run(str(fp))
+                    flow.run(str(fp), kb_name=workspace, user_id=user_id)
                 except Exception as e:
                     print(f"❌ 提取 {fp.name} 失败: {e}")
+            print(f"\n✅ [{user_id}] 批量提炼完成！")
 
-            print(f"\n✅✅ 沙箱 [{workspace}] 的批量提炼任务已全部完成！")
-
-        threading.Thread(target=run_background_batch).start()
+        threading.Thread(target=run_background_batch, daemon=True).start()
 
         return {
             "status": "success",
             "message": f"成功落盘 {len(files)} 个文件",
-            "files": [f.filename for f in files]
+            "files": [f.filename for f in files],
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件批量落盘失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"落盘失败: {str(e)}")
 
 
 # ==========================================
-# 🔍 5. 基础拉取接口 (Workspaces & Graph)
+# 🔍 5. 基础接口 (Workspaces & Graph)
 # ==========================================
 @app.get("/api/workspaces")
-async def get_workspaces():
-    """扫描本地 data/wiki 文件夹，向侧边栏喂入最真实的沙箱列表"""
-    base_dir = os.path.join(os.path.dirname(__file__), "data", "wiki")
-    if not os.path.exists(base_dir):
-        return []
-    try:
-        return [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_workspaces(user=Depends(get_current_user)):
+    user_id = user["user_id"]
+    return list_workspaces(user_id)
 
 
-# ==========================================
-# 📥 6. 隔离审批区接口 (Inbox)
-# ==========================================
-@app.get("/api/inbox")
-async def get_inbox(workspace: str):
-    """只扫描带有草稿烙印的待审实体"""
-    if not workspace: return []
-    concepts_dir = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts"
-    if not concepts_dir.exists(): return []
-
-    # 💡 组装安全烙印，防止前端意外吞噬
-    DRAFT_TAG = "<" + "!-- AUTOFILL_DRAFT --" + ">"
-
-    files = []
-    try:
-        for f in concepts_dir.glob("*.md"):
-            if f.stem.lower() == "index": continue
-
-            content = f.read_text(encoding="utf-8")
-            # 💡 核心拦截：如果没有草稿烙印，直接跳过
-            if DRAFT_TAG not in content:
-                continue
-
-            stat = f.stat()
-            # 截取内容时，剔除烙印
-            clean_excerpt = re.sub(r'<.*?AUTOFILL_DRAFT.*?>', '', content)
-            clean_excerpt = re.sub(r'[#*\[\]\n]', ' ', clean_excerpt)[:40].strip()
-
-            files.append({
-                "id": f.stem,
-                "title": f.stem,
-                "excerpt": f"{clean_excerpt}..." if clean_excerpt else "无正文内容...",
-                "timestamp": stat.st_mtime
-            })
-
-        files.sort(key=lambda x: x["timestamp"], reverse=True)
-        return files[:4]
-    except Exception as e:
-        return []
-
-
-@app.post("/api/inbox/approve")
-async def approve_inbox_file(workspace: str, file_id: str):
-    """静默放行：物理撕毁文件中的草稿烙印"""
-    DRAFT_TAG_LINE = "<" + "!-- AUTOFILL_DRAFT --" + ">\n"
-    DRAFT_TAG_INLINE = "<" + "!-- AUTOFILL_DRAFT --" + ">"
-
-    filepath = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts" / f"{file_id}.md"
-    if filepath.exists():
-        content = filepath.read_text(encoding="utf-8")
-        clean_content = content.replace(DRAFT_TAG_LINE, "").replace(DRAFT_TAG_INLINE, "")
-        filepath.write_text(clean_content, encoding="utf-8")
-    return {"status": "success"}
-
-
-# ==========================================
-# 📡 7. 需求雷达接口 (Radar) - 正式版 (5次60分)
-# ==========================================
-@app.get("/api/radar")
-async def get_radar(workspace: str):
-    if not workspace: return []
-
-    from pathlib import Path
-    import re
-    from collections import Counter
-
-    concepts_dir = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts"
-    if not concepts_dir.exists():
-        return []
-
-    existing_files = list(concepts_dir.glob("*.md"))
-    link_counter = Counter()
-
-    try:
-        # 1. 全局扫描提取引力链接
-        for file_path in existing_files:
-            content = file_path.read_text(encoding="utf-8")
-            links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
-
-            for link in links:
-                clean_link = link.strip()
-                if not clean_link: continue
-                link_counter[clean_link] += 1
-
-        # 2. 精确别名解构，识别假死链
-        def _get_real_target_if_exists(ghost_name: str, files: list) -> str:
-            def _get_aliases(text: str) -> set:
-                aliases = set()
-                clean_text = text.lower().replace("-", "").replace("_", "").replace(" ", "")
-                if clean_text: aliases.add(clean_text)
-                match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
-                if match:
-                    part1 = match.group(1).lower().replace("-", "").replace("_", "").replace(" ", "")
-                    part2 = match.group(2).lower().replace("-", "").replace("_", "").replace(" ", "")
-                    if part1: aliases.add(part1)
-                    if part2: aliases.add(part2)
-                return aliases
-
-            ghost_aliases = _get_aliases(ghost_name)
-            for ex_file in files:
-                ex_aliases = _get_aliases(ex_file.stem)
-                if ghost_aliases & ex_aliases:
-                    return ex_file.stem
-            return ""
-
-        # 3. 统计并筛选黑洞节点 (>=1次即可上榜)
-        target_ghosts = []
-        for link, count in link_counter.items():
-            real_target = _get_real_target_if_exists(link, existing_files)
-            if not real_target and link.lower() != "index" and count >= 1:
-                target_ghosts.append((link, count))
-
-        target_ghosts.sort(key=lambda x: x[1], reverse=True)
-
-        # 4. 计分并返回前端 (1次12分，5次60分触发红温，封顶100分)
-        radar_data = []
-        for name, count in target_ghosts[:5]:
-            score = min(100, count * 12)
-            radar_data.append({
-                "concept": name,
-                "urgency": score,
-                "mentions": count
-            })
-
-        return radar_data
-    except Exception:
-        return []
 @app.get("/api/graph")
-async def get_graph(workspace: str):
-    """精准定位 concepts 路径，通过正则提取真实 [[双链]] 拓扑"""
-    project_root = Path(__file__).resolve().parent
-    base_dir = project_root / "data" / "wiki" / workspace
-
+async def get_graph(workspace: str, user=Depends(get_current_user)):
+    user_id = user["user_id"]
+    base_dir = get_wiki_root(user_id) / workspace
     concepts_dir = base_dir / "concepts"
     search_dir = concepts_dir if concepts_dir.exists() else base_dir
 
     if not base_dir.exists():
         return {"nodes": [], "links": []}
 
-    nodes = []
-    links = []
-    node_set = set()
-
+    nodes, links, node_set = [], [], set()
     try:
-        for file_path in search_dir.rglob("*.md"):
-            node_name = file_path.stem
-            if node_name.lower() == "index":
+        for fp in search_dir.rglob("*.md"):
+            name = fp.stem
+            if name.lower() == "index":
                 continue
-            nodes.append({"id": node_name, "group": 1})
-            node_set.add(node_name.lower())
+            nodes.append({"id": name, "group": 1})
+            node_set.add(name.lower())
 
-        for file_path in search_dir.rglob("*.md"):
-            source_name = file_path.stem
-            if source_name.lower() == "index":
+        for fp in search_dir.rglob("*.md"):
+            source = fp.stem
+            if source.lower() == "index":
                 continue
-
-            content = file_path.read_text(encoding="utf-8")
-            matches = re.findall(r'\[\[(.*?)\]\]', content)
-
-            for match in matches:
-                target_name = match.split("|")[0].strip()
-                if target_name.lower() == "index":
+            content = fp.read_text(encoding="utf-8")
+            for match in re.findall(r'\[\[(.*?)\]\]', content):
+                target = match.split("|")[0].strip()
+                if target.lower() == "index":
                     continue
-                if target_name.lower() in node_set:
-                    links.append({"source": source_name, "target": target_name})
+                if target.lower() in node_set:
+                    links.append({"source": source, "target": target})
 
         return {"nodes": nodes, "links": links}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"星图拓扑解析失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
-# ⚖️ 8. Inbox 物理审批流接口 (读取/覆写/销毁)
+# 📥 6. 隔离审批区 (Inbox)
 # ==========================================
-class FileEditRequest(BaseModel):
-    workspace: str
-    file_id: str
-    content: str
+DRAFT_TAG = "<" + "!-- AUTOFILL_DRAFT --" + ">"
 
 
-@app.get("/api/inbox/file")
-async def get_inbox_file(workspace: str, file_id: str):
-    DRAFT_TAG_LINE = "<" + "!-- AUTOFILL_DRAFT --" + ">\n"
+@app.get("/api/inbox")
+async def get_inbox(workspace: str, user=Depends(get_current_user)):
+    if not workspace:
+        return []
+    user_id = user["user_id"]
+    concepts_dir = get_concepts_dir(user_id, workspace)
+    if not concepts_dir.exists():
+        return []
 
-    filepath = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts" / f"{file_id}.md"
-    if not filepath.exists(): raise HTTPException(status_code=404)
-    # 返回给前端编辑时，隐藏这个丑陋的烙印
-    content = filepath.read_text(encoding="utf-8").replace(DRAFT_TAG_LINE, "")
-    return {"content": content}
+    files = []
+    try:
+        for f in concepts_dir.glob("*.md"):
+            if f.stem.lower() == "index":
+                continue
+            content = f.read_text(encoding="utf-8")
+            if DRAFT_TAG not in content:
+                continue
+            stat = f.stat()
+            clean = re.sub(r'<.*?AUTOFILL_DRAFT.*?>', '', content)
+            clean = re.sub(r'[#*\[\]\n]', ' ', clean)[:40].strip()
+            files.append({
+                "id": f.stem,
+                "title": f.stem,
+                "excerpt": f"{clean}..." if clean else "无正文内容...",
+                "timestamp": stat.st_mtime,
+            })
+        files.sort(key=lambda x: x["timestamp"], reverse=True)
+        return files[:4]
+    except Exception:
+        return []
 
 
-@app.put("/api/inbox/file")
-async def update_inbox_file(req: FileEditRequest):
-    """人工介入，覆写大模型草稿并正式落盘（同时撕毁烙印）"""
-    DRAFT_TAG_LINE = "<" + "!-- AUTOFILL_DRAFT --" + ">\n"
-
-    filepath = Path(__file__).resolve().parent / "data" / "wiki" / req.workspace / "concepts" / f"{req.file_id}.md"
-    if not filepath.exists(): raise HTTPException(status_code=404)
-    # 保存时确保不带草稿烙印
-    clean_content = req.content.replace(DRAFT_TAG_LINE, "")
-    filepath.write_text(clean_content, encoding="utf-8")
+@app.post("/api/inbox/approve")
+async def approve_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
+    user_id = user["user_id"]
+    filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
+    if filepath.exists():
+        content = filepath.read_text(encoding="utf-8")
+        content = content.replace(DRAFT_TAG + "\n", "").replace(DRAFT_TAG, "")
+        filepath.write_text(content, encoding="utf-8")
     return {"status": "success"}
 
 
-@app.delete("/api/inbox/file")
-async def delete_inbox_file(workspace: str, file_id: str):
-    filepath = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts" / f"{file_id}.md"
+# ==========================================
+# 📡 7. 需求雷达 (Radar)
+# ==========================================
+@app.get("/api/radar")
+async def get_radar(workspace: str, user=Depends(get_current_user)):
+    if not workspace:
+        return []
+    user_id = user["user_id"]
+    concepts_dir = get_concepts_dir(user_id, workspace)
+    if not concepts_dir.exists():
+        return []
+
+    from collections import Counter
+    existing_files = list(concepts_dir.glob("*.md"))
+    link_counter = Counter()
+
+    try:
+        for fp in existing_files:
+            content = fp.read_text(encoding="utf-8")
+            for link in re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content):
+                clean = link.strip()
+                if clean:
+                    link_counter[clean] += 1
+
+        def _get_real_target(ghost: str, files: list) -> str:
+            def _aliases(text: str) -> set:
+                a = set()
+                c = text.lower().replace("-", "").replace("_", "").replace(" ", "")
+                if c:
+                    a.add(c)
+                m = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
+                if m:
+                    for p in [m.group(1), m.group(2)]:
+                        p = p.lower().replace("-", "").replace("_", "").replace(" ", "")
+                        if p:
+                            a.add(p)
+                return a
+
+            ga = _aliases(ghost)
+            for f in files:
+                if ga & _aliases(f.stem):
+                    return f.stem
+            return ""
+
+        ghosts = []
+        for link, count in link_counter.items():
+            real = _get_real_target(link, existing_files)
+            if not real and link.lower() != "index" and count >= 1:
+                ghosts.append((link, count))
+        ghosts.sort(key=lambda x: x[1], reverse=True)
+
+        return [
+            {"concept": name, "urgency": min(100, count * 12), "mentions": count}
+            for name, count in ghosts[:5]
+        ]
+    except Exception:
+        return []
+
+
+# ==========================================
+# ⚖️ 8. Inbox 物理审批 (CRUD)
+# ==========================================
+@app.get("/api/inbox/file")
+async def get_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
+    user_id = user["user_id"]
+    filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
+    if not filepath.exists():
+        raise HTTPException(status_code=404)
+    content = filepath.read_text(encoding="utf-8").replace(DRAFT_TAG + "\n", "")
+    return {"content": content}
+
+
+@app.post("/api/inbox/reject")
+async def reject_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
+    user_id = user["user_id"]
+    filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if filepath.exists():
         filepath.unlink()
-        return {"status": "success"}
-    raise HTTPException(status_code=404)
+    return {"status": "success"}
 
 
 # ==========================================
-# 📖 9. 物理节点读取接口 (Concept Viewer)
+# 📊 9. 报告生成 (Stage 3)
 # ==========================================
-@app.get("/api/concept")
-async def get_concept(workspace: str, name: str):
-    """用于星图二次点击时，读取并展示具体的 MD 物理文件内容"""
-    if not workspace or not name:
-        return {"content": "参数错误：沙箱或节点名称丢失"}
+@app.post("/api/report")
+async def report_endpoint(request: ReportRequest, user=Depends(get_current_user)):
+    user_id = user["user_id"]
+    if not request.workspace:
+        raise HTTPException(status_code=400, detail="必须指定工作区")
 
-    from pathlib import Path
+    from workflows.report_flow import ReportFlow
+    rf = ReportFlow(user_id=user_id)
+    session_id = request.session_id or f"{user_id}:{request.workspace}:report"
 
-    # 拼装路径: data/wiki/沙箱名/concepts/节点名.md
-    file_path = Path(__file__).resolve().parent / "data" / "wiki" / workspace / "concepts" / f"{name}.md"
+    return StreamingResponse(
+        rf.generate(
+            topic=request.topic,
+            workspace=request.workspace,
+            outline=request.outline or "",
+            session_id=session_id,
+        ),
+        media_type="text/event-stream",
+    )
 
-    if file_path.exists():
-        try:
-            content = file_path.read_text(encoding="utf-8")
-            return {"content": content}
-        except Exception as e:
-            return {"content": f"文件读取异常: {str(e)}"}
-    else:
-        return {"content": "⚠️ 该概念仅作为图谱中的【黑洞引用】存在，尚未被大模型实例化生成物理文件。"}
+
+# ==========================================
+# 🌐 SPA 前端入口 (Vite 开发代理或静态文件)
+# ==========================================
+from starlette.responses import FileResponse, RedirectResponse
+from starlette.staticfiles import StaticFiles
+
+DIST_DIR = PROJECT_ROOT / "web" / "dist"
+
+if DIST_DIR.exists():
+    # 生产模式：挂载静态文件
+    app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="static_assets")
+
+    @app.get("/")
+    async def spa_index_prod():
+        return FileResponse(str(DIST_DIR / "index.html"))
+
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str):
+        """SPA 路由回退"""
+        file_path = DIST_DIR / full_path
+        if file_path.is_file():
+            return FileResponse(str(file_path))
+        return FileResponse(str(DIST_DIR / "index.html"))
+else:
+    @app.get("/")
+    async def spa_index_dev():
+        return RedirectResponse(url="http://localhost:3000")
+
 
 if __name__ == "__main__":
     import uvicorn
-
-    # 启动命令，热重载开启
-    uvicorn.run("app:app", host="127.0.0.1", port=8888, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8888)

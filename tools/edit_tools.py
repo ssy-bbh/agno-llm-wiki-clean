@@ -1,22 +1,49 @@
 """
-edit_tools.py — 局部精准编辑工具 (纯手写安全版)
+edit_tools.py — 局部精准编辑工具 (线程安全·用户隔离版)
 """
 import os
+import threading
 from pathlib import Path
+
 # 锁定操作根目录，绝对不准越界
 WIKI_ROOT = Path(__file__).parent.parent / "data" / "wiki"
 
-import os
-from pathlib import Path
+# ═══════════════════════════════════════════════════════
+# 🧵 线程安全上下文（替代 os.environ，解决并发竞态）
+# ═══════════════════════════════════════════════════════
+_ctx = threading.local()
+
+
+def set_context(user_id: str = "", kb_name: str = "default", sub_dir: str = "", doc_name: str = ""):
+    """设置当前线程的路由上下文（线程安全，不影响其他线程）"""
+    _ctx.user_id = user_id
+    _ctx.kb_name = kb_name
+    _ctx.sub_dir = sub_dir
+    _ctx.doc_name = doc_name
+
+
+def get_context() -> dict:
+    """获取当前线程的路由上下文"""
+    return {
+        "user_id": getattr(_ctx, "user_id", ""),
+        "kb_name": getattr(_ctx, "kb_name", "default"),
+        "sub_dir": getattr(_ctx, "sub_dir", ""),
+        "doc_name": getattr(_ctx, "doc_name", ""),
+    }
 
 
 def _resolve(file_name: str) -> Path:
-    """以父文件夹（分类）为中心的统筹路由"""
-    kb_name = os.environ.get("ACTIVE_KB", "default")
-    sub_dir = os.environ.get("ACTIVE_SUBDIR", "")
+    """以父文件夹（分类）为中心的统筹路由，支持用户级隔离"""
+    ctx = get_context()
+    kb_name = ctx["kb_name"]
+    sub_dir = ctx["sub_dir"]
+    user_id = ctx["user_id"]
 
-    # 1. 核心变化：只改这一行！利用 __file__ 获取当前工具文件所在位置，死死锁住项目的绝对根目录
-    base_dir = Path(__file__).resolve().parent.parent / "data" / "wiki" / kb_name / sub_dir
+    # 用户隔离：data/wiki/{user_id}/{kb_name}/{sub_dir}
+    if user_id:
+        base_dir = Path(__file__).resolve().parent.parent / "data" / "wiki" / user_id / kb_name / sub_dir
+    else:
+        base_dir = Path(__file__).resolve().parent.parent / "data" / "wiki" / kb_name / sub_dir
 
     # 2. 智能路由
     if Path(file_name).name.lower() == "index.md":

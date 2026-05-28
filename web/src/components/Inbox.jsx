@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
+import { useAuth } from '../contexts/AuthContext'
 
 export default function Inbox({ selectedSandbox }) {
+  const { apiFetch } = useAuth()
   const [items, setItems] = useState([])
   const [loading, setLoading] = useState(false)
   const [editingFile, setEditingFile] = useState(null)
@@ -9,7 +11,7 @@ export default function Inbox({ selectedSandbox }) {
   const fetchInbox = () => {
     if (!selectedSandbox) return
     setLoading(true)
-    fetch(`/api/inbox?workspace=${selectedSandbox}`)
+    apiFetch(`/api/inbox?workspace=${selectedSandbox}`)
       .then(res => res.json())
       .then(data => setItems(data))
       .catch(err => console.error("Inbox 扫描失败", err))
@@ -24,7 +26,7 @@ export default function Inbox({ selectedSandbox }) {
   }, [selectedSandbox])
 
   const handleApprove = (fileId) => {
-    fetch(`/api/inbox/approve?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'POST' })
+    apiFetch(`/api/inbox/approve?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'POST' })
       .then(res => res.json())
       .then(() => {
         window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE')) // 鸣枪刷新
@@ -32,7 +34,7 @@ export default function Inbox({ selectedSandbox }) {
   }
 
   const handleDelete = (fileId) => {
-    fetch(`/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'DELETE' })
+    apiFetch(`/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`, { method: 'DELETE' })
       .then(res => res.json())
       .then(() => {
         window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE')) // 鸣枪刷新
@@ -40,7 +42,7 @@ export default function Inbox({ selectedSandbox }) {
   }
 
   const handleEditClick = (fileId) => {
-    fetch(`/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`)
+    apiFetch(`/api/inbox/file?workspace=${selectedSandbox}&file_id=${fileId}`)
       .then(res => res.json())
       .then(data => setEditingFile({ id: fileId, content: data.content }))
   }
@@ -48,9 +50,8 @@ export default function Inbox({ selectedSandbox }) {
   const handleSaveEdit = () => {
     if (!editingFile) return
     setIsSaving(true)
-    fetch(`/api/inbox/file`, {
+    apiFetch(`/api/inbox/file`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         workspace: selectedSandbox,
         file_id: editingFile.id,

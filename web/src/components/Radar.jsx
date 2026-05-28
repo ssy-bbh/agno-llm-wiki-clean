@@ -1,13 +1,15 @@
 import { useState, useEffect } from 'react'
+import { useAuth } from '../contexts/AuthContext'
 
 export default function Radar({ selectedSandbox }) {
+  const { apiFetch } = useAuth()
   const [blackholes, setBlackholes] = useState([])
   const [loading, setLoading] = useState(false)
 
   const fetchRadar = () => {
     if (!selectedSandbox) return
     setLoading(true)
-    fetch(`/api/radar?workspace=${selectedSandbox}`)
+    apiFetch(`/api/radar?workspace=${selectedSandbox}`)
       .then(res => res.json())
       .then(data => setBlackholes(data))
       .catch(err => console.error("Radar 扫描失败", err))
@@ -15,14 +17,9 @@ export default function Radar({ selectedSandbox }) {
   }
 
   useEffect(() => {
-    // 1. 沙箱切换，初始嗅探
     fetchRadar()
-
-    // 2. 注册事件监听，听到物理变动广播就刷新
     const handleKbUpdate = () => fetchRadar()
     window.addEventListener('KB_PHYSICAL_UPDATE', handleKbUpdate)
-
-    // 3. 销毁时解绑
     return () => window.removeEventListener('KB_PHYSICAL_UPDATE', handleKbUpdate)
   }, [selectedSandbox])
 
@@ -42,7 +39,7 @@ export default function Radar({ selectedSandbox }) {
       ) : (
         <>
           {blackholes.map((hole, idx) => {
-            const isCritical = hole.urgency >= 60; // 5次及以上红温预警
+            const isCritical = hole.urgency >= 60;
             return (
               <div key={idx} className="space-y-1.5 group">
                 <div className="flex justify-between items-end">

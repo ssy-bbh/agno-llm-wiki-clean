@@ -1,79 +1,71 @@
 import { useState, useEffect } from 'react'
+import { useAuth } from '../contexts/AuthContext'
 
-export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandboxSelect }) {
+export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandboxSelect, onOpenSettings, onOpenSessions, onOpenAdmin }) {
+  const { user, logout, apiFetch } = useAuth()
   const [sandboxes, setSandboxes] = useState([])
 
-  // 💡 将获取沙箱列表的逻辑剥离出来，方便后续复用
   const fetchWorkspaces = () => {
-    fetch('/api/workspaces')
+    apiFetch('/api/workspaces')
       .then(res => res.json())
       .then(data => {
-        const formatted = data.map(name => ({
-          id: name,
-          name: name,
-          status: 'active'
-        }))
-        setSandboxes(formatted)
+        setSandboxes(data.map(name => ({ id: name, name: name, status: 'active' })))
       })
-      .catch(err => console.error("获取工作区失败:", err))
+      .catch(err => console.error("fetch workspaces error:", err))
   }
 
-  // 挂载时初始拉取
-  useEffect(() => {
-    fetchWorkspaces()
-  }, [])
+  useEffect(() => { fetchWorkspaces() }, [])
 
-  // 💡 新增：创建沙箱的物理指令
   const handleCreateSandbox = async () => {
-    const name = window.prompt("🗂️ 请输入新知识沙箱的名称：\n(建议使用英文或无特殊符号的中文，例如 'AI_Papers')")
+    const name = window.prompt("请输入新知识沙箱的名称：")
     if (!name || !name.trim()) return
-
     try {
-      const response = await fetch("/api/workspaces/create", {
+      const response = await apiFetch("/api/workspaces/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim() })
       })
-
-      if (!response.ok) {
-          const errorData = await response.text()
-          throw new Error(`[HTTP ${response.status}] 详情: ${errorData}`)
-      }
-
-      // 创建成功后立刻刷新左侧列表
+      if (!response.ok) throw new Error("create failed")
       fetchWorkspaces()
-      alert(`✅ 物理沙箱 [${name.trim()}] 开辟成功！请在列表中选中它以批量导入知识。`)
     } catch (err) {
-      alert("❌ 创建沙箱失败: " + err.message)
+      alert("创建失败: " + err.message)
     }
   }
 
   return (
     <aside className="w-[260px] min-w-[260px] h-screen bg-slate-950/80 border-r border-slate-700/60 flex flex-col relative scanline overflow-hidden">
-      {/* Scanline overlay */}
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-transparent via-cyan-500/[0.02] to-transparent h-8 animate-scan" />
 
-      {/* Logo */}
       <div className="px-5 py-5 border-b border-slate-700/60">
-        <div className="flex items-center gap-2">
-          <span className="text-2xl">🧠</span>
-          <h1 className="text-lg font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent tracking-wide">
-            LLM-Wiki OS
-          </h1>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-2xl">🧠</span>
+            <div>
+              <h1 className="text-lg font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent tracking-wide">
+                LLM-Wiki OS
+              </h1>
+              <p className="text-[10px] text-slate-500 font-mono tracking-widest uppercase">Knowledge Graph Engine</p>
+            </div>
+          </div>
+          <button onClick={logout} className="text-slate-600 hover:text-red-400 transition-colors text-xs" title="退出登录">🚪</button>
         </div>
-        <p className="text-[10px] text-slate-500 mt-1 font-mono tracking-widest uppercase">Knowledge Graph Engine</p>
+        {user && (
+          <div className="mt-2 flex items-center gap-2">
+            <div className="w-6 h-6 rounded-full bg-gradient-to-br from-emerald-500 to-cyan-500 flex items-center justify-center text-[10px] font-bold text-white">
+              {(user.username || '?')[0].toUpperCase()}
+            </div>
+            <span className="text-[11px] text-slate-400 truncate">{user.username}</span>
+          </div>
+        )}
       </div>
 
-      {/* Mode Toggle */}
       <div className="px-4 py-4 border-b border-slate-700/60">
         <p className="text-[10px] text-slate-500 uppercase tracking-widest mb-2 font-semibold">运行模式</p>
-        <div className="flex rounded-lg bg-slate-800/60 p-1 border border-slate-700/40">
+        <div className="flex rounded-lg bg-slate-800/60 p-1 border border-slate-700/40 gap-1">
           <button
             onClick={() => onModeChange('query')}
             className={`flex-1 py-1.5 px-2 text-xs rounded-md transition-all duration-200 font-medium ${
-              mode === 'query'
-                ? 'bg-emerald-500/20 text-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.3)]'
-                : 'text-slate-400 hover:text-slate-300'
+              mode === 'query' ? 'bg-emerald-500/20 text-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.3)]' : 'text-slate-400 hover:text-slate-300'
             }`}
           >
             🗣️ 探求
@@ -81,22 +73,26 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
           <button
             onClick={() => onModeChange('forge')}
             className={`flex-1 py-1.5 px-2 text-xs rounded-md transition-all duration-200 font-medium ${
-              mode === 'forge'
-                ? 'bg-cyan-500/20 text-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.3)]'
-                : 'text-slate-400 hover:text-slate-300'
+              mode === 'forge' ? 'bg-cyan-500/20 text-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.3)]' : 'text-slate-400 hover:text-slate-300'
             }`}
           >
             🕸️ 织网
           </button>
+          <button
+            onClick={() => onModeChange('report')}
+            className={`flex-1 py-1.5 px-2 text-xs rounded-md transition-all duration-200 font-medium ${
+              mode === 'report' ? 'bg-purple-500/20 text-purple-400 shadow-[0_0_8px_rgba(168,85,247,0.3)]' : 'text-slate-400 hover:text-slate-300'
+            }`}
+          >
+            📊 报告
+          </button>
         </div>
       </div>
 
-      {/* Workspace Radar */}
       <div className="flex-1 px-4 py-4 overflow-hidden">
         <div className="flex items-center justify-between mb-3">
           <p className="text-[10px] text-slate-500 uppercase tracking-widest font-semibold flex items-center gap-2">
             工作区沙箱
-            {/* 💡 新建沙箱按钮 */}
             <button
               onClick={handleCreateSandbox}
               className="text-cyan-400 hover:text-cyan-300 bg-slate-800 hover:bg-slate-700 px-1.5 py-0.5 rounded transition-colors text-[9px] border border-slate-600/50"
@@ -132,16 +128,28 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
         </div>
       </div>
 
-      {/* Footer */}
       <div className="px-4 py-3 border-t border-slate-700/60">
         <div className="flex items-center gap-2">
           <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-          <span className="text-[10px] text-slate-500 font-mono">v0.1.0 · Online</span>
+          <span className="text-[10px] text-slate-500 font-mono">v0.2.0 · Online</span>
         </div>
-
-        <div className="mt-3 pt-3 border-t border-slate-800/60 flex items-center gap-2 text-slate-500 hover:text-slate-300 transition-colors cursor-pointer group text-xs">
-          <span className="text-sm group-hover:rotate-45 transition-transform duration-300">⚙️</span>
-          <span className="font-mono tracking-wider uppercase">SysConfig</span>
+        <div className="mt-3 pt-3 border-t border-slate-800/60 flex items-center gap-3">
+          {onOpenAdmin && (
+            <button onClick={onOpenAdmin} className="flex items-center gap-2 text-amber-500/70 hover:text-amber-400 transition-colors text-xs">
+              <span className="text-sm">🔍</span>
+              <span className="font-mono tracking-wider uppercase">Monitor</span>
+            </button>
+          )}
+          <button onClick={onOpenSettings} className="flex items-center gap-2 text-slate-500 hover:text-slate-300 transition-colors text-xs">
+            <span className="text-sm hover:rotate-45 transition-transform duration-300">⚙️</span>
+            <span className="font-mono tracking-wider uppercase">Settings</span>
+          </button>
+          {selectedSandbox && (
+            <button onClick={onOpenSessions} className="flex items-center gap-2 text-slate-500 hover:text-slate-300 transition-colors text-xs">
+              <span className="text-sm">📜</span>
+              <span className="font-mono tracking-wider uppercase">History</span>
+            </button>
+          )}
         </div>
       </div>
     </aside>

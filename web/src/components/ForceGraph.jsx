@@ -1,8 +1,10 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
 import ForceGraph2D from 'react-force-graph-2d'
 import ReactMarkdown from 'react-markdown'
+import { useAuth } from '../contexts/AuthContext'
 
 export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode }) {
+  const { apiFetch } = useAuth()
   const fgRef = useRef()
   const [graphData, setGraphData] = useState({ nodes: [], links: [] })
 
@@ -22,7 +24,7 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
       return
     }
 
-    fetch(`/api/graph?workspace=${selectedSandbox}`)
+    apiFetch(`/api/graph?workspace=${selectedSandbox}`)
       .then(res => res.json())
       .then(data => {
         const validNodeIds = new Set(data.nodes.map(n => n.id))
@@ -74,7 +76,7 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
       setModalOpen(true)
       setIsLoadingMd(true)
       // 使用 encodeURIComponent 确保中文路径不乱码
-      fetch(`/api/concept?workspace=${selectedSandbox}&name=${encodeURIComponent(node.id)}`)
+      apiFetch(`/api/concept?workspace=${selectedSandbox}&name=${encodeURIComponent(node.id)}`)
         .then(res => res.json())
         .then(data => setMdContent(data.content))
         .catch(() => setMdContent('❌ 无法读取物理文件，可能遭遇断链。'))

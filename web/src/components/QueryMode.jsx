@@ -1,17 +1,118 @@
 import { useState, useEffect, useRef } from 'react'
-import { marked } from 'marked' // 💡 换成更健壮、对流式输出极度宽容的 marked 引擎
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
+import 'katex/dist/katex.min.css'
+import { useAuth } from '../contexts/AuthContext'
 
-export default function QueryMode({ selectedSandbox }) {
+// react-markdown 插件列表
+const remarkPlugins = [remarkGfm, remarkMath]
+const rehypePlugins = [rehypeKatex]
+
+// 自定义渲染组件
+const mdComponents = {
+  a: ({ href, children, ...props }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+      {children}
+    </a>
+  ),
+  img: ({ src, alt, ...props }) => (
+    <img
+      src={src}
+      alt={alt || ''}
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      className="max-w-full h-auto rounded-lg my-2 border border-slate-700/50 shadow-sm"
+      {...props}
+    />
+  ),
+  table: ({ children, ...props }) => (
+    <div className="overflow-x-auto my-3">
+      <table className="min-w-full text-sm border-collapse" {...props}>{children}</table>
+    </div>
+  ),
+  th: ({ children, ...props }) => (
+    <th className="border border-slate-600 bg-slate-800/60 px-3 py-1.5 text-left text-slate-300 font-semibold" {...props}>{children}</th>
+  ),
+  td: ({ children, ...props }) => (
+    <td className="border border-slate-700/50 px-3 py-1.5 text-slate-300" {...props}>{children}</td>
+  ),
+  code: ({ className, children, ...props }) => {
+    const isBlock = className?.startsWith('language-')
+    if (isBlock) {
+      return (
+        <pre className="bg-slate-900 border border-slate-700 rounded-lg p-3 overflow-x-auto my-2">
+          <code className={className} {...props}>{children}</code>
+        </pre>
+      )
+    }
+    return (
+      <code className="bg-slate-700/40 px-1.5 py-0.5 rounded text-emerald-300 text-xs" {...props}>{children}</code>
+    )
+  }
+}
+
+export default function QueryMode({ selectedSandbox, sessionId }) {
+  const { apiFetch } = useAuth()
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState([])
   const [isTyping, setIsTyping] = useState(false)
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false)
   const messagesEndRef = useRef(null)
+  const prevSessionIdRef = useRef(null)
 
-  // 💡 核心会话隔离：一旦在左侧边栏切换了沙箱隔离区，强制重置当前对话，防止记忆跨库交叉污染
+  // 💡 核心会话隔离：切换沙箱时重置对话（但跳过因加载历史会话触发的重渲染）
   useEffect(() => {
+    // 如果正在加载历史，不要清空消息
+    if (isLoadingHistory) return
+    // 如果 sessionId 刚变化（正在切换会话），也不要清空
+    if (prevSessionIdRef.current !== sessionId) return
     setMessages([])
     setInput('')
   }, [selectedSandbox])
+
+  // 📥 加载历史会话消息
+  useEffect(() => {
+    if (!sessionId) {
+      prevSessionIdRef.current = null
+      return
+    }
+    // 同一个 sessionId 不重复加载
+    if (prevSessionIdRef.current === sessionId) return
+    prevSessionIdRef.current = sessionId
+
+    let cancelled = false
+    setIsLoadingHistory(true)
+
+    const loadHistory = async () => {
+      try {
+        const res = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`)
+        if (cancelled) return
+        if (!res.ok) {
+          setMessages([])
+          return
+        }
+        const data = await res.json()
+        if (cancelled) return
+        const loaded = (data.messages || []).map(m => ({
+          role: m.role,
+          content: m.content,
+          logs: []
+        }))
+        setMessages(loaded)
+      } catch (e) {
+        if (!cancelled) {
+          console.error('load session history error:', e)
+          setMessages([])
+        }
+      } finally {
+        if (!cancelled) setIsLoadingHistory(false)
+      }
+    }
+    loadHistory()
+    return () => { cancelled = true }
+  }, [sessionId])
 
   // 自动平滑滚动到最新消息
   useEffect(() => {
@@ -38,9 +139,8 @@ export default function QueryMode({ selectedSandbox }) {
 
     try {
       // 🚀 双端连接：将问题、当前隔离区沙箱标识、历史上下文捆绑发往后端
-      const response = await fetch('/api/chat', {
+      const response = await apiFetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query: currentInput,
           workspace: selectedSandbox || "",
@@ -135,7 +235,12 @@ export default function QueryMode({ selectedSandbox }) {
 
       {/* 消息历史画布 */}
       <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 scrollbar-thin pt-16">
-        {messages.length === 0 ? (
+        {isLoadingHistory ? (
+          <div className="h-full flex flex-col items-center justify-center text-slate-500 font-mono space-y-3">
+            <div className="w-8 h-8 border-2 border-cyan-500/30 border-t-cyan-400 rounded-full animate-spin" />
+            <p className="text-sm animate-pulse">正在加载会话记录...</p>
+          </div>
+        ) : messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-slate-500 font-mono space-y-2">
             <span className="text-3xl animate-bounce">🗣️</span>
             <p className="text-sm">知识库探求中心已就绪，请输入你的提问...</p>
@@ -162,13 +267,15 @@ export default function QueryMode({ selectedSandbox }) {
                   {/* 回答正文气泡 */}
                   {msg.content && (
                     <div className="bg-slate-800/40 border border-slate-800/60 rounded-2xl px-5 py-4 text-slate-200 text-sm shadow-sm leading-relaxed">
-                      {/* 💡 核心修复：使用 marked 渲染流式文本，配合 Tailwind 自动格式化图片和链接 */}
-                      <div
-                        className="prose prose-invert max-w-none prose-sm prose-pre:bg-slate-900 prose-pre:border prose-pre:border-slate-700 prose-img:max-w-full prose-img:h-auto prose-img:rounded-lg prose-img:my-2 prose-img:border prose-img:border-slate-700/50 prose-img:shadow-sm prose-a:text-cyan-400 hover:prose-a:text-cyan-300 prose-a:underline"
-                        dangerouslySetInnerHTML={{
-                          __html: marked.parse(msg.content || '')
-                        }}
-                      />
+                      <div className="prose prose-invert max-w-none prose-sm prose-a:text-cyan-400 hover:prose-a:text-cyan-300">
+                        <ReactMarkdown
+                          remarkPlugins={remarkPlugins}
+                          rehypePlugins={rehypePlugins}
+                          components={mdComponents}
+                        >
+                          {msg.content}
+                        </ReactMarkdown>
+                      </div>
                     </div>
                   )}
                 </div>

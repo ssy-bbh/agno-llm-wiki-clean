@@ -1,6 +1,8 @@
 import { useState, useCallback } from 'react'
+import { useAuth } from '../contexts/AuthContext'
 
 export default function CyberForge({ selectedSandbox, setForgeLogs }) {
+  const { apiFetch } = useAuth()
   const [dragOver, setDragOver] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [progress, setProgress] = useState(0)
@@ -30,7 +32,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
 
     try {
       setProgress(40)
-      const response = await fetch("/api/upload", {
+      const response = await apiFetch("/api/upload", {
         method: "POST",
         body: formData
       })
@@ -63,9 +65,8 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     setForgeLogs(prev => [...prev, { text: `🔥 [熔炉点火] 正在建立与后端织网任务 [${actionType}] 的数据链...` }])
 
     try {
-      const response = await fetch('/api/forge', {
+      const response = await apiFetch('/api/forge', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: actionType, workspace: selectedSandbox })
       })
 
