@@ -39,6 +39,7 @@ from workflows.query_flow import QueryFlow
 from workflows.lint_flow import LintFlow
 from workflows.autofill_flow import AutoFillFlow
 from workflows.ingest_flow import IngestFlow
+from core.task_log import task_log, TaskOutputCapture
 
 
 # ==========================================
@@ -550,6 +551,58 @@ async def admin_server_status(admin=Depends(get_admin_user)):
     return info
 
 
+# ==========================================
+# 📋 任务日志 (Task Logs)
+# ==========================================
+@app.get("/api/admin/task-logs")
+async def admin_list_task_logs(admin=Depends(get_admin_user)):
+    """列出所有有任务日志的 user:workspace 组合"""
+    return task_log.list_keys()
+
+
+@app.get("/api/admin/task-logs/{user_id}/{workspace}")
+async def admin_get_task_logs(user_id: str, workspace: str, limit: int = 500, since: float = 0, admin=Depends(get_admin_user)):
+    """获取指定 user:workspace 的任务日志"""
+    logs = task_log.get_logs(user_id=user_id, workspace=workspace, limit=limit, since=since)
+    return {"user_id": user_id, "workspace": workspace, "logs": logs, "total": len(logs)}
+
+
+@app.get("/api/admin/task-logs/{user_id}/{workspace}/stream")
+async def admin_stream_task_logs(user_id: str, workspace: str, request: Request, admin=Depends(get_admin_user)):
+    """SSE 实时推送任务日志"""
+    import asyncio
+
+    async def stream():
+        last_ts = 0
+        # 先发送历史日志
+        history = task_log.get_logs(user_id=user_id, workspace=workspace, limit=200)
+        for entry in history:
+            yield f"data: {json.dumps(entry)}\n\n"
+            last_ts = max(last_ts, entry.get("timestamp", 0))
+        yield f"data: {json.dumps({'time': '', 'message': '── 历史日志结束，以下为实时推送 ──', 'level': 'info'})}\n\n"
+
+        # 实时轮询新日志
+        while True:
+            if await request.is_disconnected():
+                break
+            new_logs = task_log.get_logs(user_id=user_id, workspace=workspace, limit=50, since=last_ts)
+            for entry in new_logs:
+                ts = entry.get("timestamp", 0)
+                if ts > last_ts:
+                    yield f"data: {json.dumps(entry)}\n\n"
+                    last_ts = ts
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.delete("/api/admin/task-logs/{user_id}/{workspace}")
+async def admin_clear_task_logs(user_id: str, workspace: str, admin=Depends(get_admin_user)):
+    """清除指定 user:workspace 的任务日志"""
+    task_log.clear(user_id=user_id, workspace=workspace)
+    return {"status": "cleared"}
+
+
 @app.get("/api/admin/sessions/{session_id}/messages")
 async def admin_get_session_messages(session_id: str, admin=Depends(get_admin_user)):
     """管理员查看任意用户的会话消息"""
@@ -936,17 +989,34 @@ async def forge_endpoint(request: ForgeRequest, user=Depends(get_current_user)):
     user_id = user["user_id"]
 
     async def run_forge_task():
+        action_name = "织网" if request.action == "reweave" else "填补黑洞" if request.action == "fill_blackhole" else request.action
+        task_log.append(user_id, request.workspace, f"🔥 [锻造炉] 启动: {action_name}", "info")
         try:
             if request.action == "reweave":
                 async for log in lint_flow.stream_run(request.workspace, user_id=user_id):
+                    # 同时写入任务日志
+                    try:
+                        data = json.loads(log.replace("data: ", "").strip())
+                        if data.get("type") == "log":
+                            task_log.append(user_id, request.workspace, data["content"])
+                    except Exception:
+                        pass
                     yield log
             elif request.action == "fill_blackhole":
                 async for log in autofill_flow.stream_run(request.workspace, user_id=user_id):
+                    try:
+                        data = json.loads(log.replace("data: ", "").strip())
+                        if data.get("type") == "log":
+                            task_log.append(user_id, request.workspace, data["content"])
+                    except Exception:
+                        pass
                     yield log
             else:
                 yield f"data: {json.dumps({'type': 'log', 'content': '❌ 未知的织网指令。'})}\n\n"
         except Exception as e:
+            task_log.append(user_id, request.workspace, f"💥 熔炉崩溃: {str(e)}", "error")
             yield f"data: {json.dumps({'type': 'log', 'content': f'💥 熔炉崩溃: {str(e)}'})}\n\n"
+        task_log.append(user_id, request.workspace, f"✅ [锻造炉] {action_name} 完成", "success")
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(run_forge_task(), media_type="text/event-stream")
@@ -1011,16 +1081,18 @@ async def upload_batch_endpoint(
             file_path.write_bytes(contents)
             saved_paths.append(file_path)
 
-        # 后台线程：用参数传递代替 os.environ 污染
+        # 后台线程：用参数传递代替 os.environ 污染，输出捕获到任务日志
         def run_background_batch():
-            flow = IngestFlow()
-            for fp in saved_paths:
-                print(f"\n🚀 [{user_id}] 提取: {fp.name} -> {workspace}")
-                try:
-                    flow.run(str(fp), kb_name=workspace, user_id=user_id)
-                except Exception as e:
-                    print(f"❌ 提取 {fp.name} 失败: {e}")
-            print(f"\n✅ [{user_id}] 批量提炼完成！")
+            with TaskOutputCapture(user_id=user_id, workspace=workspace):
+                task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {len(saved_paths)} 个文件", "info")
+                flow = IngestFlow()
+                for fp in saved_paths:
+                    print(f"\n🚀 [{user_id}] 提取: {fp.name} -> {workspace}")
+                    try:
+                        flow.run(str(fp), kb_name=workspace, user_id=user_id)
+                    except Exception as e:
+                        print(f"❌ 提取 {fp.name} 失败: {e}")
+                task_log.append(user_id, workspace, f"✅ [{user_id}] 批量提炼完成！共处理 {len(saved_paths)} 个文件", "success")
 
         threading.Thread(target=run_background_batch, daemon=True).start()
 
