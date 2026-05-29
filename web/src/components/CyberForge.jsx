@@ -56,6 +56,8 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
 
   const sseRef = useRef(null)
   const timerRef = useRef(null)
+  // Prevent poll from overwriting optimistic 'ingesting' before backend thread writes status file
+  const optimisticUntilRef = useRef(0)
 
   // ── Poll status (includes structured progress) ──
   useEffect(() => {
@@ -67,6 +69,8 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         const res = await apiFetch(`/api/task-logs/${encodeURIComponent(selectedSandbox)}/status`)
         if (!alive) return
         const data = await res.json()
+        // Don't let server 'idle' overwrite optimistic 'ingesting' within 10s after upload
+        if (data.status === 'idle' && Date.now() < optimisticUntilRef.current) return
         setIngestStatus(data.status)
         if (data.progress) {
           setProgress(data.progress)
@@ -173,8 +177,10 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
 
       setUploadProgress(100)
       setForgeLogs(prev => [...prev, { text: `✅ 文件已落盘，AI 提炼引擎已启动` }])
+      // Optimistic: show progress card immediately, protect from poll for 10s
       setIngestStatus('ingesting')
       setElapsed(0)
+      optimisticUntilRef.current = Date.now() + 10000
     } catch (err) {
       setForgeLogs(prev => [...prev, { text: `❌ 上传失败: ${err.message}` }])
     } finally {
