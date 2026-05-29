@@ -82,7 +82,10 @@ def get_model_for_user(user_id: Optional[str] = None, provider: str = "") -> Ope
                     model_id=user_config.get("model_id", ""),
                 )
 
-    # 回退到系统默认
+        # 用户没有任何 API Key → 抛错，由 llm_factory 决定是否回退
+        raise ValueError(f"用户 {user_id} 未配置任何 API Key")
+
+    # 无 user_id 时才回退到系统默认
     return get_default_model()
 
 

@@ -198,6 +198,17 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
                   }
                   return newMsgs
                 })
+              } else if (data.type === 'error') {
+                setMessages(prev => {
+                  const newMsgs = [...prev]
+                  const lastIdx = newMsgs.length - 1
+                  newMsgs[lastIdx] = {
+                    ...newMsgs[lastIdx],
+                    content: data.content,
+                    isError: true
+                  }
+                  return newMsgs
+                })
               }
             } catch (err) {
               console.warn("解析 SSE 数据包失败:", dataStr, err)
@@ -266,7 +277,11 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
 
                   {/* 回答正文气泡 */}
                   {msg.content && (
-                    <div className="bg-slate-800/40 border border-slate-800/60 rounded-2xl px-5 py-4 text-slate-200 text-sm shadow-sm leading-relaxed">
+                    <div className={`rounded-2xl px-5 py-4 text-sm shadow-sm leading-relaxed ${
+                      msg.isError
+                        ? 'bg-red-500/10 border border-red-500/30 text-red-200'
+                        : 'bg-slate-800/40 border border-slate-800/60 text-slate-200'
+                    }`}>
                       <div className="prose prose-invert max-w-none prose-sm prose-a:text-cyan-400 hover:prose-a:text-cyan-300">
                         <ReactMarkdown
                           remarkPlugins={remarkPlugins}

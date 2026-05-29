@@ -1,17 +1,101 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 
 export default function CyberForge({ selectedSandbox, setForgeLogs }) {
-  const { apiFetch } = useAuth()
+  const { apiFetch, token } = useAuth()
   const [dragOver, setDragOver] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [progress, setProgress] = useState(0)
   const [isForging, setIsForging] = useState(false)
+  const [ingestStatus, setIngestStatus] = useState('idle') // idle | ingesting
+  const [ingestFileCount, setIngestFileCount] = useState(0)
+  const [elapsed, setElapsed] = useState(0)
+  const sseRef = useRef(null)
+  const timerRef = useRef(null)
 
-  // 💡 升级为支持数组的批量上传函数
+  // ── 轮询摄入状态 ──
+  useEffect(() => {
+    if (!selectedSandbox) return
+    let alive = true
+
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`/api/task-logs/${encodeURIComponent(selectedSandbox)}/status`)
+        if (!alive) return
+        const data = await res.json()
+        setIngestStatus(data.status)
+        setIngestFileCount(data.files || 0)
+        if (data.status === 'ingesting' && data.started) {
+          setElapsed(Math.floor(Date.now() / 1000 - data.started))
+        } else {
+          setElapsed(0)
+        }
+      } catch {}
+    }
+
+    poll()
+    const iv = setInterval(poll, 2000)
+    return () => { alive = false; clearInterval(iv) }
+  }, [selectedSandbox])
+
+  // ── 计时器（摄入中时每秒更新） ──
+  useEffect(() => {
+    if (ingestStatus !== 'ingesting') {
+      if (timerRef.current) clearInterval(timerRef.current)
+      return
+    }
+    timerRef.current = setInterval(() => setElapsed(e => e + 1), 1000)
+    return () => clearInterval(timerRef.current)
+  }, [ingestStatus])
+
+  // ── SSE 订阅实时日志 ──
+  useEffect(() => {
+    if (!selectedSandbox || !token) return
+
+    // 关闭旧连接
+    if (sseRef.current) {
+      sseRef.current.close()
+      sseRef.current = null
+    }
+
+    const url = `/api/task-logs/${encodeURIComponent(selectedSandbox)}/stream?token=${token}`
+    const fullUrl = url.startsWith('http') ? url : `${window.location.origin}${url}`
+    const es = new EventSource(fullUrl)
+    sseRef.current = es
+
+    es.onmessage = (e) => {
+      try {
+        const entry = JSON.parse(e.data)
+        if (entry.message && entry.message !== '── 实时推送中 ──') {
+          const level = entry.level || 'info'
+          const prefix = level === 'success' ? '✅' : level === 'error' ? '❌' : level === 'warning' ? '⚠️' : ''
+          setForgeLogs(prev => [...prev, {
+            text: `${entry.time ? `[${entry.time}] ` : ''}${prefix}${entry.message}`,
+            level,
+          }])
+
+          // 提炼完成时通知图谱刷新
+          if (entry.message.includes('提炼完成') || entry.message.includes('全部完成')) {
+            window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE'))
+          }
+        }
+      } catch {}
+    }
+
+    es.onerror = () => {
+      // EventSource auto-reconnects
+    }
+
+    return () => {
+      es.close()
+      sseRef.current = null
+    }
+  }, [selectedSandbox, token])
+
+  // ── 上传文件 ──
   const uploadFiles = async (files) => {
     if (!selectedSandbox) {
-      setForgeLogs(prev => [...prev, { text: "❌ 物理摄入失败：请先在左侧选择或新建一个目标沙箱！" }])
+      setForgeLogs(prev => [...prev, { text: "❌ 请先在左侧选择或新建一个目标沙箱！" }])
       return
     }
 
@@ -20,15 +104,11 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
 
     setUploading(true)
     setProgress(10)
-    setForgeLogs(prev => [...prev, { text: `📥 [批量摄入流] 收到 ${fileArray.length} 个实体文件，正在注入沙箱 [${selectedSandbox}]...` }])
+    setForgeLogs(prev => [...prev, { text: `📥 收到 ${fileArray.length} 个文件，正在上传至 [${selectedSandbox}]...` }])
 
     const formData = new FormData()
     formData.append("workspace", selectedSandbox)
-
-    // 💡 核心：把多个文件都挂载到 "files" 这个键名下
-    fileArray.forEach(file => {
-      formData.append("files", file)
-    })
+    fileArray.forEach(file => formData.append("files", file))
 
     try {
       setProgress(40)
@@ -37,14 +117,16 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         body: formData
       })
 
-      if (!response.ok) throw new Error(`落盘响应异常: ${response.status}`)
+      if (!response.ok) throw new Error(`上传异常: ${response.status}`)
 
       setProgress(100)
-      setForgeLogs(prev => [...prev, { text: `✅ [落盘成功] ${fileArray.length} 份原始语料已物理归档至 data/raw/${selectedSandbox}/ 目录下。` }])
-      setForgeLogs(prev => [...prev, { text: `🔥 [熔炉点火] 后台已自动开启排队队列，大模型正逐个进行降维提取...` }])
-      setForgeLogs(prev => [...prev, { text: `⏳ (可前往后端终端查看提炼进度，全部完成后刷新沙箱即可)` }])
+      setForgeLogs(prev => [...prev, { text: `✅ 文件已落盘，AI 提炼引擎已启动` }])
+      setForgeLogs(prev => [...prev, { text: `⏳ 提炼过程在后台运行，下方会实时显示进度。提炼完成后图谱会自动刷新。` }])
+      setIngestStatus('ingesting')
+      setIngestFileCount(fileArray.length)
+      setElapsed(0)
     } catch (err) {
-      setForgeLogs(prev => [...prev, { text: `❌ [物理阻断] 摄入流强制切断: ${err.message}` }])
+      setForgeLogs(prev => [...prev, { text: `❌ 上传失败: ${err.message}` }])
     } finally {
       setTimeout(() => {
         setUploading(false)
@@ -53,16 +135,16 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     }
   }
 
-  // 💡 真实联动后端流式清洗脚本的动作引擎
+  // ── 织网操作 ──
   const handleForgeAction = async (actionType) => {
     if (isForging) return
     if (!selectedSandbox) {
-      setForgeLogs(prev => [...prev, { text: "❌ 熔炉死锁：必须在左侧指定具体的隔离沙箱环境才能清洗拓扑！" }])
+      setForgeLogs(prev => [...prev, { text: "❌ 请先在左侧选择目标沙箱！" }])
       return
     }
 
     setIsForging(true)
-    setForgeLogs(prev => [...prev, { text: `🔥 [熔炉点火] 正在建立与后端织网任务 [${actionType}] 的数据链...` }])
+    setForgeLogs(prev => [...prev, { text: `🔥 正在执行 [${actionType}]...` }])
 
     try {
       const response = await apiFetch('/api/forge', {
@@ -70,7 +152,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         body: JSON.stringify({ action: actionType, workspace: selectedSandbox })
       })
 
-      if (!response.ok) throw new Error(`后端网关无响应: ${response.status}`)
+      if (!response.ok) throw new Error(`后端无响应: ${response.status}`)
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
@@ -91,31 +173,54 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
               if (data.type === 'log') {
                 setForgeLogs(prev => [...prev, { text: data.content }])
               }
-            } catch (err) {}
+            } catch {}
           }
         }
         if (done) break
       }
 
-      // 🚀🚀🚀 核心改动：流式任务结束，朝天鸣枪，通知 Radar 和 Inbox 立刻刷新！ 🚀🚀🚀
       window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE'))
 
     } catch (err) {
-      setForgeLogs(prev => [...prev, { text: `💥 熔炉异常断开: ${err.message}` }])
+      setForgeLogs(prev => [...prev, { text: `💥 操作失败: ${err.message}` }])
     } finally {
       setIsForging(false)
     }
   }
 
-  // 触发点击文件框批量上传
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files.length > 0) {
       uploadFiles(e.target.files)
     }
   }
 
+  const formatTime = (s) => {
+    if (s < 60) return `${s}s`
+    return `${Math.floor(s / 60)}m ${s % 60}s`
+  }
+
   return (
     <div className="p-2 space-y-4">
+      {/* ── 提炼状态横幅 ── */}
+      {ingestStatus === 'ingesting' && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 animate-pulse">
+          <div className="flex items-center gap-2">
+            <span className="text-lg">⚡</span>
+            <div className="flex-1">
+              <div className="text-xs font-bold text-amber-400">AI 正在提炼中...</div>
+              <div className="text-[10px] text-amber-300/70 font-mono">
+                {ingestFileCount} 个文件 · 已耗时 {formatTime(elapsed)} · 可正常使用其他功能
+              </div>
+            </div>
+            <div className="flex gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style={{animationDelay: '0ms'}} />
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style={{animationDelay: '150ms'}} />
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style={{animationDelay: '300ms'}} />
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Upload Zone */}
       <div
         onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
@@ -124,7 +229,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
           e.preventDefault();
           setDragOver(false);
           if(e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-            uploadFiles(e.dataTransfer.files) // 💡 传入整个文件集合，支持批量拖拽
+            uploadFiles(e.dataTransfer.files)
           }
         }}
         onClick={() => document.getElementById('forge-file-picker').click()}
@@ -138,7 +243,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
           type="file"
           id="forge-file-picker"
           className="hidden"
-          multiple // 💡 开启多选能力
+          multiple
           onChange={handleFileChange}
           accept=".md,.txt,.pdf"
         />
@@ -187,15 +292,17 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         </button>
       </div>
 
-      {/* Real Real-time Status */}
+      {/* Status */}
       <div className="bg-slate-950/60 border border-slate-900 rounded-lg p-2.5 font-mono text-[10px] space-y-1 text-slate-400">
         <div className="flex items-center justify-between">
-          <span className="text-slate-500">沙箱锚定坐标:</span>
+          <span className="text-slate-500">沙箱:</span>
           <span className="text-cyan-400">{selectedSandbox ? `[${selectedSandbox}]` : "未选定"}</span>
         </div>
         <div className="flex items-center justify-between">
-          <span className="text-slate-500">落盘物理仓位:</span>
-          <span className="text-slate-400">data/raw/.../</span>
+          <span className="text-slate-500">提炼引擎:</span>
+          <span className={ingestStatus === 'ingesting' ? 'text-amber-400 animate-pulse' : 'text-emerald-400'}>
+            {ingestStatus === 'ingesting' ? `⚡ 运行中 (${formatTime(elapsed)})` : '✅ 空闲'}
+          </span>
         </div>
       </div>
     </div>

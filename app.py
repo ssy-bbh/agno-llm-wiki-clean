@@ -32,7 +32,9 @@ from core.auth import (
     register_user, login_user,
     get_current_user, get_optional_user, get_admin_user,
     save_user_api_key, get_user_api_keys,
+    decode_token,
 )
+from core.llm_factory import set_user_context
 from core.model_router import get_model_for_user, get_default_model, list_providers
 
 from workflows.query_flow import QueryFlow
@@ -66,6 +68,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _set_user_context_middleware(request: Request, call_next):
+    """从 JWT 提取 user_id + role 写入 threading.local，让 llm_factory 自动选模型"""
+    user_id = ""
+    role = "user"
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        try:
+            payload = decode_token(token)
+            user_id = payload.get("sub", "")
+            role = payload.get("role", "user")
+        except Exception:
+            pass
+    # SSE 端点用 query param 传 token
+    if not user_id:
+        token = request.query_params.get("token", "")
+        if token:
+            try:
+                payload = decode_token(token)
+                user_id = payload.get("sub", "")
+                role = payload.get("role", "user")
+            except Exception:
+                pass
+    set_user_context(user_id, role=role)
+    response = await call_next(request)
+    return response
 
 
 # ==========================================
@@ -276,12 +307,14 @@ async def api_list_providers(user=Depends(get_current_user)):
 
 @app.post("/api/settings/api-key")
 async def api_save_key(req: ApiKeySaveRequest, user=Depends(get_current_user)):
-    """保存用户 API Key"""
+    """保存用户 API Key（保存后自动清除 QueryFlow 缓存以切换模型）"""
     if not req.api_key or len(req.api_key) < 8:
         raise HTTPException(status_code=400, detail="API Key 太短")
     ok = save_user_api_key(user["user_id"], req.provider, req.api_key, req.base_url, req.model_id)
     if not ok:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 清除该用户的 QueryFlow 缓存，下次请求会用新模型重建
+    _query_flow_cache.pop(user["user_id"], None)
     return {"status": "success", "provider": req.provider}
 
 
@@ -614,6 +647,52 @@ async def admin_clear_task_logs(user_id: str, workspace: str, admin=Depends(get_
     return {"status": "cleared"}
 
 
+# ── 用户级任务日志（非管理员，只看自己的） ──
+_active_ingests = {}  # key: "user_id:workspace" -> {"status": "ingesting"|"idle", "files": int, "started": float}
+_active_ingests_lock = threading.Lock()
+
+
+@app.get("/api/task-logs/{workspace}/stream")
+async def user_stream_task_logs(workspace: str, request: Request, user=Depends(get_current_user)):
+    """用户级 SSE：实时推送当前 workspace 的任务日志"""
+    import asyncio
+    user_id = user["user_id"]
+
+    async def stream():
+        last_ts = 0
+        # 先发历史
+        history = task_log.get_logs(user_id=user_id, workspace=workspace, limit=200)
+        for entry in history:
+            yield f"data: {json.dumps(entry)}\n\n"
+            last_ts = max(last_ts, entry.get("timestamp", 0))
+        yield f"data: {json.dumps({'time': '', 'message': '── 实时推送中 ──', 'level': 'info'})}\n\n"
+
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                new_logs = task_log.get_logs(user_id=user_id, workspace=workspace, limit=50, since=last_ts)
+                for entry in new_logs:
+                    ts = entry.get("timestamp", 0)
+                    if ts > last_ts:
+                        yield f"data: {json.dumps(entry)}\n\n"
+                        last_ts = ts
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/task-logs/{workspace}/status")
+async def user_task_status(workspace: str, user=Depends(get_current_user)):
+    """查询当前 workspace 是否正在摄入"""
+    user_id = user["user_id"]
+    key = f"{user_id}:{workspace}"
+    with _active_ingests_lock:
+        info = _active_ingests.get(key, {"status": "idle", "files": 0, "started": 0})
+    return {**info, "workspace": workspace}
+
+
 @app.get("/api/admin/sessions/{session_id}/messages")
 async def admin_get_session_messages(session_id: str, admin=Depends(get_admin_user)):
     """管理员查看任意用户的会话消息"""
@@ -793,8 +872,19 @@ async def chat_endpoint(request: ChatRequest, user=Depends(get_current_user)):
         )
     except HTTPException:
         raise
+    except ValueError as e:
+        # 用户未配置 API Key 等业务错误 → 推送友好的 SSE 错误消息
+        err_msg = str(e)
+        async def error_stream():
+            yield f"data: {json.dumps({'type': 'error', 'content': err_msg})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        err_msg = f"系统异常: {str(e)}"
+        async def error_stream():
+            yield f"data: {json.dumps({'type': 'error', 'content': err_msg})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
 
 
 # ==========================================
@@ -1159,16 +1249,23 @@ async def upload_batch_endpoint(
 
         # 后台线程：用参数传递代替 os.environ 污染，输出捕获到任务日志
         def run_background_batch():
-            with TaskOutputCapture(user_id=user_id, workspace=workspace):
-                task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {len(saved_paths)} 个文件", "info")
-                flow = IngestFlow()
-                for fp in saved_paths:
-                    print(f"\n🚀 [{user_id}] 提取: {fp.name} -> {workspace}")
-                    try:
-                        flow.run(str(fp), kb_name=workspace, user_id=user_id)
-                    except Exception as e:
-                        print(f"❌ 提取 {fp.name} 失败: {e}")
-                task_log.append(user_id, workspace, f"✅ [{user_id}] 批量提炼完成！共处理 {len(saved_paths)} 个文件", "success")
+            ingest_key = f"{user_id}:{workspace}"
+            with _active_ingests_lock:
+                _active_ingests[ingest_key] = {"status": "ingesting", "files": len(saved_paths), "started": time.time()}
+            try:
+                with TaskOutputCapture(user_id=user_id, workspace=workspace):
+                    task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {len(saved_paths)} 个文件。AI 正在提炼中，请耐心等待...", "info")
+                    flow = IngestFlow()
+                    for i, fp in enumerate(saved_paths, 1):
+                        print(f"\n🚀 [{user_id}] [{i}/{len(saved_paths)}] 提取: {fp.name} -> {workspace}")
+                        try:
+                            flow.run(str(fp), kb_name=workspace, user_id=user_id)
+                        except Exception as e:
+                            print(f"❌ 提取 {fp.name} 失败: {e}")
+                    task_log.append(user_id, workspace, f"✅ [{user_id}] 全部提炼完成！共处理 {len(saved_paths)} 个文件", "success")
+            finally:
+                with _active_ingests_lock:
+                    _active_ingests[ingest_key] = {"status": "idle", "files": 0, "started": 0}
 
         threading.Thread(target=run_background_batch, daemon=True).start()
 
