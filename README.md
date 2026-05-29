@@ -12,7 +12,7 @@
 
 ---
 
-## 四大核心设计原则
+## 五大核心设计原则
 
 ### 1. Protocols 与 Prompts 分离
 
@@ -47,7 +47,21 @@ data/memory.db         → SQLite 会话记忆（Agno SqliteDb）
 - `path_resolver.py` 统一解析所有路径，确保用户只能访问自己的数据
 - `index.md` 是全局导航地图，每次读写**必读**
 
-### 4. Map-Reduce 并发摄入 + Workflow 确定性
+### 4. 多 Worker 状态共享 + 实时进度可视化
+
+服务器以 `uvicorn --workers N` 部署时，多个 Worker 进程内存互不共享。本项目采用**文件共享存储**（`data/.ingest_status/`）替代内存字典，实现：
+
+- 摄入状态（`{user_id}__{workspace}.json`）跨 Worker 可见
+- 结构化进度（`{user_id}__{workspace}_progress.json`）跨 Worker 可读
+- 前端乐观更新 + 竞态保护（`optimisticUntilRef`）避免 poll 抖动
+
+前端 CyberForge 组件将进度解析为 4 阶段可视化卡片：
+```
+📄 解析文档 → ⚡ 提取概念 → 🔀 聚类归并 → 🧠 融合落盘
+```
+每阶段显示百分比、文件名、概念计数、耗时计时器，SSE 实时推送。
+
+### 5. Map-Reduce 并发摄入 + Workflow 确定性
 
 | 工作流 | 步骤 | 特点 |
 |---|---|---|
@@ -74,7 +88,7 @@ data/memory.db         → SQLite 会话记忆（Agno SqliteDb）
     │  auth.py (JWT)   │                   │  ingest_flow        │
     │  path_resolver   │                   │  lint_flow          │
     │  model_router    │                   │  query_flow         │
-    │  task_log        │                   │  autofill_flow      │
+    │  task_log(进度)  │                   │  autofill_flow      │
     │  llm_factory     │                   │  report_flow        │
     └────────┬────────┘                   └──────────┬──────────┘
              │                                       │
@@ -113,7 +127,7 @@ agno-llm-wiki-demo/
 │   ├── llm_factory.py      # 模型工厂：OpenAILike + Qwen
 │   ├── model_router.py     # 多供应商 LLM 路由（BYOK）
 │   ├── path_resolver.py    # 统一路径解析（用户隔离）
-│   └── task_log.py         # 任务日志（环形缓冲 + SSE 推送）
+│   └── task_log.py         # 任务日志（环形缓冲 + 结构化进度 + 文件共享 + SSE 推送）
 │
 ├── protocols/              # 维基协议层
 │   ├── purpose.md          # 知识库使命边界、核心论点
@@ -150,11 +164,12 @@ agno-llm-wiki-demo/
 │   │   └── {workspace}/   # 沙箱
 │   │       ├── concepts/  # 概念页面
 │   │       └── index.md   # 导航地图
+│   ├── .ingest_status/    # 跨 Worker 共享状态文件（自动生成）
 │   └── memory.db          # SQLite 会话记忆
 │
 ├── web/                   # Web 前端（React + Vite + Tailwind）
 │   ├── src/
-│   │   ├── components/    # UI 组件（15 个）
+│   │   ├── components/    # UI 组件（14 个）
 │   │   ├── contexts/      # React Context（AuthContext）
 │   │   ├── data/          # Mock 数据
 │   │   └── App.jsx        # 路由入口
@@ -198,6 +213,47 @@ npm run build    # 构建生产包到 web/dist/
 - **生产模式**：直接访问 `http://localhost:8888`（后端服务前端静态文件 + SPA 回退）
 - **开发模式**：访问 `http://localhost:5173`（Vite 热更新 + 代理 API 到 8888）
 
+### 生产部署（Linux 服务器）
+
+```bash
+# 1. 上传源码到服务器（排除 .venv/node_modules/data/raw）
+scp -r . root@<server>:/opt/llm-wiki-os/
+
+# 2. 创建虚拟环境 + 安装依赖
+cd /opt/llm-wiki-os
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cd web && npm install && npm run build && cd ..
+
+# 3. 配置 .env
+cp .env.example .env && nano .env
+
+# 4. 创建 systemd 服务
+cat > /etc/systemd/system/llm-wiki.service << 'EOF'
+[Unit]
+Description=LLM-Wiki OS API Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/llm-wiki-os
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/llm-wiki-os/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/llm-wiki-os/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8888 --workers 4
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now llm-wiki
+```
+
+> **注意**：`--workers N` 开启多进程时，摄入状态通过文件共享（`data/.ingest_status/`），无需额外配置。
+
 ---
 
 ## API 端点一览
@@ -225,6 +281,8 @@ npm run build    # 构建生产包到 web/dist/
 | | `/api/report` | POST | 批量报告生成 |
 | **设置** | `/api/settings/providers` | GET | 可用 LLM 供应商列表 |
 | | `/api/settings/api-key` | POST | 保存用户 API Key |
+| **任务日志** | `/api/task-logs/{ws}/stream` | GET | 用户任务日志 SSE 流（含进度事件） |
+| | `/api/task-logs/{ws}/status` | GET | 摄入状态 + 结构化进度（跨 Worker 文件读取） |
 | **管理** | `/api/admin/users` | GET | 用户列表（管理员） |
 | | `/api/admin/sessions` | GET | 全局会话（管理员） |
 | | `/api/admin/logs` | GET | 系统日志 SSE（管理员） |
@@ -283,7 +341,11 @@ npm run build    # 构建生产包到 web/dist/
 - [x] **Web 前端 SPA**（React + Tailwind + 力导向图 + KaTeX 数学渲染）
 - [x] **管理员控制台**（用户管理、会话监控、任务日志 SSE、系统日志）
 - [x] **批量报告生成**（report_flow：TopicScanner→BulkRetriever→ReportSynthesizer）
-- [x] **BYOK 模型选择**（用户自带 API Key + 多供应商路由）
+- [x] **BYOK 模型选择**（用户自带 API Key + 多供应商路由，管理员 fallback 系统 Key）
+- [x] **可视化进度条**（CyberForge 4 阶段进度卡片，SSE 实时推送）
+- [x] **多 Worker 状态共享**（文件替代内存字典，解决 uvicorn --workers N 状态隔离）
+- [x] **对话错误气泡**（SSE error 事件 → 前端红色提示，替代静默失败）
+- [x] **问候意图引导**（IntentRouter 识别 chat 意图 → 推送帮助 SSE 流）
 
 ### 🔧 扩展中
 
@@ -296,7 +358,8 @@ npm run build    # 构建生产包到 web/dist/
 - [ ] 增量摄入：同一来源二次更新（diff + merge）
 - [ ] 冲突解决：多来源引用同一概念的合并策略
 - [ ] `lint_flow.py` LLM 自动修复死链（当前仅报告）
-- [ ] XSS 防护（DOMPurify）+ CORS 白名单 + 上传文件校验
-- [ ] 速率限制 + 数据导出
+- [ ] XSS 防护（当前已用 react-markdown 替代 dangerouslySetInnerHTML）
+- [ ] CORS 白名单 + 上传文件校验 + 速率限制
+- [ ] 数据导出（Markdown ZIP / JSON）
 
 ---
