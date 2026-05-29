@@ -655,6 +655,60 @@ async def admin_get_session_messages(session_id: str, admin=Depends(get_admin_us
 # ==========================================
 # 🗣️ 1. 探求模式接口 (Query Mode)
 # ==========================================
+# ── 问候/帮助关键词拦截 → 返回使用引导 ──
+_HELP_KEYWORDS = {
+    "你好", "hello", "hi", "hey", "嗨",
+    "你可以做什么", "你能做什么", "怎么用", "如何使用", "使用说明",
+    "帮助", "help", "功能", "教程",
+    "what can you do", "how to use",
+}
+
+_HELP_GUIDE = """👋 **欢迎使用 LLM-Wiki 知识研究系统！**
+
+这是一个由 AI 多智能体驱动的私人知识库，以下是核心功能：
+
+---
+
+### 📤 上传资料（织网模式）
+1. 切换到右上角 **「织网模式」**
+2. 在 **「赛博熔炉」** 面板拖拽上传 PDF / Word / Markdown 文件
+3. AI 会自动提取概念、建立双链、编织知识图谱
+
+### 🔍 查询知识（探求模式）
+1. 切换到 **「探求模式」**
+2. 在底部输入框直接提问，例如：
+   - *“板形控制的基本原理是什么？”*
+   - *“冷轧带钢的张力控制有哪些方法？”*
+3. AI 会先查本地知识库，不够时自动联网搜索
+
+### 🗺️ 知识图谱
+- 织网模式的力导向图展示概念之间的关联
+- 点击节点可阅读概念详情，支持双链跳转
+
+### 📋 隔离审批
+- AI 不确定的新概念会进入 **「隔离审批区」**
+- 你可以预览 → 批准入库 / 废弃
+
+### 🔧 审查 & 修复
+- 织网模式下点击 **「重织死链」** 和 **「填补黑洞」**
+- AI 会检测断裂链接并自动补全缺失页面
+
+### 📊 报告生成
+- 切换到 **「报告模式」**
+- 指定主题，AI 批量检索相关材料并生成结构化报告
+
+---
+
+💡 **提示**：先在左侧选择一个 **沙箱（Workspace）**，所有操作都在该沙箱内进行。"""
+
+
+def _is_help_query(query: str) -> bool:
+    q = query.lower().strip()
+    if len(q) > 30:
+        return False
+    return any(kw in q for kw in _HELP_KEYWORDS)
+
+
 @app.get("/api/intent/debug")
 async def debug_intent(query: str, user=Depends(get_current_user)):
     return {"intent": classify_intent(query), "query": query}
@@ -668,6 +722,17 @@ async def chat_endpoint(request: ChatRequest, user=Depends(get_current_user)):
         workspace = request.workspace
         user_id = user["user_id"]
         session_id = request.session_id or f"{user_id}:{workspace or 'global'}:{uuid.uuid4().hex[:12]}"
+
+        # ── 问候/帮助拦截 → 返回使用引导 ──
+        if _is_help_query(query):
+            async def help_stream():
+                yield f"data: {json.dumps({'type': 'log', 'content': '📖 检测到使用引导请求'})}\n\n"
+                yield f"data: {json.dumps({'type': 'text', 'content': _HELP_GUIDE})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return StreamingResponse(
+                _wrap_stream_with_save(help_stream(), user_id, session_id, query),
+                media_type="text/event-stream",
+            )
 
         if request.intent_override and request.intent_override in (
             Intent.CHAT, Intent.SCAN, Intent.SUMMARY, Intent.QUERY
@@ -1382,4 +1447,4 @@ else:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8888)
+    uvicorn.run(app, host="0.0.0.0", port=8888, workers=4)
