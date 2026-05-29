@@ -648,8 +648,28 @@ async def admin_clear_task_logs(user_id: str, workspace: str, admin=Depends(get_
 
 
 # ── 用户级任务日志（非管理员，只看自己的） ──
-_active_ingests = {}  # key: "user_id:workspace" -> {"status": "ingesting"|"idle", "files": int, "started": float}
-_active_ingests_lock = threading.Lock()
+# 用文件存储摄入状态，解决多 worker 进程内存不共享的问题
+_INGEST_STATUS_DIR = PROJECT_ROOT / "data" / ".ingest_status"
+_INGEST_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _write_ingest_status(user_id: str, workspace: str, status: str, files: int = 0, started: float = 0):
+    """写入摄入状态到共享文件（多 worker 可见）"""
+    fpath = _INGEST_STATUS_DIR / f"{user_id}__{workspace}.json"
+    data = {"status": status, "files": files, "started": started}
+    try:
+        fpath.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+def _read_ingest_status(user_id: str, workspace: str) -> dict:
+    """从共享文件读取摄入状态"""
+    fpath = _INGEST_STATUS_DIR / f"{user_id}__{workspace}.json"
+    try:
+        if fpath.exists():
+            return json.loads(fpath.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"status": "idle", "files": 0, "started": 0}
 
 
 @app.get("/api/task-logs/{workspace}/stream")
@@ -699,9 +719,7 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
 async def user_task_status(workspace: str, user=Depends(get_current_user)):
     """查询当前 workspace 是否正在摄入（含结构化进度）"""
     user_id = user["user_id"]
-    key = f"{user_id}:{workspace}"
-    with _active_ingests_lock:
-        info = _active_ingests.get(key, {"status": "idle", "files": 0, "started": 0})
+    info = _read_ingest_status(user_id, workspace)
     progress = task_log.get_progress(user_id, workspace)
     return {**info, "workspace": workspace, "progress": progress}
 
@@ -1262,9 +1280,7 @@ async def upload_batch_endpoint(
 
         # 后台线程：用参数传递代替 os.environ 污染，输出捕获到任务日志
         def run_background_batch():
-            ingest_key = f"{user_id}:{workspace}"
-            with _active_ingests_lock:
-                _active_ingests[ingest_key] = {"status": "ingesting", "files": len(saved_paths), "started": time.time()}
+            _write_ingest_status(user_id, workspace, "ingesting", files=len(saved_paths), started=time.time())
             # 初始化结构化进度
             task_log.set_progress(
                 user_id, workspace,
@@ -1284,8 +1300,7 @@ async def upload_batch_endpoint(
                             print(f"❌ 提取 {fp.name} 失败: {e}")
                     task_log.append(user_id, workspace, f"✅ [{user_id}] 全部提炼完成！共处理 {len(saved_paths)} 个文件", "success")
             finally:
-                with _active_ingests_lock:
-                    _active_ingests[ingest_key] = {"status": "idle", "files": 0, "started": 0}
+                _write_ingest_status(user_id, workspace, "idle")
 
         threading.Thread(target=run_background_batch, daemon=True).start()
 

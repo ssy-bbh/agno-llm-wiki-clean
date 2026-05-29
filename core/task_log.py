@@ -2,14 +2,17 @@
 core/task_log.py — Per-workspace task progress log (ingest/lint/autofill)
 Captures print output from background flows into an in-memory ring buffer,
 keyed by (user_id, workspace).
+Progress data is also written to shared files for multi-worker visibility.
 """
 import io
+import json
 import re
 import sys
 import time
 import threading
 from collections import deque, defaultdict
 from datetime import datetime
+from pathlib import Path
 
 
 class TaskLogManager:
@@ -31,8 +34,16 @@ class TaskLogManager:
         return cls._instance
 
     # ── 结构化进度追踪 ──
+    # ── 文件持久化路径（跨 worker 共享） ──
+    _PROGRESS_DIR = Path(__file__).resolve().parent.parent / "data" / ".ingest_status"
+
+    def _progress_file(self, user_id: str, workspace: str) -> Path:
+        self._PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+        return self._PROGRESS_DIR / f"{user_id}__{workspace}_progress.json"
+
     def set_progress(self, user_id: str, workspace: str, **kwargs):
-        """Update structured progress for a (user, workspace) pair."""
+        """Update structured progress for a (user, workspace) pair.
+        Also writes to a shared file for multi-worker visibility."""
         key = f"{user_id}:{workspace}"
         with self._progress_lock:
             if key not in self._progress:
@@ -49,11 +60,34 @@ class TaskLogManager:
                 }
             self._progress[key].update(kwargs)
             self._progress[key]["updated"] = time.time()
+            snapshot = dict(self._progress[key])
+        # Write to shared file (non-blocking best-effort)
+        try:
+            self._progress_file(user_id, workspace).write_text(
+                json.dumps(snapshot), encoding="utf-8"
+            )
+        except Exception:
+            pass
 
     def get_progress(self, user_id: str, workspace: str) -> dict:
+        """Read progress: prefer in-memory, fallback to shared file."""
         key = f"{user_id}:{workspace}"
         with self._progress_lock:
-            return dict(self._progress.get(key, {"phase": "idle"}))
+            mem = self._progress.get(key)
+            if mem:
+                return dict(mem)
+        # Fallback: read from file (cross-worker)
+        try:
+            fpath = self._progress_file(user_id, workspace)
+            if fpath.exists():
+                data = json.loads(fpath.read_text(encoding="utf-8"))
+                # Cache it in memory for fast subsequent reads
+                with self._progress_lock:
+                    self._progress[key] = data
+                return data
+        except Exception:
+            pass
+        return {"phase": "idle"}
 
     def clear_progress(self, user_id: str = "", workspace: str = ""):
         with self._progress_lock:

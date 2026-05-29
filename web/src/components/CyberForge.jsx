@@ -53,7 +53,6 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   const [ingestStatus, setIngestStatus] = useState('idle')
   const [progress, setProgress] = useState(null) // structured progress from backend
   const [elapsed, setElapsed] = useState(0)
-  const [showLogs, setShowLogs] = useState(false) // toggle raw logs
 
   const sseRef = useRef(null)
   const timerRef = useRef(null)
@@ -176,7 +175,6 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
       setForgeLogs(prev => [...prev, { text: `✅ 文件已落盘，AI 提炼引擎已启动` }])
       setIngestStatus('ingesting')
       setElapsed(0)
-      setShowLogs(false)
     } catch (err) {
       setForgeLogs(prev => [...prev, { text: `❌ 上传失败: ${err.message}` }])
     } finally {
@@ -360,16 +358,6 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
             </div>
           </div>
 
-          {/* ── 折叠原始日志 ── */}
-          <div className="border-t border-slate-800/60">
-            <button
-              onClick={() => setShowLogs(!showLogs)}
-              className="w-full px-4 py-1.5 text-[10px] text-slate-500 font-mono hover:text-slate-400 flex items-center gap-1 transition-colors"
-            >
-              <span className={`transition-transform duration-200 ${showLogs ? 'rotate-90' : ''}`}>▶</span>
-              {showLogs ? '收起详细日志' : '展开详细日志'}
-            </button>
-          </div>
         </div>
       )}
 
