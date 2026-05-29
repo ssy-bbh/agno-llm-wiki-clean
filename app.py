@@ -660,11 +660,17 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
 
     async def stream():
         last_ts = 0
+        last_progress_ts = 0
         # 先发历史
         history = task_log.get_logs(user_id=user_id, workspace=workspace, limit=200)
         for entry in history:
             yield f"data: {json.dumps(entry)}\n\n"
             last_ts = max(last_ts, entry.get("timestamp", 0))
+        # 发当前进度快照
+        prog = task_log.get_progress(user_id, workspace)
+        if prog.get("phase", "idle") != "idle":
+            yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
+            last_progress_ts = prog.get("updated", 0)
         yield f"data: {json.dumps({'time': '', 'message': '── 实时推送中 ──', 'level': 'info'})}\n\n"
 
         try:
@@ -676,6 +682,12 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
                     if ts > last_ts:
                         yield f"data: {json.dumps(entry)}\n\n"
                         last_ts = ts
+                # 进度变化时也推送
+                prog = task_log.get_progress(user_id, workspace)
+                prog_ts = prog.get("updated", 0)
+                if prog_ts > last_progress_ts:
+                    yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
+                    last_progress_ts = prog_ts
         except (asyncio.CancelledError, GeneratorExit):
             pass
 
@@ -685,12 +697,13 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
 
 @app.get("/api/task-logs/{workspace}/status")
 async def user_task_status(workspace: str, user=Depends(get_current_user)):
-    """查询当前 workspace 是否正在摄入"""
+    """查询当前 workspace 是否正在摄入（含结构化进度）"""
     user_id = user["user_id"]
     key = f"{user_id}:{workspace}"
     with _active_ingests_lock:
         info = _active_ingests.get(key, {"status": "idle", "files": 0, "started": 0})
-    return {**info, "workspace": workspace}
+    progress = task_log.get_progress(user_id, workspace)
+    return {**info, "workspace": workspace, "progress": progress}
 
 
 @app.get("/api/admin/sessions/{session_id}/messages")
@@ -1252,6 +1265,13 @@ async def upload_batch_endpoint(
             ingest_key = f"{user_id}:{workspace}"
             with _active_ingests_lock:
                 _active_ingests[ingest_key] = {"status": "ingesting", "files": len(saved_paths), "started": time.time()}
+            # 初始化结构化进度
+            task_log.set_progress(
+                user_id, workspace,
+                phase="parsing", current_file=0, total_files=len(saved_paths),
+                current_file_name="", total_chunks=0, map_done=0,
+                total_concepts=0, reduce_done=0, started=time.time(),
+            )
             try:
                 with TaskOutputCapture(user_id=user_id, workspace=workspace):
                     task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {len(saved_paths)} 个文件。AI 正在提炼中，请耐心等待...", "info")
