@@ -66,8 +66,18 @@ if exist "%PROJECT_DIR%\web\dist\index.html" (
     ) else (
         echo   构建前端...
         cd "%PROJECT_DIR%\web"
-        call npm install --silent
+        call npm install
+        if errorlevel 1 (
+            echo   ❌ npm install 失败，请检查上方错误信息
+            pause
+            exit /b 1
+        )
         call npm run build
+        if errorlevel 1 (
+            echo   ❌ npm run build 失败
+            pause
+            exit /b 1
+        )
         cd "%PROJECT_DIR%"
         echo   ✅ 前端构建完成
     )
