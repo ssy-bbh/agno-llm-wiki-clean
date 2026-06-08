@@ -11,7 +11,6 @@ from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
 from tools.edit_tools import _resolve, set_context
-from core.llm_factory import set_user_context
 
 
 class IngestFlow:
@@ -26,10 +25,8 @@ class IngestFlow:
 
         # ═══ P0 优化：缓存与索引 ═══
         self._file_cache = {}           # {filepath: content} 文件内容缓存
-        self._file_cache_lock = threading.Lock()
         self._context_cache = {}        # {concept_tuple: context_str} 上下文缓存
         self._concept_index = {}        # {normalized_name: Path} 概念文件索引
-        self._index_lock = threading.Lock()  # index.md 写盘锁
 
     def _normalize_name(self, text: str) -> str:
         if not text:
@@ -69,10 +66,9 @@ class IngestFlow:
     def _read_file_cached(self, filepath: Path) -> str:
         """🔧 P0-2: 带缓存的文件读取，同一批次内不重复读盘"""
         key = str(filepath)
-        with self._file_cache_lock:
-            if key not in self._file_cache:
-                self._file_cache[key] = filepath.read_text(encoding="utf-8")
-            return self._file_cache[key]
+        if key not in self._file_cache:
+            self._file_cache[key] = filepath.read_text(encoding="utf-8")
+        return self._file_cache[key]
 
     def _fetch_local_context(self, concepts: list) -> str:
         """档案管理员：提取上下文，提供给大模型参考（带缓存）"""
@@ -111,55 +107,6 @@ class IngestFlow:
             return chunk_id, chunk, analysis_result, "成功"
         except Exception as e:
             return chunk_id, chunk, None, f"报错: {str(e)}"
-
-    def _reduce_one(self, norm_c, payload, ctx, seq, total):
-        """
-        🔧 P0-3: 单个概念的融合（可并行执行）
-        每个线程独立设置上下文，独立 LLM 调用，概念文件独立写盘。
-        index.md 更新通过 _index_lock 保护。
-        """
-        # ① 在子线程中恢复路由上下文 + BYOK 用户身份
-        set_context(user_id=ctx["user_id"], kb_name=ctx["kb_name"], sub_dir=ctx["sub_dir"], doc_name=ctx["doc_name"])
-        set_user_context(user_id=ctx["user_id"], role=ctx["role"])
-
-        display_name = payload["display_name"]
-        print(f"  🔄 [融合 {seq}/{total}] 目标概念: [{display_name}]")
-        t0 = time.time()
-
-        combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
-
-        # Token 熔断保护
-        MAX_CHARS = 8000
-        if len(combined_text) > MAX_CHARS:
-            print(f"  -> ⚠️ [{display_name}] 过长 ({len(combined_text)} 字符)，已截断")
-            combined_text = combined_text[:MAX_CHARS] + "\n\n... [数据过长，出于系统上下文保护已截断，请基于以上核心信息进行融合] ..."
-
-        combined_summary = "\n".join(payload["summaries"])
-        existing_context = self._fetch_local_context([display_name])
-
-        try:
-            fresh_editor = WikiEditor()
-            report = fresh_editor.merge(
-                raw_text=combined_text,
-                analyst_summary=combined_summary,
-                existing_context=existing_context
-            )
-
-            if report and report.get("actions"):
-                # 写盘加锁保护（概念文件独立，但 index.md/append_link 是共享资源）
-                with self._index_lock:
-                    self.writer.execute(report)
-            else:
-                print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
-
-            elapsed = time.time() - t0
-            print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)")
-            return display_name, "success", elapsed
-
-        except Exception as e:
-            elapsed = time.time() - t0
-            print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
-            return display_name, f"error: {e}", elapsed
 
     def run(self, input_source: str, kb_name: str = "", user_id: str = ""):
         """
@@ -252,7 +199,7 @@ class IngestFlow:
                 concept_payloads[norm_c]["summaries"].append(summary)
 
         # ==========================================
-        # 🔴 PHASE 3: REDUCE (并行概念融合)
+        # 🔴 PHASE 3: REDUCE (串行概念融合)
         # ==========================================
         print("\n" + "=" * 60)
         total_concepts = len(concept_payloads)
@@ -265,30 +212,47 @@ class IngestFlow:
         self._file_cache.clear()
         self._context_cache.clear()
 
-        # 🔧 P0-3: 并行 REDUCE（ThreadPoolExecutor，适配 Agno 同步 API）
-        from core.llm_factory import get_user_role
-        ctx = {"user_id": user_id, "kb_name": kb_name or "default", "sub_dir": "", "doc_name": getattr(path, 'stem', '') if path.exists() else "", "role": get_user_role()}
-        MAX_REDUCE_WORKERS = min(6, total_concepts) if total_concepts > 0 else 1
-
         t_reduce_start = time.time()
-        print(f"⚡ 启动 {MAX_REDUCE_WORKERS} 并发融合引擎 (原串行 → 并行)...")
 
-        completed = 0
-        with ThreadPoolExecutor(max_workers=MAX_REDUCE_WORKERS) as executor:
-            futures = {}
-            for seq, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
-                future = executor.submit(self._reduce_one, norm_c, payload, ctx, seq, total_concepts)
-                futures[future] = norm_c
+        for seq, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
+            display_name = payload["display_name"]
+            print(f"  🔄 [融合 {seq}/{total_concepts}] 目标概念: [{display_name}]")
+            t0 = time.time()
 
-            for future in as_completed(futures):
-                name, status, elapsed = future.result()
-                completed += 1
-                icon = "✅" if status == "success" else "❌"
-                print(f"  {icon} [{completed}/{total_concepts}] {name} — {status} ({elapsed:.1f}s)")
+            combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
+
+            # Token 熔断保护
+            MAX_CHARS = 8000
+            if len(combined_text) > MAX_CHARS:
+                print(f"  -> ⚠️ [{display_name}] 过长 ({len(combined_text)} 字符)，已截断")
+                combined_text = combined_text[:MAX_CHARS] + "\n\n... [数据过长，出于系统上下文保护已截断，请基于以上核心信息进行融合] ..."
+
+            combined_summary = "\n".join(payload["summaries"])
+            existing_context = self._fetch_local_context([display_name])
+
+            try:
+                fresh_editor = WikiEditor()
+                report = fresh_editor.merge(
+                    raw_text=combined_text,
+                    analyst_summary=combined_summary,
+                    existing_context=existing_context
+                )
+
+                if report and report.get("actions"):
+                    self.writer.execute(report)
+                else:
+                    print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
+
+                elapsed = time.time() - t0
+                print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)")
+
+            except Exception as e:
+                elapsed = time.time() - t0
+                print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
 
         t_total = time.time() - t_reduce_start
         print("\n" + "=" * 60)
-        print(f"✅ [IngestFlow] 摄入完毕 | REDUCE 耗时: {t_total:.1f}s (并行) | 知识图谱已延展！")
+        print(f"✅ [IngestFlow] 摄入完毕 | REDUCE 耗时: {t_total:.1f}s | 知识图谱已延展！")
 
 
 if __name__ == "__main__":
