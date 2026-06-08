@@ -78,16 +78,16 @@ class LintFlow:
         updated_count = 0
         dead_links = []
 
-        for target_concept, sources in backlinks_map.items():
-            target_file = None
-            # 暴力量化防撞
-            clean_target = target_concept.lower().replace("-", "").replace("_", "").replace(" ", "")
+        # 🔧 P0 优化：预构建归一化名称索引，O(N) 一次性扫描
+        filename_index = {}
+        for f in all_md_files:
+            clean = f.stem.lower().replace("-", "").replace("_", "").replace(" ", "")
+            filename_index[clean] = f
 
-            for f in all_md_files:
-                clean_filename = f.stem.lower().replace("-", "").replace("_", "").replace(" ", "")
-                if clean_target == clean_filename:
-                    target_file = f
-                    break
+        for target_concept, sources in backlinks_map.items():
+            # O(1) 索引查找替代 O(N) 暴力扫描
+            clean_target = target_concept.lower().replace("-", "").replace("_", "").replace(" ", "")
+            target_file = filename_index.get(clean_target)
 
             if not target_file:
                 dead_links.append(target_concept)

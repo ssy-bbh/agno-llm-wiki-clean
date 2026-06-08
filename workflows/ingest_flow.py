@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import time
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,7 @@ from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
 from tools.edit_tools import _resolve, set_context
+from core.llm_factory import set_user_context
 
 
 class IngestFlow:
@@ -22,51 +24,81 @@ class IngestFlow:
         self.writer = WikiWriter()
         # Editor 会在循环内动态实例化，防止上下文记忆污染
 
+        # ═══ P0 优化：缓存与索引 ═══
+        self._file_cache = {}           # {filepath: content} 文件内容缓存
+        self._file_cache_lock = threading.Lock()
+        self._context_cache = {}        # {concept_tuple: context_str} 上下文缓存
+        self._concept_index = {}        # {normalized_name: Path} 概念文件索引
+        self._index_lock = threading.Lock()  # index.md 写盘锁
+
     def _normalize_name(self, text: str) -> str:
         if not text:
             return ""
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
-    def _find_existing_file(self, concept: str) -> Path:
-        """同义词嗅探器：使用 _resolve 精准定位到当前激活的沙箱路径下"""
+    def _build_concept_index(self):
+        """🔧 P0-1: 一次性构建概念文件索引，后续查找 O(1)"""
         concepts_dir = _resolve("concepts")
-        if not concepts_dir.exists():
-            return None
+        index = {}
+        if concepts_dir.exists():
+            for f in concepts_dir.glob("*.md"):
+                norm = self._normalize_name(f.stem)
+                if norm:
+                    index[norm] = f
+        self._concept_index = index
+        print(f"  📇 概念索引已构建: {len(index)} 个文件")
 
+    def _find_existing_file(self, concept: str) -> Path:
+        """同义词嗅探器：基于预构建索引 O(1) 查找，回退模糊匹配"""
         norm_c = self._normalize_name(concept)
         if not norm_c:
             return None
 
-        for f in concepts_dir.glob("*.md"):
-            norm_f = self._normalize_name(f.stem)
-            if norm_c == norm_f:
-                return f
-            # 模糊包含匹配
-            if len(norm_c) > 2 and len(norm_f) > 2:
-                if norm_c in norm_f or norm_f in norm_c:
-                    return f
+        # O(1) 精确命中
+        if norm_c in self._concept_index:
+            return self._concept_index[norm_c]
+
+        # O(N) 模糊包含匹配（仅对短索引回退）
+        if len(norm_c) > 2:
+            for norm_f, f in self._concept_index.items():
+                if len(norm_f) > 2:
+                    if norm_c in norm_f or norm_f in norm_c:
+                        return f
         return None
 
+    def _read_file_cached(self, filepath: Path) -> str:
+        """🔧 P0-2: 带缓存的文件读取，同一批次内不重复读盘"""
+        key = str(filepath)
+        with self._file_cache_lock:
+            if key not in self._file_cache:
+                self._file_cache[key] = filepath.read_text(encoding="utf-8")
+            return self._file_cache[key]
+
     def _fetch_local_context(self, concepts: list) -> str:
-        """档案管理员：提取上下文，提供给大模型参考"""
+        """档案管理员：提取上下文，提供给大模型参考（带缓存）"""
+        cache_key = tuple(sorted(concepts))
+        if cache_key in self._context_cache:
+            return self._context_cache[cache_key]
+
         context_str = "\n"
         index_path = _resolve("index.md")
 
         if index_path.exists():
-            context_str += f"=== index.md (导航地图) ===\n{index_path.read_text(encoding='utf-8')}\n\n"
+            context_str += f"=== index.md (导航地图) ===\n{self._read_file_cached(index_path)}\n\n"
         else:
             context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
 
         for concept in concepts:
             real_file = self._find_existing_file(concept)
             if real_file:
-                content = real_file.read_text(encoding="utf-8")
+                content = self._read_file_cached(real_file)
                 rel_path = f"concepts/{real_file.name}"
                 context_str += f"=== {rel_path} (本地已存在) ===\n{content}\n\n"
             else:
                 safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
                 context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
 
+        self._context_cache[cache_key] = context_str
         return context_str
 
     def _map_extract(self, chunk, chunk_id):
@@ -79,6 +111,55 @@ class IngestFlow:
             return chunk_id, chunk, analysis_result, "成功"
         except Exception as e:
             return chunk_id, chunk, None, f"报错: {str(e)}"
+
+    def _reduce_one(self, norm_c, payload, ctx, seq, total):
+        """
+        🔧 P0-3: 单个概念的融合（可并行执行）
+        每个线程独立设置上下文，独立 LLM 调用，概念文件独立写盘。
+        index.md 更新通过 _index_lock 保护。
+        """
+        # ① 在子线程中恢复路由上下文 + BYOK 用户身份
+        set_context(user_id=ctx["user_id"], kb_name=ctx["kb_name"], sub_dir=ctx["sub_dir"], doc_name=ctx["doc_name"])
+        set_user_context(user_id=ctx["user_id"], role=ctx["role"])
+
+        display_name = payload["display_name"]
+        print(f"  🔄 [融合 {seq}/{total}] 目标概念: [{display_name}]")
+        t0 = time.time()
+
+        combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
+
+        # Token 熔断保护
+        MAX_CHARS = 8000
+        if len(combined_text) > MAX_CHARS:
+            print(f"  -> ⚠️ [{display_name}] 过长 ({len(combined_text)} 字符)，已截断")
+            combined_text = combined_text[:MAX_CHARS] + "\n\n... [数据过长，出于系统上下文保护已截断，请基于以上核心信息进行融合] ..."
+
+        combined_summary = "\n".join(payload["summaries"])
+        existing_context = self._fetch_local_context([display_name])
+
+        try:
+            fresh_editor = WikiEditor()
+            report = fresh_editor.merge(
+                raw_text=combined_text,
+                analyst_summary=combined_summary,
+                existing_context=existing_context
+            )
+
+            if report and report.get("actions"):
+                # 写盘加锁保护（概念文件独立，但 index.md/append_link 是共享资源）
+                with self._index_lock:
+                    self.writer.execute(report)
+            else:
+                print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
+
+            elapsed = time.time() - t0
+            print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)")
+            return display_name, "success", elapsed
+
+        except Exception as e:
+            elapsed = time.time() - t0
+            print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
+            return display_name, f"error: {e}", elapsed
 
     def run(self, input_source: str, kb_name: str = "", user_id: str = ""):
         """
@@ -171,50 +252,50 @@ class IngestFlow:
                 concept_payloads[norm_c]["summaries"].append(summary)
 
         # ==========================================
-        # 🔴 PHASE 3: REDUCE (按概念逐个融合落盘)
+        # 🔴 PHASE 3: REDUCE (并行概念融合)
         # ==========================================
         print("\n" + "=" * 60)
         total_concepts = len(concept_payloads)
         print(f"🧠 [Phase 3: REDUCE] 惊人降维！发现 {total_concepts} 个独立核心概念。")
 
-        for i, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
-            display_name = payload["display_name"]
-            print(f"\n" + "-" * 50)
-            print(f"🔄 [融合 {i}/{total_concepts}] 目标概念: [{display_name}]")
+        # 🔧 P0-1: 预构建概念索引（O(N) 一次性扫描，后续查找 O(1)）
+        self._build_concept_index()
 
-            combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
+        # 🔧 P0-2: 清空缓存（新批次，防止旧数据干扰）
+        self._file_cache.clear()
+        self._context_cache.clear()
 
-            # Token 熔断保护 (防止合并后文本过长撑爆大模型)
-            MAX_CHARS = 8000
-            if len(combined_text) > MAX_CHARS:
-                print(f"  -> ⚠️ 警告：知识碎片过长 ({len(combined_text)} 字符)，已触发自动截断保护！")
-                combined_text = combined_text[:MAX_CHARS] + "\n\n... [数据过长，出于系统上下文保护已截断，请基于以上核心信息进行融合] ..."
+        # 🔧 P0-3: 并行 REDUCE（ThreadPoolExecutor，适配 Agno 同步 API）
+        from core.llm_factory import get_user_role
+        ctx = {"user_id": user_id, "kb_name": kb_name or "default", "sub_dir": "", "doc_name": getattr(path, 'stem', '') if path.exists() else "", "role": get_user_role()}
+        MAX_REDUCE_WORKERS = min(6, total_concepts) if total_concepts > 0 else 1
 
-            combined_summary = "\n".join(payload["summaries"])
-            existing_context = self._fetch_local_context([display_name])
+        t_reduce_start = time.time()
+        print(f"⚡ 启动 {MAX_REDUCE_WORKERS} 并发融合引擎 (原串行 → 并行)...")
 
-            try:
-                # 每次循环重启主编，消除前一个概念的记忆污染
-                fresh_editor = WikiEditor()
-                report = fresh_editor.merge(
-                    raw_text=combined_text,
-                    analyst_summary=combined_summary,
-                    existing_context=existing_context
-                )
+        completed = 0
+        with ThreadPoolExecutor(max_workers=MAX_REDUCE_WORKERS) as executor:
+            futures = {}
+            for seq, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
+                future = executor.submit(self._reduce_one, norm_c, payload, ctx, seq, total_concepts)
+                futures[future] = norm_c
 
-                if report and report.get("actions"):
-                    self.writer.execute(report)
-                else:
-                    print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
-            except Exception as e:
-                print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
+            for future in as_completed(futures):
+                name, status, elapsed = future.result()
+                completed += 1
+                icon = "✅" if status == "success" else "❌"
+                print(f"  {icon} [{completed}/{total_concepts}] {name} — {status} ({elapsed:.1f}s)")
 
+        t_total = time.time() - t_reduce_start
         print("\n" + "=" * 60)
-        print("✅ [IngestFlow] 单文件降维摄入完毕，知识图谱已延展！")
+        print(f"✅ [IngestFlow] 摄入完毕 | REDUCE 耗时: {t_total:.1f}s (并行) | 知识图谱已延展！")
 
 
 if __name__ == "__main__":
-    raw_dir = Path("../data/raw")
+    # 自动定位项目根目录（支持从项目根或 workflows/ 子目录运行）
+    _script_dir = Path(__file__).resolve().parent
+    _project_root = _script_dir.parent if _script_dir.name == "workflows" else _script_dir
+    raw_dir = _project_root / "data" / "raw"
 
     if not raw_dir.exists():
         raw_dir.mkdir(parents=True, exist_ok=True)
