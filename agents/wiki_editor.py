@@ -1,7 +1,8 @@
 """
 wiki_editor.py — 知识主编 (比对与决策)
 """
-from pydantic import BaseModel, Field, field_validator
+import json
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Any, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from agno.agent import Agent
@@ -22,6 +23,30 @@ class Action(BaseModel):
     content: Optional[str] = Field(default=None)
     link_to: Optional[str] = Field(default=None)
     rationale: str = Field(description="操作理由")
+
+    @model_validator(mode='before')
+    @classmethod
+    def fix_llm_field_names(cls, data: Any) -> Any:
+        """容错：LLM 偶尔用 action/target/reason 代替 type/file/rationale"""
+        if isinstance(data, dict):
+            # action → type
+            if 'action' in data and 'type' not in data:
+                data['type'] = data.pop('action')
+            # target → file
+            if 'target' in data and 'file' not in data:
+                data['file'] = data.pop('target')
+            # reason/reasoning → rationale
+            if 'reason' in data and 'rationale' not in data:
+                data['rationale'] = data.pop('reason')
+            elif 'reasoning' in data and 'rationale' not in data:
+                data['rationale'] = data.pop('reasoning')
+            # description → rationale (fallback)
+            if 'description' in data and 'rationale' not in data:
+                data['rationale'] = data.pop('description')
+            # 兜底：如果 rationale 仍然缺失，给个默认值
+            if 'rationale' not in data:
+                data['rationale'] = 'LLM 未提供理由'
+        return data
 
     @field_validator('tags', mode='before')
     @classmethod
@@ -90,6 +115,34 @@ class WikiEditor:
                 return {"actions": []}  # 返回空动作 = 跳过写盘
 
         if isinstance(response.content, str):
-            raise ValueError("大模型未返回合法的 Pydantic 对象。")
+            # 🔧 JSON 修复兆底：手动修正 LLM 常用的错误字段名
+            raw = response.content.strip()
+            # 提取 JSON 块
+            if '```json' in raw:
+                raw = raw.split('```json', 1)[1].split('```', 1)[0].strip()
+            elif '```' in raw:
+                raw = raw.split('```', 1)[1].split('```', 1)[0].strip()
+            try:
+                data = json.loads(raw)
+                # 修复每个 action 的字段名
+                for act in data.get('actions', []):
+                    if 'action' in act and 'type' not in act:
+                        act['type'] = act.pop('action')
+                    if 'target' in act and 'file' not in act:
+                        act['file'] = act.pop('target')
+                    if 'reason' in act and 'rationale' not in act:
+                        act['rationale'] = act.pop('reason')
+                    elif 'reasoning' in act and 'rationale' not in act:
+                        act['rationale'] = act.pop('reasoning')
+                    elif 'description' in act and 'rationale' not in act:
+                        act['rationale'] = act.pop('description')
+                    if 'rationale' not in act:
+                        act['rationale'] = 'LLM 未提供理由'
+                report = EditorReport.model_validate(data)
+                print(f"  🔧 JSON 修复成功，恢复 {len(report.actions)} 个 actions")
+                return report.model_dump()
+            except Exception as fix_err:
+                print(f"  ❌ JSON 修复失败: {fix_err}")
+                raise ValueError("大模型未返回合法的 Pydantic 对象。")
 
         return response.content.model_dump()
