@@ -32,9 +32,13 @@ class Action(BaseModel):
             # action → type
             if 'action' in data and 'type' not in data:
                 data['type'] = data.pop('action')
-            # target → file
+            # target / file_path / path → file
             if 'target' in data and 'file' not in data:
                 data['file'] = data.pop('target')
+            if 'file_path' in data and 'file' not in data:
+                data['file'] = data.pop('file_path')
+            if 'path' in data and 'file' not in data:
+                data['file'] = data.pop('path')
             # reason/reasoning → rationale
             if 'reason' in data and 'rationale' not in data:
                 data['rationale'] = data.pop('reason')
@@ -130,6 +134,10 @@ class WikiEditor:
                         act['type'] = act.pop('action')
                     if 'target' in act and 'file' not in act:
                         act['file'] = act.pop('target')
+                    if 'file_path' in act and 'file' not in act:
+                        act['file'] = act.pop('file_path')
+                    if 'path' in act and 'file' not in act:
+                        act['file'] = act.pop('path')
                     if 'reason' in act and 'rationale' not in act:
                         act['rationale'] = act.pop('reason')
                     elif 'reasoning' in act and 'rationale' not in act:
