@@ -4,6 +4,7 @@ import { useAuth } from '../contexts/AuthContext'
 // ── Phase definitions ──
 const PHASES = {
   idle:       { label: '空闲',     icon: '💤', color: 'slate' },
+  stopping:   { label: '已停止',   icon: '🛑', color: 'red' },
   parsing:    { label: '解析文档', icon: '📄', color: 'blue' },
   extracting: { label: '提取概念', icon: '⚡', color: 'cyan' },
   clustering: { label: '聚类归并', icon: '🔀', color: 'purple' },
@@ -11,12 +12,13 @@ const PHASES = {
   done:       { label: '提炼完成', icon: '✅', color: 'emerald' },
 }
 
-const PHASE_ORDER = ['idle', 'parsing', 'extracting', 'clustering', 'merging', 'done']
+const PHASE_ORDER = ['idle', 'stopping', 'parsing', 'extracting', 'clustering', 'merging', 'done']
 
 // Calculate overall percentage from structured progress
 function calcPercent(p) {
   if (!p || p.phase === 'idle') return 0
   if (p.phase === 'done') return 100
+  if (p.phase === 'stopping') return 0  // 已停止，不显示进度条
 
   const phaseIdx = PHASE_ORDER.indexOf(p.phase)
   // Phase base percentages: parsing=5, extracting=5-45, clustering=45-55, merging=55-95
@@ -39,7 +41,7 @@ function calcPercent(p) {
     subProgress = 0.5 // indeterminate midpoint
   }
 
-  return Math.round(range[0] + (range[1] - range[0]) * subProgress)
+  return Math.min(100, Math.round(range[0] + (range[1] - range[0]) * subProgress))
 }
 
 export default function CyberForge({ selectedSandbox, setForgeLogs }) {
@@ -48,16 +50,34 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   const [uploading, setUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [isForging, setIsForging] = useState(false)
+  const [terminating, setTerminating] = useState(false)
+  const [resuming, setResuming] = useState(false)
+  const [sseKey, setSseKey] = useState(0)  // 强制 SSE 重连
 
   // ── Ingest progress state ──
   const [ingestStatus, setIngestStatus] = useState('idle')
   const [progress, setProgress] = useState(null) // structured progress from backend
   const [elapsed, setElapsed] = useState(0)
+  const [checkpoint, setCheckpoint] = useState(null) // { concepts, files_done, has_checkpoint }
 
   const sseRef = useRef(null)
   const timerRef = useRef(null)
   // Prevent poll from overwriting optimistic 'ingesting' before backend thread writes status file
   const optimisticUntilRef = useRef(0)
+  // Ref to track current ingestStatus for SSE callback (closure captures stale state)
+  const ingestStatusRef = useRef('idle')
+  // Keep ref in sync with state
+  useEffect(() => { ingestStatusRef.current = ingestStatus }, [ingestStatus])
+
+  // ── 切换沙箱时清空所有状态，防止跨沙箱数据串扰 ──
+  useEffect(() => {
+    setForgeLogs([])
+    setIngestStatus('idle')
+    setProgress(null)
+    setElapsed(0)
+    setCheckpoint(null)
+    optimisticUntilRef.current = 0
+  }, [selectedSandbox])
 
   // ── Poll status (includes structured progress) ──
   useEffect(() => {
@@ -69,8 +89,18 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         const res = await apiFetch(`/api/task-logs/${encodeURIComponent(selectedSandbox)}/status`)
         if (!alive) return
         const data = await res.json()
-        // Don't let server 'idle' overwrite optimistic 'ingesting' within 10s after upload
-        if (data.status === 'idle' && Date.now() < optimisticUntilRef.current) return
+
+        // Stopping state: always accept stopping/idle transitions (bypass optimistic window)
+        if (ingestStatus === 'stopping') {
+          if (data.status === 'idle') {
+            setIngestStatus('idle')
+            setProgress(null)  // 清除残留的 phase=done，防止完成卡片遮住暂停卡片
+          }
+          return
+        }
+
+        // Don't let server overwrite optimistic status within the lock window
+        if (Date.now() < optimisticUntilRef.current) return
         setIngestStatus(data.status)
         if (data.progress) {
           setProgress(data.progress)
@@ -89,6 +119,108 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     return () => { alive = false; clearInterval(iv) }
   }, [selectedSandbox])
 
+  // ── Poll checkpoint status ──
+  useEffect(() => {
+    if (!selectedSandbox) return
+    let alive = true
+
+    const pollCp = async () => {
+      try {
+        const res = await apiFetch(`/api/ingest/checkpoint?workspace=${encodeURIComponent(selectedSandbox)}`)
+        if (!alive) return
+        if (res.ok) {
+          const data = await res.json()
+          setCheckpoint(data)
+        }
+      } catch {}
+    }
+
+    pollCp()
+    const iv = setInterval(pollCp, 5000)
+    return () => { alive = false; clearInterval(iv) }
+  }, [selectedSandbox])
+
+  // ── Terminate ingest ──
+  const handleTerminate = async () => {
+    if (!selectedSandbox || terminating) return
+    setTerminating(true)
+    // 立即切换到 stopping 状态，不等 API 返回
+    setIngestStatus('stopping')
+    setProgress(null)  // 直接清除进度，进度条立即消失
+    optimisticUntilRef.current = Date.now() + 300000  // 5分钟内忽略服务器旧状态
+    // 立即关闭 SSE，防止后台线程推送进度事件覆盖 stopping
+    if (sseRef.current) {
+      sseRef.current.close()
+      sseRef.current = null
+    }
+    try {
+      const formData = new FormData()
+      formData.append('workspace', selectedSandbox)
+      const res = await apiFetch('/api/ingest/terminate', { method: 'POST', body: formData })
+      if (res.ok) {
+        setForgeLogs(prev => [...prev, { text: '🛑 已停止摄入，已保存检查点', level: 'warning' }])
+      } else {
+        const err = await res.json().catch(() => ({}))
+        setForgeLogs(prev => [...prev, { text: `❌ 终止失败: ${err.detail || res.status}`, level: 'error' }])
+      }
+    } catch (e) {
+      setForgeLogs(prev => [...prev, { text: `❌ 终止请求失败: ${e.message}`, level: 'error' }])
+    } finally {
+      setTimeout(() => setTerminating(false), 2000)
+    }
+  }
+
+  // ── Resume ingest ──
+  const handleResume = async () => {
+    if (!selectedSandbox || resuming) return
+    setResuming(true)
+    try {
+      // 先检查后台线程是否已完全停止
+      const statusRes = await apiFetch(`/api/task-logs/${encodeURIComponent(selectedSandbox)}/status`)
+      let serverStatus = 'unknown'
+      if (statusRes.ok) {
+        const statusData = await statusRes.json()
+        serverStatus = statusData.status
+        console.log('[RESUME] pre-check status:', serverStatus, statusData)
+        if (statusData.status === 'ingesting') {
+          setForgeLogs(prev => [...prev, { text: '⏳ 后台任务正在停止中，请等待几秒后再试', level: 'warning' }])
+          setTimeout(() => setResuming(false), 1000)
+          return
+        }
+      } else {
+        console.log('[RESUME] pre-check failed:', statusRes.status)
+      }
+
+      const formData = new FormData()
+      formData.append('workspace', selectedSandbox)
+      console.log('[RESUME] calling resume endpoint, workspace:', selectedSandbox)
+      const res = await apiFetch('/api/ingest/resume', { method: 'POST', body: formData })
+      console.log('[RESUME] response status:', res.status)
+      if (res.ok) {
+        const data = await res.json()
+        console.log('[RESUME] success:', data)
+        setForgeLogs(prev => [...prev, {
+          text: `🔄 继续摄入已启动：${data.files.length} 个文件，${data.checkpoint_concepts} 个概念将从检查点跳过`,
+          level: 'info'
+        }])
+        setIngestStatus('ingesting')
+        setProgress({ phase: 'parsing', current_file: 0, total_files: data.files.length, current_file_name: '', total_chunks: 0, map_done: 0, total_concepts: 0, reduce_done: 0 })
+        setElapsed(0)
+        optimisticUntilRef.current = Date.now() + 30000
+        setSseKey(k => k + 1)  // 强制 SSE 重连
+      } else {
+        const err = await res.json().catch(() => ({}))
+        console.log('[RESUME] error:', res.status, err)
+        setForgeLogs(prev => [...prev, { text: `❌ 继续失败: ${err.detail || res.status}`, level: 'error' }])
+      }
+    } catch (e) {
+      console.log('[RESUME] exception:', e)
+      setForgeLogs(prev => [...prev, { text: `❌ 继续请求失败: ${e.message}`, level: 'error' }])
+    } finally {
+      setTimeout(() => setResuming(false), 2000)
+    }
+  }
+
   // ── Elapsed timer ──
   useEffect(() => {
     if (ingestStatus !== 'ingesting') {
@@ -98,6 +230,14 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     timerRef.current = setInterval(() => setElapsed(e => e + 1), 1000)
     return () => clearInterval(timerRef.current)
   }, [ingestStatus])
+
+  // ── Auto-dismiss done card after 3s so checkpoint card can show ──
+  useEffect(() => {
+    if (ingestStatus === 'idle' && progress?.phase === 'done') {
+      const timer = setTimeout(() => setProgress(null), 3000)
+      return () => clearTimeout(timer)
+    }
+  }, [ingestStatus, progress?.phase])
 
   // ── SSE: real-time log + progress events ──
   useEffect(() => {
@@ -119,6 +259,8 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
 
         // Structured progress update
         if (data.type === 'progress') {
+          // Stopping 状态：忽略所有进度更新，防止旧线程的 done 事件覆盖停止卡片
+          if (ingestStatusRef.current === 'stopping') return
           setProgress({ ...data })
           if (data.started) setElapsed(Math.floor(Date.now() / 1000 - data.started))
           return
@@ -146,7 +288,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
       es.close()
       sseRef.current = null
     }
-  }, [selectedSandbox, token])
+  }, [selectedSandbox, token, sseKey])
 
   // ── Upload files ──
   const uploadFiles = async (files) => {
@@ -309,7 +451,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
           {/* ── 阶段指示器 ── */}
           <div className="px-4 pb-3">
             <div className="flex items-center justify-between">
-              {PHASE_ORDER.filter(p => p !== 'idle' && p !== 'done').map((p, i) => {
+              {PHASE_ORDER.filter(p => p !== 'idle' && p !== 'stopping' && p !== 'done').map((p, i) => {
                 const info = PHASES[p]
                 const phaseIdx = PHASE_ORDER.indexOf(p)
                 const currentIdx = PHASE_ORDER.indexOf(phase)
@@ -364,11 +506,60 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
             </div>
           </div>
 
+          {/* ── 终止按钮 ── */}
+          <div className="px-4 pb-3">
+            <button
+              onClick={handleTerminate}
+              disabled={terminating}
+              className={`w-full py-2 rounded-lg border text-xs font-mono font-medium flex items-center justify-center gap-2 transition-all duration-200 ${
+                terminating
+                  ? 'bg-red-900/30 border-red-800/50 text-red-500/60 cursor-wait'
+                  : 'bg-red-950/40 border-red-800/40 text-red-400 hover:bg-red-900/40 hover:border-red-600/60 hover:shadow-[0_0_12px_rgba(239,68,68,0.15)]'
+              }`}
+            >
+              {terminating ? (
+                <><span className="animate-spin">⏳</span> 正在终止...</>
+              ) : (
+                <><span>⏹</span> 终止摄入</>
+              )}
+            </button>
+          </div>
+
         </div>
       )}
 
-      {/* ── 完成状态卡片 ── */}
-      {ingestStatus === 'idle' && progress?.phase === 'done' && (
+      {/* ── 已停止状态卡片 ── */}
+      {ingestStatus === 'stopping' && (
+        <div className="bg-red-500/5 border border-red-500/20 rounded-lg p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-lg">🛑</span>
+            <div className="flex-1">
+              <div className="text-xs font-bold text-red-400">摄入已停止</div>
+              <div className="text-[10px] text-red-300/60 font-mono">
+                已处理的概念已保存检查点，可稍后继续
+              </div>
+            </div>
+          </div>
+          <button
+            onClick={handleResume}
+            disabled={resuming}
+            className={`w-full py-1.5 rounded-lg border text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-all duration-200 ${
+              resuming
+                ? 'bg-emerald-900/30 border-emerald-800/50 text-emerald-500/60 cursor-wait'
+                : 'bg-emerald-950/40 border-emerald-700/40 text-emerald-400 hover:bg-emerald-900/40 hover:border-emerald-600/60'
+            }`}
+          >
+            {resuming ? (
+              <><span className="animate-spin">⏳</span> 启动中...</>
+            ) : (
+              <><span>▶</span> 继续摄入</>
+            )}
+          </button>
+        </div>
+      )}
+
+      {/* ── 完成状态卡片（有 checkpoint 时不显示，避免打架）── */}
+      {ingestStatus === 'idle' && progress?.phase === 'done' && !checkpoint?.has_checkpoint && (
         <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-lg p-3">
           <div className="flex items-center gap-2">
             <span className="text-lg">✅</span>
@@ -378,6 +569,54 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
                 {progress.total_concepts} 个概念已落盘 · 耗时 {formatTime(elapsed)}
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── 检查点继续摄入卡片（优先级高于 done）── */}
+      {ingestStatus === 'idle' && checkpoint?.has_checkpoint && (
+        <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-lg">📌</span>
+            <div className="flex-1">
+              <div className="text-xs font-bold text-amber-400">上次摄入未完成</div>
+              <div className="text-[10px] text-amber-300/60 font-mono">
+                已处理 {checkpoint.concepts} 个概念 · {checkpoint.files_done} 个文件
+              </div>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={handleResume}
+              disabled={resuming}
+              className={`flex-1 py-1.5 rounded-lg border text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-all duration-200 ${
+                resuming
+                  ? 'bg-emerald-900/30 border-emerald-800/50 text-emerald-500/60 cursor-wait'
+                  : 'bg-emerald-950/40 border-emerald-700/40 text-emerald-400 hover:bg-emerald-900/40 hover:border-emerald-600/60'
+              }`}
+            >
+              {resuming ? (
+                <><span className="animate-spin">⏳</span> 启动中...</>
+              ) : (
+                <><span>▶</span> 继续摄入</>
+              )}
+            </button>
+            <button
+              onClick={async () => {
+                if (!selectedSandbox) return
+                try {
+                  const formData = new FormData()
+                  formData.append('workspace', selectedSandbox)
+                  await apiFetch('/api/ingest/clear-checkpoint', { method: 'POST', body: formData })
+                  setCheckpoint(null)
+                  setForgeLogs(prev => [...prev, { text: '🗑️ 检查点已清除，下次摄入将从头开始', level: 'info' }])
+                } catch {}
+              }}
+              className="py-1.5 px-3 rounded-lg border text-xs font-mono border-slate-800 text-slate-500 hover:border-slate-700 hover:text-slate-400 transition-all"
+              title="清除检查点，下次从头开始"
+            >
+              🗑️
+            </button>
           </div>
         </div>
       )}

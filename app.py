@@ -34,6 +34,10 @@ from core.auth import (
     save_user_api_key, get_user_api_keys,
     decode_token,
 )
+from core.ingest_control import (
+    request_terminate, clear_terminate, is_terminate_requested,
+    get_checkpoint, clear_checkpoint, mark_terminated, save_file_checkpoint,
+)
 from core.llm_factory import set_user_context
 from core.model_router import get_model_for_user, get_default_model, list_providers
 
@@ -652,10 +656,44 @@ async def admin_clear_task_logs(user_id: str, workspace: str, admin=Depends(get_
 _INGEST_STATUS_DIR = PROJECT_ROOT / "data" / ".ingest_status"
 _INGEST_STATUS_DIR.mkdir(parents=True, exist_ok=True)
 
-def _write_ingest_status(user_id: str, workspace: str, status: str, files: int = 0, started: float = 0):
-    """写入摄入状态到共享文件（多 worker 可见）"""
+# ── Generation counter: prevents old threads from overwriting new thread's status ──
+_ingest_gen_lock = threading.Lock()
+_ingest_gen = {}  # (user_id, workspace) -> generation number
+
+def _next_ingest_gen(user_id: str, workspace: str) -> int:
+    """Increment and return a new generation number for this (user, workspace)."""
+    key = (user_id, workspace)
+    with _ingest_gen_lock:
+        _ingest_gen[key] = _ingest_gen.get(key, 0) + 1
+        return _ingest_gen[key]
+
+def _current_ingest_gen(user_id: str, workspace: str) -> int:
+    """Return max(in-memory gen, file gen) — ensures cross-worker visibility."""
+    key = (user_id, workspace)
+    with _ingest_gen_lock:
+        mem_gen = _ingest_gen.get(key, 0)
+    # Also check file (shared across workers)
+    file_gen = 0
+    try:
+        fpath = _INGEST_STATUS_DIR / f"{user_id}__{workspace}.json"
+        if fpath.exists():
+            data = json.loads(fpath.read_text(encoding="utf-8"))
+            file_gen = data.get("gen", 0)
+    except Exception:
+        pass
+    result = max(mem_gen, file_gen)
+    # Sync memory with the higher value
+    with _ingest_gen_lock:
+        if result > _ingest_gen.get(key, 0):
+            _ingest_gen[key] = result
+    return result
+
+def _write_ingest_status(user_id: str, workspace: str, status: str, files: int = 0, started: float = 0, gen: int = None):
+    """写入摄入状态到共享文件（多 worker 可见）。gen 用于防止旧线程覆盖新线程。"""
     fpath = _INGEST_STATUS_DIR / f"{user_id}__{workspace}.json"
     data = {"status": status, "files": files, "started": started}
+    if gen is not None:
+        data["gen"] = gen
     try:
         fpath.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
@@ -702,10 +740,11 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
                     if ts > last_ts:
                         yield f"data: {json.dumps(entry)}\n\n"
                         last_ts = ts
-                # 进度变化时也推送
+                # 进度变化时也推送（但仅在摄入中时，避免终止后推送残留旧进度）
+                cur_status = _read_ingest_status(user_id, workspace)
                 prog = task_log.get_progress(user_id, workspace)
                 prog_ts = prog.get("updated", 0)
-                if prog_ts > last_progress_ts:
+                if prog_ts > last_progress_ts and cur_status.get("status") == "ingesting":
                     yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
                     last_progress_ts = prog_ts
         except (asyncio.CancelledError, GeneratorExit):
@@ -1240,6 +1279,41 @@ async def create_workspace(req: SandboxCreate, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"开荒失败: {str(e)}")
 
 
+@app.delete("/api/workspaces/{name}")
+async def delete_workspace(name: str, user=Depends(get_current_user)):
+    """彻底删除一个沙箱及其所有数据"""
+    user_id = user["user_id"]
+    safe_name = re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="非法的沙箱名称！")
+
+    import shutil
+    base = Path(__file__).resolve().parent / "data"
+    dirs_to_clean = [
+        base / "wiki" / user_id / safe_name,       # wiki 数据
+        base / "raw" / user_id / safe_name,          # 原始上传
+        base / ".ingest_control" / user_id / safe_name,  # 摄入控制
+    ]
+    files_to_clean = [
+        base / ".ingest_status" / f"{user_id}__{safe_name}.json",  # 摄入状态
+        base / ".task_logs" / f"{user_id}__{safe_name}.log",        # 任务日志
+        base / ".task_logs" / f"{user_id}__{safe_name}.log.sse",   # SSE 缓冲
+    ]
+
+    deleted = []
+    for d in dirs_to_clean:
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+            deleted.append(str(d))
+    for f in files_to_clean:
+        if f.exists():
+            f.unlink(missing_ok=True)
+            deleted.append(str(f))
+
+    print(f"🗑️ 沙箱已删除: {user_id}/{safe_name}, 清理了 {len(deleted)} 项", flush=True)
+    return {"status": "success", "deleted": len(deleted)}
+
+
 # ==========================================
 # 📥 4. 文件上传（含校验）
 # ==========================================
@@ -1259,6 +1333,20 @@ async def upload_batch_endpoint(
     if not files:
         raise HTTPException(status_code=400, detail="未检测到任何文件！")
 
+    # 沙箱名校验：防止路径穿越和非法字符
+    if ".." in workspace or "/" in workspace or "\\" in workspace:
+        raise HTTPException(status_code=400, detail="沙箱名包含非法字符")
+    # 允许中文、英文、数字、下划线、连字符、空格
+    if not re.match(r'^[\w\u4e00-\u9fa5\s\-]+$', workspace):
+        raise HTTPException(status_code=400, detail=f"沙箱名 '{workspace}' 包含特殊字符，只允许中英文、数字、下划线、连字符和空格")
+
+    # 文件名校验：清理危险字符
+    for f in files:
+        if f.filename:
+            fname = Path(f.filename).name  # 去掉任何路径成分
+            if ".." in fname or fname.startswith("."):
+                raise HTTPException(status_code=400, detail=f"文件名非法: {f.filename}")
+
     # 文件校验
     for f in files:
         ext = Path(f.filename).suffix.lower() if f.filename else ""
@@ -1273,14 +1361,23 @@ async def upload_batch_endpoint(
     saved_paths = []
     try:
         for f in files:
-            file_path = raw_dir / f.filename
+            # 清理文件名：只取 basename，防止路径穿越
+            safe_filename = Path(f.filename).name if f.filename else "unnamed"
+            file_path = raw_dir / safe_filename
             contents = await f.read()
             file_path.write_bytes(contents)
             saved_paths.append(file_path)
+            print(f"  📄 上传: {safe_filename} ({len(contents)} bytes)", flush=True)
 
         # 后台线程：用参数传递代替 os.environ 污染，输出捕获到任务日志
+        # Generation counter: 防止旧线程 finally 覆盖新线程的 status
+        my_gen = _next_ingest_gen(user_id, workspace)
+
         def run_background_batch():
-            _write_ingest_status(user_id, workspace, "ingesting", files=len(saved_paths), started=time.time())
+            # 新摄入开始：清除旧的终止标记（保留检查点以支持 Resume）
+            clear_terminate(user_id, workspace)
+
+            _write_ingest_status(user_id, workspace, "ingesting", files=len(saved_paths), started=time.time(), gen=my_gen)
             # 初始化结构化进度
             task_log.set_progress(
                 user_id, workspace,
@@ -1288,19 +1385,54 @@ async def upload_batch_endpoint(
                 current_file_name="", total_chunks=0, map_done=0,
                 total_concepts=0, reduce_done=0, started=time.time(),
             )
+            terminated = False
             try:
-                with TaskOutputCapture(user_id=user_id, workspace=workspace):
+                with TaskOutputCapture(
+                    user_id=user_id, workspace=workspace,
+                    gen=my_gen, gen_fn=lambda: _current_ingest_gen(user_id, workspace),
+                ):
                     task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {len(saved_paths)} 个文件。AI 正在提炼中，请耐心等待...", "info")
                     flow = IngestFlow()
                     for i, fp in enumerate(saved_paths, 1):
+                        # ── 每个文件前检查：终止信号 + generation 被取代 ──
+                        if _current_ingest_gen(user_id, workspace) != my_gen:
+                            task_log.append(user_id, workspace, "⚡ 新的摄入任务已启动，旧线程自动退出", "info")
+                            terminated = True
+                            break
+                        if is_terminate_requested(user_id, workspace):
+                            task_log.append(user_id, workspace, f"🛑 用户手动终止，已完成 {i-1}/{len(saved_paths)} 个文件", "warning")
+                            terminated = True
+                            break
+
                         print(f"\n🚀 [{user_id}] [{i}/{len(saved_paths)}] 提取: {fp.name} -> {workspace}")
                         try:
-                            flow.run(str(fp), kb_name=workspace, user_id=user_id)
+                            result = flow.run(str(fp), kb_name=workspace, user_id=user_id)
+                            if result is False:
+                                # flow.run 内部检测到终止信号
+                                terminated = True
+                                task_log.append(user_id, workspace, f"🛑 摄入在文件 {fp.name} 内被终止", "warning")
+                                break
+                            # 文件完整处理成功，保存文件检查点
+                            save_file_checkpoint(user_id, workspace, fp.name)
                         except Exception as e:
                             print(f"❌ 提取 {fp.name} 失败: {e}")
-                    task_log.append(user_id, workspace, f"✅ [{user_id}] 全部提炼完成！共处理 {len(saved_paths)} 个文件", "success")
+
+                    if not terminated:
+                        task_log.append(user_id, workspace, f"✅ [{user_id}] 全部提炼完成！共处理 {len(saved_paths)} 个文件", "success")
             finally:
-                _write_ingest_status(user_id, workspace, "idle")
+                # 只有当前 generation 的线程才能写 status（防止旧线程覆盖新线程）
+                if _current_ingest_gen(user_id, workspace) == my_gen:
+                    if terminated:
+                        mark_terminated(user_id, workspace)
+                        # 终止时：重置进度为 idle（清除残留的 phase）
+                        task_log.set_progress(
+                            user_id, workspace,
+                            phase="idle", current_file=0, total_files=0,
+                            current_file_name="", total_chunks=0, map_done=0,
+                            total_concepts=0, reduce_done=0, started=0,
+                        )
+                    # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
+                    _write_ingest_status(user_id, workspace, "idle", gen=my_gen)
 
         threading.Thread(target=run_background_batch, daemon=True).start()
 
@@ -1313,6 +1445,180 @@ async def upload_batch_endpoint(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"落盘失败: {str(e)}")
+
+
+# ==========================================
+# ⏹️ 摄入控制（终止 / 继续 / 状态）
+# ==========================================
+@app.post("/api/ingest/terminate")
+async def terminate_ingest(
+    workspace: str = Form(...),
+    user=Depends(get_current_user),
+):
+    """终止当前摄入流水线（立即返回，后台线程在下一个检查点自动停止）"""
+    user_id = user["user_id"]
+    # 1. 写终止标记（后台线程在概念/文件间隙检查此标记）
+    request_terminate(user_id, workspace)
+    # 2. 写 stopping 到状态文件（表示后台线程正在停止中）
+    #    旧线程 finally 会在 generation 匹配时写 idle
+    _write_ingest_status(user_id, workspace, "stopping")
+    # 3. 写 stopping 到进度文件（带未来时间戳，防止旧线程覆盖）
+    #    前端 poll/SSE 看到 phase=stopping 时忽略更新
+    task_log.set_progress(
+        user_id, workspace,
+        phase="stopping", current_file=0, total_files=0,
+        current_file_name="", total_chunks=0, map_done=0,
+        total_concepts=0, reduce_done=0, started=0,
+        updated=time.time() + 9999,  # 未来时间戳，防止旧线程的 set_progress 覆盖
+    )
+    task_log.append(user_id, workspace, "🛑 摄入已停止，后台任务将在当前操作完成后自动退出", "warning")
+    return {"status": "ok", "message": "摄入已停止"}
+
+
+@app.post("/api/ingest/resume")
+async def resume_ingest(
+    workspace: str = Form(...),
+    user=Depends(get_current_user),
+):
+    """
+    继续摄入：清除终止标记，重新处理 raw 目录中的所有文件。
+    已处理的概念会从检查点跳过，只对新概念调用 LLM。
+    """
+    user_id = user["user_id"]
+
+    # 不再检查 status 文件——generation counter 保证旧线程不会干扰新线程
+    # 用户点击“继续”时，旧线程可能仍在跑 LLM（最长 300s），但 gen 已递增
+    # 旧线程 finally 检查 gen 不匹配会跳过写入
+
+    # 清除终止标记
+    clear_terminate(user_id, workspace)
+    print(f"🔄 [RESUME] user={user_id} workspace={workspace}", flush=True)
+
+    # 查找 raw 目录中的所有文件
+    raw_dir = get_raw_root(user_id) / workspace
+    if not raw_dir.exists():
+        print(f"❌ [RESUME] raw_dir not found: {raw_dir}", flush=True)
+        raise HTTPException(status_code=404, detail="没有找到已上传的原始文件")
+
+    saved_paths = sorted(raw_dir.iterdir())
+    saved_paths = [f for f in saved_paths if f.is_file()]
+    if not saved_paths:
+        raise HTTPException(status_code=404, detail="raw 目录为空")
+
+    # 获取检查点信息：跳过已完整处理的文件
+    cp = get_checkpoint(user_id, workspace)
+    done_concepts = len(cp.get("concepts", []))
+    done_files = set(cp.get("files_done", []))
+    remaining_paths = [f for f in saved_paths if f.name not in done_files]
+    print(f"🔄 [RESUME] raw_files={[f.name for f in saved_paths]} done_files={done_files} remaining={len(remaining_paths)} done_concepts={done_concepts}", flush=True)
+
+    if not remaining_paths:
+        raise HTTPException(status_code=400, detail=f"所有文件均已处理完成（{len(done_files)} 个），无需继续摄入")
+
+    # Generation counter: 防止旧线程 finally 覆盖新线程的 status
+    resume_gen = _next_ingest_gen(user_id, workspace)
+
+    # 在启动线程前先写好初始状态（避免 SSE 连上时读到旧的 idle）
+    _write_ingest_status(user_id, workspace, "ingesting", files=len(remaining_paths), started=time.time(), gen=resume_gen)
+    task_log.set_progress(
+        user_id, workspace,
+        phase="parsing", current_file=0, total_files=len(remaining_paths),
+        current_file_name="", total_chunks=0, map_done=0,
+        total_concepts=done_concepts, reduce_done=done_concepts,
+        started=time.time(),
+    )
+
+    # 启动后台线程重新处理（只处理未完成文件）
+    def run_resume_batch():
+        clear_terminate(user_id, workspace)
+        terminated = False
+        try:
+            # 传入检查点偏移量，让 _TeeWriter 的累计计数器从上次停止处继续
+            with TaskOutputCapture(
+                user_id=user_id, workspace=workspace,
+                checkpoint_concepts=done_concepts, checkpoint_reduce=done_concepts,
+                gen=resume_gen, gen_fn=lambda: _current_ingest_gen(user_id, workspace),
+            ):
+                task_log.append(
+                    user_id, workspace,
+                    f"🔄 [继续摄入] 重启流水线，共 {len(remaining_paths)} 个待处理文件"
+                    f"（跳过 {len(done_files)} 个已完成文件）。"
+                    f"已有 {done_concepts} 个概念在检查点中将被跳过。", "info"
+                )
+                flow = IngestFlow()
+                for i, fp in enumerate(remaining_paths, 1):
+                    if _current_ingest_gen(user_id, workspace) != resume_gen:
+                        task_log.append(user_id, workspace, "⚡ 新的摄入任务已启动，旧线程自动退出", "info")
+                        terminated = True
+                        break
+                    if is_terminate_requested(user_id, workspace):
+                        task_log.append(user_id, workspace, f"🛑 用户再次终止", "warning")
+                        terminated = True
+                        break
+                    print(f"\n🚀 [{user_id}] [resume {i}/{len(remaining_paths)}] {fp.name}")
+                    try:
+                        result = flow.run(str(fp), kb_name=workspace, user_id=user_id)
+                        if result is False:
+                            terminated = True
+                            break
+                        save_file_checkpoint(user_id, workspace, fp.name)
+                    except Exception as e:
+                        print(f"❌ {fp.name} 失败: {e}")
+
+                if not terminated:
+                    task_log.append(user_id, workspace, f"✅ [继续摄入] 全部完成！", "success")
+        finally:
+            # 只有当前 generation 的线程才能写 status（防止旧线程覆盖新线程）
+            if _current_ingest_gen(user_id, workspace) == resume_gen:
+                if terminated:
+                    mark_terminated(user_id, workspace)
+                    # 终止时：重置进度为 idle（清除残留的 phase）
+                    task_log.set_progress(
+                        user_id, workspace,
+                        phase="idle", current_file=0, total_files=0,
+                        current_file_name="", total_chunks=0, map_done=0,
+                        total_concepts=0, reduce_done=0, started=0,
+                    )
+                # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
+                _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
+
+    threading.Thread(target=run_resume_batch, daemon=True).start()
+
+    return {
+        "status": "ok",
+        "message": f"继续摄入已启动，{len(remaining_paths)} 个文件（跳过 {len(done_files)} 个已完成），{done_concepts} 个概念将从检查点跳过",
+        "files": [f.name for f in remaining_paths],
+        "checkpoint_concepts": done_concepts,
+        "skipped_files": list(done_files),
+    }
+
+
+@app.get("/api/ingest/checkpoint")
+async def get_ingest_checkpoint(
+    workspace: str,
+    user=Depends(get_current_user),
+):
+    """获取检查点信息（已处理的概念和文件数）"""
+    user_id = user["user_id"]
+    cp = get_checkpoint(user_id, workspace)
+    return {
+        "concepts": len(cp.get("concepts", [])),
+        "files_done": len(cp.get("files_done", [])),
+        "terminated_at": cp.get("terminated_at"),
+        "has_checkpoint": len(cp.get("concepts", [])) > 0,
+    }
+
+
+@app.post("/api/ingest/clear-checkpoint")
+async def clear_ingest_checkpoint(
+    workspace: str = Form(...),
+    user=Depends(get_current_user),
+):
+    """清除检查点（下次摄入将从头开始）"""
+    user_id = user["user_id"]
+    clear_checkpoint(user_id, workspace)
+    clear_terminate(user_id, workspace)
+    return {"status": "ok", "message": "检查点和终止标记已清除"}
 
 
 # ==========================================

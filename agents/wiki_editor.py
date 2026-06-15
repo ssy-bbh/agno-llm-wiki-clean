@@ -3,8 +3,12 @@ wiki_editor.py — 知识主编 (比对与决策)
 """
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Any, Optional, Literal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from agno.agent import Agent
 from core.llm_factory import get_qwen_model
+
+# 单次 LLM 调用超时（秒）——融合比提取更复杂，给更多时间
+LLM_TIMEOUT_SECONDS = 300
 
 
 # 💡 我们把 Action 的定义移交给了主编，因为只有它才有权下达动作指令
@@ -76,7 +80,14 @@ class WikiEditor:
 
         请严格按 JSON 格式输出 actions。如果找不到原文字符串，绝对不要编造 old_str！
         """
-        response = self.agent.run(user_prompt)
+        # 超时保护：防止单个概念融合卡住导致整个流水线停滞
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.agent.run, user_prompt)
+            try:
+                response = future.result(timeout=LLM_TIMEOUT_SECONDS)
+            except FuturesTimeoutError:
+                print(f"\n⏰ [WikiEditor] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此概念")
+                return {"actions": []}  # 返回空动作 = 跳过写盘
 
         if isinstance(response.content, str):
             raise ValueError("大模型未返回合法的 Pydantic 对象。")

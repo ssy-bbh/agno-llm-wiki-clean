@@ -66,9 +66,15 @@ def list_workspaces(user_id: str = "") -> list:
     wiki_root = get_wiki_root(user_id)
     if not wiki_root.exists():
         return []
-    workspaces = [d for d in wiki_root.iterdir() if d.is_dir()]
-    workspaces.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    return [w.name for w in workspaces]
+    try:
+        # 一次性消费 iterdir() 生成器，防止并发创建目录时 RuntimeError
+        entries = list(wiki_root.iterdir())
+        workspaces = [d for d in entries if d.is_dir()]
+        workspaces.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        return [w.name for w in workspaces]
+    except (OSError, RuntimeError):
+        # 目录不存在或并发冲突时安全返回
+        return []
 
 
 def get_default_workspace(user_id: str = "") -> str:

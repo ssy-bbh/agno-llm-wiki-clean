@@ -1,7 +1,11 @@
 from pydantic import BaseModel, Field
 from typing import List
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from agno.agent import Agent
 from core.llm_factory import get_qwen_model
+
+# 单次 LLM 调用超时（秒）
+LLM_TIMEOUT_SECONDS = 90
 
 
 # 💡 变化 1：把 Action 类彻底删除了！它不配拥有这个权力。
@@ -43,7 +47,14 @@ class WikiAnalyst:
 
         请提取核心概念并生成摘要。
         """
-        response = self.agent.run(user_prompt)
+        # 超时保护：防止 LLM 卡住导致整个流水线停滞
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.agent.run, user_prompt)
+            try:
+                response = future.result(timeout=LLM_TIMEOUT_SECONDS)
+            except FuturesTimeoutError:
+                print(f"\n⏰ [WikiAnalyst] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此块")
+                return {"new_concepts": [], "summary": "(LLM 超时，未提取)"}
 
         if isinstance(response.content, str):
             print("\n🚨 Pydantic 解析失败！原始字符串是：\n", response.content)

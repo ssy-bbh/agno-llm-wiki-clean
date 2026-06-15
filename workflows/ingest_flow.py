@@ -11,6 +11,10 @@ from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
 from tools.edit_tools import _resolve, set_context
+from core.ingest_control import (
+    is_terminate_requested, save_concept_checkpoint,
+    is_concept_done, save_file_checkpoint
+)
 
 
 class IngestFlow:
@@ -117,19 +121,58 @@ class IngestFlow:
         # 在调用任何 _resolve 前，设置线程安全上下文
         set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
 
+        # 早期终止检查：还没开始重活之前快速退出
+        if user_id and kb_name and is_terminate_requested(user_id, kb_name):
+            print(f"\n🛑 [IngestFlow] 收到终止信号，跳过 {Path(input_source).name}")
+            return False  # 返回 False 表示被终止
+        # 在调用任何 _resolve 前，设置线程安全上下文
+        set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
+
         print("\n" + "=" * 60)
         print(f"🚀 [IngestFlow] 启动 Map-Reduce 引擎 | 沙箱: {kb_name} | 用户: {user_id}")
 
         # 设置文档名到上下文
         path = Path(input_source)
         if path.exists() and path.is_file():
+            # ── 单文件模式 ──
             set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=path.stem)
-            print(f"📄 目标语料：{path.name}")
-            raw_text = extract_text(str(path))
+            print(f"📄 目标语料：{path.name} ({path.stat().st_size} bytes)", flush=True)
+            try:
+                raw_text = extract_text(str(path))
+            except Exception as e:
+                print(f"❌ extract_text 失败: {type(e).__name__}: {e}", flush=True)
+                raw_text = ""
+            print(f"📝 提取文本: {len(raw_text)} 字符", flush=True)
+            if not raw_text.strip():
+                print("⚠️ 警告：提取出的文本为空！PDF 可能是扫描图片（需要 OCR）或文件损坏。", flush=True)
             chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
-            print(f"✂️ 物理切分为 {len(chunks)} 个知识块。")
+            print(f"✂️ 物理切分为 {len(chunks)} 个知识块。", flush=True)
+        elif path.exists() and path.is_dir():
+            # ── 目录模式：遍历所有文件，合并文本后切块 ──
+            SUPPORTED_EXT = {".pdf", ".docx", ".md", ".txt"}
+            all_text = ""
+            file_count = 0
+            for file in sorted(path.iterdir()):
+                if file.is_file() and file.suffix.lower() in SUPPORTED_EXT:
+                    try:
+                        text = extract_text(str(file))
+                        if text.strip():
+                            all_text += f"\n\n--- [{file.name}] ---\n\n" + text
+                            file_count += 1
+                            print(f"  📄 读取: {file.name} ({len(text)} 字符)")
+                    except Exception as e:
+                        print(f"  ⚠️ 跳过 {file.name}: {e}")
+            if not all_text.strip():
+                print("❌ 目录中没有可解析的文件")
+                chunks = []
+            else:
+                print(f"📚 共读取 {file_count} 个文件 ({len(all_text)} 字符)")
+                chunks = chunk_text(all_text, chunk_size=1500, overlap=200)
+                print(f"✂️ 物理切分为 {len(chunks)} 个知识块。")
         else:
-            chunks = [input_source]
+            # 兜底：把 input_source 当原始文本
+            chunks = chunk_text(input_source, chunk_size=1500, overlap=200)
+            print(f"✂️ 原始文本切分为 {len(chunks)} 个知识块。")
 
         # ==========================================
         # 🟢 PHASE 1: MAP (无锁绝对并发)
@@ -214,8 +257,26 @@ class IngestFlow:
 
         t_reduce_start = time.time()
 
+        skipped_count = 0
+        error_count = 0
+        checkpoint_count = 0  # 从检查点跳过的概念数
+        terminated = False
+
         for seq, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
             display_name = payload["display_name"]
+
+            # ── 终止检查（每个概念开始前）──
+            if user_id and kb_name and is_terminate_requested(user_id, kb_name):
+                print(f"\n🛑 [REDUCE] 收到终止信号，在概念 {seq}/{total_concepts} 前停止")
+                terminated = True
+                break
+
+            # ── 检查点跳过（Resume 时已处理的概念不再重复调 LLM）──
+            if user_id and kb_name and is_concept_done(user_id, kb_name, norm_c):
+                checkpoint_count += 1
+                print(f"  ⏩ [{seq}/{total_concepts}] [{display_name}] 已在检查点中，跳过")
+                continue
+
             print(f"  🔄 [融合 {seq}/{total_concepts}] 目标概念: [{display_name}]")
             t0 = time.time()
 
@@ -242,17 +303,36 @@ class IngestFlow:
                     self.writer.execute(report)
                 else:
                     print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
+                    skipped_count += 1
+
+                # ── 保存检查点（融合成功后立即记录）──
+                if user_id and kb_name:
+                    save_concept_checkpoint(user_id, kb_name, norm_c)
 
                 elapsed = time.time() - t0
                 print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)")
 
             except Exception as e:
                 elapsed = time.time() - t0
+                error_count += 1
                 print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
+                # 继续处理下一个概念，不中断整个流水线
 
         t_total = time.time() - t_reduce_start
         print("\n" + "=" * 60)
-        print(f"✅ [IngestFlow] 摄入完毕 | REDUCE 耗时: {t_total:.1f}s | 知识图谱已延展！")
+        stats_parts = [f"REDUCE 耗时: {t_total:.1f}s"]
+        if checkpoint_count:
+            stats_parts.append(f"检查点跳过: {checkpoint_count}")
+        if skipped_count:
+            stats_parts.append(f"无增量: {skipped_count}")
+        if error_count:
+            stats_parts.append(f"失败: {error_count}")
+        if terminated:
+            stats_parts.append("⚠️ 用户终止")
+        print(f"✅ [IngestFlow] 摄入完毕 | {' | '.join(stats_parts)} | 知识图谱已延展！")
+
+        # 返回是否被终止（供外层循环判断）
+        return not terminated
 
 
 if __name__ == "__main__":
