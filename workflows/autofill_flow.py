@@ -1,5 +1,5 @@
 """
-autofill_flow.py — 幽灵节点实例化引擎 (知识黑洞自动填补)
+autofill_flow.py - 幽灵节点实例化引擎 (知识黑洞自动填补)
 """
 import os
 import re
@@ -11,13 +11,13 @@ from collections import Counter
 from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.edit_tools import _resolve, set_context
-from core.path_resolver import get_wiki_root
+from core.path_resolver import get_wiki_root, USE_MINIO
 
 
 class AutoFillFlow:
     def __init__(self, threshold: int = 5):
         """
-        :param threshold: 触发自动填补的最小入度（默认被提及 5 次及以上就触发）
+        :param threshold: 触发自动填补的最小入度(默认被提及 5 次及以上就触发)
         """
         self.threshold = threshold
         self.writer = WikiWriter()
@@ -36,9 +36,165 @@ class AutoFillFlow:
         yield format_log(f"🕳️ [AutoFill Flow] 启动知识黑洞探测器 | 🎯 锁定目标沙箱: {kb_name}")
         await asyncio.sleep(0.01)
 
-        # 设置线程安全上下文（替代 os.environ，解决并发竞态）
+        # 设置线程安全上下文(替代 os.environ,解决并发竞态)
         set_context(user_id=user_id, kb_name=kb_name, sub_dir="")
 
+        if USE_MINIO:
+            # ═══════════════════════════════════════════
+            # MinIO 模式
+            # ═══════════════════════════════════════════
+            from core import storage
+            from core.path_resolver import minio_concepts_prefix, minio_concept_key
+
+            prefix = minio_concepts_prefix(user_id, kb_name)
+            all_keys = storage.list_keys(prefix)
+            concept_keys = [k for k in all_keys if k.endswith(".md") 
+                           and not k.endswith("/index.md") 
+                           and "/mocs/" not in k]
+
+            if not concept_keys:
+                yield format_log("❌ 错误：concepts 核心概念仓不存在，图谱为空，无法探测。")
+                return
+
+            # 1. 扫描与入度统计
+            link_counter = Counter()
+            backlinks_context = {}
+
+            yield format_log("📡 正在全盘解构物理文件并精确提取双向引用权重...")
+            await asyncio.sleep(0.01)
+
+            # 构建文件名索引
+            name_to_key = {}  # clean_name -> key
+            for key in concept_keys:
+                name = key.split("/")[-1].replace(".md", "")
+                name_to_key[name] = key
+
+            for key in concept_keys:
+                name = key.split("/")[-1].replace(".md", "")
+                try:
+                    content = storage.read(key)
+                except Exception:
+                    continue
+                links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
+                for link in links:
+                    clean_link = link.strip()
+                    if not clean_link: continue
+                    link_counter[clean_link] += 1
+                    if clean_link not in backlinks_context:
+                        backlinks_context[clean_link] = []
+                    if name not in backlinks_context[clean_link]:
+                        backlinks_context[clean_link].append(name)
+
+            # 2. 过滤、锁定与【偷天换日】底层链接修复
+            target_ghosts = []
+            existing_names = list(name_to_key.keys())
+
+            def _get_real_target_if_exists_minio(ghost_name: str, names: list) -> str:
+                def _get_aliases(text: str) -> set:
+                    aliases = set()
+                    clean_text = text.lower().replace("-", "").replace("_", "").replace(" ", "")
+                    if clean_text: aliases.add(clean_text)
+                    match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
+                    if match:
+                        part1 = match.group(1).lower().replace("-", "").replace("_", "").replace(" ", "")
+                        part2 = match.group(2).lower().replace("-", "").replace("_", "").replace(" ", "")
+                        if part1: aliases.add(part1)
+                        if part2: aliases.add(part2)
+                    return aliases
+                ghost_aliases = _get_aliases(ghost_name)
+                for n in names:
+                    if ghost_aliases & _get_aliases(n):
+                        return n
+                return ""
+
+            yield format_log("🛠️ [自愈系统] 正在清理异名同义假空节点并自动重定向物理指针...")
+            await asyncio.sleep(0.01)
+
+            for link, count in link_counter.items():
+                real_target = _get_real_target_if_exists_minio(link, existing_names)
+                if real_target:
+                    if link != real_target:
+                        yield format_log(f"  -> 🔀 [偷天换日] 修复假空节点 [{link}] -> 真实归宿 [{real_target}]")
+                        await asyncio.sleep(0.01)
+                        for source_file in backlinks_context[link]:
+                            source_key = name_to_key.get(source_file)
+                            if source_key:
+                                try:
+                                    content = storage.read(source_key)
+                                    pattern = re.compile(rf'\[\[{re.escape(link)}(?:\|([^\]]+))?\]\]')
+                                    new_content = pattern.sub(lambda m: f"[[{real_target}|{m.group(1) or link}]]", content)
+                                    if new_content != content:
+                                        storage.write(source_key, new_content)
+                                except Exception:
+                                    pass
+                else:
+                    if count >= self.threshold:
+                        target_ghosts.append((link, count))
+
+            target_ghosts.sort(key=lambda x: x[1], reverse=True)
+
+            if not target_ghosts:
+                yield format_log("✅ 经脉调理完毕：当前图谱极其健康，未发现任何触发阈值的真空知识黑洞。")
+                return
+
+            yield format_log(f"🎯 警报！全库共探测到 {len(target_ghosts)} 个严重高频真空节点 (被引用 >= {self.threshold}次)：")
+            await asyncio.sleep(0.01)
+
+            # 3. 逐个召唤主编进行物理填补
+            yield format_log("🪄 正在物理启动熔炉，呼叫 WikiEditor / WikiWriter 智能体合成真空实体...")
+            await asyncio.sleep(0.01)
+
+            for node, count in target_ghosts:
+                yield format_log(f"✨ [实例化中] 正在驱动大模型提取上下文并合成新实体: [{node}]")
+                await asyncio.sleep(0.01)
+
+                source_docs_str = ""
+                for source_file in backlinks_context[node][:3]:
+                    source_key = name_to_key.get(source_file)
+                    if source_key:
+                        try:
+                            snippet = storage.read(source_key)[:600]
+                            source_docs_str += f"\n=== {source_file} (提及了该概念) ===\n{snippet}...\n"
+                        except Exception:
+                            pass
+
+                prompt_text = (
+                    f"你是一个知识图谱修复专家。目前系统内有一个核心概念【{node}】被多次引用，"
+                    f"但其独立条目缺失。请基于你的通用知识，以及下面提供的一些本地关联文档的上下文，"
+                    f"直接生成关于【{node}】的详细百科解释。\n\n"
+                    f"关联上下文参考：\n{source_docs_str}"
+                )
+
+                try:
+                    fresh_editor = WikiEditor()
+                    report = fresh_editor.merge(
+                        raw_text=prompt_text,
+                        analyst_summary=f"这是一个高频核心实体，必须创建一个全新的详细词条：{node}",
+                        existing_context=f"=== concepts/{node}.md ===\n(全新概念，待你创建)\n"
+                    )
+
+                    if report and report.get("actions"):
+                        self.writer.execute(report)
+
+                        # 给新生成的实体打上"待审批草稿"烙印
+                        new_key = minio_concept_key(user_id, kb_name, f"{node}.md")
+                        if storage.exists(new_key):
+                            old_content = storage.read(new_key)
+                            storage.write(new_key, "<!-- AUTOFILL_DRAFT -->\n" + old_content)
+
+                        yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: concepts/{node}.md")
+                    else:
+                        yield format_log(f"  -> ⏭️ 智能主编拒绝生成词条: [{node}]")
+                    await asyncio.sleep(0.01)
+                except Exception as e:
+                    yield format_log(f"  -> ❌ 填补节点 [{node}] 发生未知阻断: {e}")
+
+            yield format_log("✅ [AutoFill Flow] 真空幽灵实体全部实例化完毕，图谱暗物质已清除！")
+            return
+
+        # ═══════════════════════════════════════════
+        # 本地模式（保持原样）
+        # ═══════════════════════════════════════════
         concepts_dir = get_wiki_root(user_id) / kb_name / "concepts"
         if not concepts_dir.exists():
             yield format_log("❌ 错误：concepts 核心概念仓不存在，图谱为空，无法探测。")
@@ -161,7 +317,7 @@ class AutoFillFlow:
                 if report and report.get("actions"):
                     self.writer.execute(report)
 
-                    # 💡 核心新增：强制给新生成的实体打上隐形的“待审批草稿”烙印
+                    # 💡 核心新增：强制给新生成的实体打上隐形的"待审批草稿"烙印
                     target_file = concepts_dir / f"{node}.md"
                     if target_file.exists():
                         old_content = target_file.read_text(encoding="utf-8")
@@ -184,7 +340,7 @@ class AutoFillFlow:
             return
         kbs = [p for p in wiki_dir.iterdir() if p.is_dir()]
         if not kbs: return
-        print("\n📂 请选择本地沙箱：")
+        print("\n📂 请选择本地沙箱:")
         for i, kb in enumerate(kbs, 1):
             print(f"  [{i}] {kb.name}")
         choice = input("👉 输入编号: ").strip()

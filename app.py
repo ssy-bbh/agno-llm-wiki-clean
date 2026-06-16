@@ -25,8 +25,26 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from core.path_resolver import (
     get_wiki_root, get_raw_root, get_concepts_dir, get_index_path,
     get_memory_db_path, ensure_user_dirs, list_workspaces, get_default_workspace,
-    PROJECT_ROOT,
+    PROJECT_ROOT, USE_MINIO,
 )
+
+
+# ═══════════════════════════════════════════
+# MinIO 辅助函数（前端 API 共用）
+# ═══════════════════════════════════════════
+
+def _minio_list_concepts(user_id: str, workspace: str) -> list:
+    """列出 MinIO 中指定沙箱的所有概念文件 key（排除 index.md 和 mocs/）"""
+    from core import storage
+    from core.path_resolver import minio_concepts_prefix
+    prefix = minio_concepts_prefix(user_id, workspace)
+    all_keys = storage.list_keys(prefix)
+    return [k for k in all_keys if k.endswith(".md") and not k.endswith("/index.md") and "/mocs/" not in k]
+
+
+def _minio_concept_name(key: str) -> str:
+    """从 MinIO key 提取概念名（不含 .md 后缀）"""
+    return key.split("/")[-1].replace(".md", "")
 from core.auth import (
     AuthRequest, AuthResponse,
     register_user, login_user,
@@ -1069,10 +1087,13 @@ async def _stream_scan_response(query: str, workspace: str, user_id: str = ""):
         total_nodes = 0
         ws_stats = []
         for ws_name in all_ws:
-            concepts_dir = get_concepts_dir(user_id, ws_name)
             count = 0
-            if concepts_dir.exists():
-                count = len([f for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
+            if USE_MINIO:
+                count = len(_minio_list_concepts(user_id, ws_name))
+            else:
+                concepts_dir = get_concepts_dir(user_id, ws_name)
+                if concepts_dir.exists():
+                    count = len([f for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
             total_nodes += count
             ws_stats.append((ws_name, count))
 
@@ -1091,10 +1112,14 @@ async def _stream_scan_response(query: str, workspace: str, user_id: str = ""):
         return
 
     # 指定沙箱扫描
-    concepts_dir = get_concepts_dir(user_id, workspace)
     available = []
-    if concepts_dir.exists():
-        available = sorted([f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
+    if USE_MINIO:
+        concept_keys = _minio_list_concepts(user_id, workspace)
+        available = sorted([_minio_concept_name(k) for k in concept_keys])
+    else:
+        concepts_dir = get_concepts_dir(user_id, workspace)
+        if concepts_dir.exists():
+            available = sorted([f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
 
     if available:
         group_size = 8
@@ -1131,12 +1156,22 @@ async def _stream_summary_response(query: str, workspace: str, user_id: str = ""
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
 
-    index_path = get_index_path(user_id, workspace)
+    index_content = None
+    if USE_MINIO:
+        from core import storage
+        from core.path_resolver import minio_index_key
+        _idx_key = minio_index_key(user_id, workspace)
+        if storage.exists(_idx_key):
+            index_content = storage.read(_idx_key)
+    else:
+        index_path = get_index_path(user_id, workspace)
+        if index_path.exists():
+            index_content = index_path.read_text(encoding="utf-8")
+
     yield f"data: {json.dumps({'type': 'log', 'content': '📋 [概览] 正在读取导航地图 ...'})}\n\n"
     await asyncio.sleep(0.3)
 
-    if index_path.exists():
-        index_content = index_path.read_text(encoding="utf-8")
+    if index_content is not None:
         if len(index_content.strip()) < 50:
             content = f"📋 沙箱 **{workspace}** 的导航地图几乎空白。\n\n建议先进行知识摄入。"
             for i in range(0, len(content), 15):
@@ -1235,6 +1270,14 @@ async def create_workspace(req: SandboxCreate, user=Depends(get_current_user)):
     try:
         wiki_dir.mkdir(parents=True, exist_ok=True)
         raw_dir.mkdir(parents=True, exist_ok=True)
+
+        # MinIO 模式下，初始化 index.md 让沙箱能被列表接口发现
+        if USE_MINIO:
+            from core import storage
+            from core.path_resolver import minio_index_key
+            idx_key = minio_index_key(user_id, safe_name)
+            storage.write(idx_key, f"# {safe_name} - 知识导航\n\n等待知识摄入...\n")
+
         return {"status": "success", "workspace": safe_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"开荒失败: {str(e)}")
@@ -1267,38 +1310,82 @@ async def upload_batch_endpoint(
         if f.size and f.size > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail=f"文件 {f.filename} 超过 50MB 限制")
 
-    raw_dir = get_raw_root(user_id) / workspace
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    # ── 根据 USE_MINIO 决定文件存储方式 ──
+    from core.path_resolver import USE_MINIO
 
-    saved_paths = []
+    saved_paths = []   # MinIO 模式：临时文件路径 | 本地模式：持久路径
+    saved_keys = []    # MinIO 模式：待归档的 MinIO Key
+    file_contents = {} # MinIO 模式：文件名 → 字节数据（后台线程归档用）
+
     try:
-        for f in files:
-            file_path = raw_dir / f.filename
-            contents = await f.read()
-            file_path.write_bytes(contents)
-            saved_paths.append(file_path)
+        import tempfile
+        if USE_MINIO:
+            # MinIO 模式：写入临时文件直接解析，后台异步归档到 MinIO raw/
+            # 省去"先传 MinIO 再下载回来"的网络往返
+            for f in files:
+                contents = await f.read()
+                suffix = Path(f.filename).suffix
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(contents)
+                    tmp_path = tmp.name
+                saved_paths.append(tmp_path)
+                saved_keys.append(f"raw/{user_id}/{workspace}/{f.filename}")
+                file_contents[f.filename] = contents
+        else:
+            # 本地模式：写入 data/raw/{workspace}/
+            raw_dir = get_raw_root(user_id) / workspace
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            for f in files:
+                file_path = raw_dir / f.filename
+                contents = await f.read()
+                file_path.write_bytes(contents)
+                saved_paths.append(file_path)
 
-        # 后台线程：用参数传递代替 os.environ 污染，输出捕获到任务日志
+        total_files = len(saved_paths)
+
+        # 后台线程：执行摄入流程
         def run_background_batch():
-            _write_ingest_status(user_id, workspace, "ingesting", files=len(saved_paths), started=time.time())
+            _write_ingest_status(user_id, workspace, "ingesting", files=total_files, started=time.time())
             # 初始化结构化进度
             task_log.set_progress(
                 user_id, workspace,
-                phase="parsing", current_file=0, total_files=len(saved_paths),
+                phase="parsing", current_file=0, total_files=total_files,
                 current_file_name="", total_chunks=0, map_done=0,
                 total_concepts=0, reduce_done=0, started=time.time(),
             )
             try:
                 with TaskOutputCapture(user_id=user_id, workspace=workspace):
-                    task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {len(saved_paths)} 个文件。AI 正在提炼中，请耐心等待...", "info")
+                    task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {total_files} 个文件。AI 正在提炼中，请耐心等待...", "info")
                     flow = IngestFlow()
-                    for i, fp in enumerate(saved_paths, 1):
-                        print(f"\n🚀 [{user_id}] [{i}/{len(saved_paths)}] 提取: {fp.name} -> {workspace}")
-                        try:
-                            flow.run(str(fp), kb_name=workspace, user_id=user_id)
-                        except Exception as e:
-                            print(f"❌ 提取 {fp.name} 失败: {e}")
-                    task_log.append(user_id, workspace, f"✅ [{user_id}] 全部提炼完成！共处理 {len(saved_paths)} 个文件", "success")
+
+                    if USE_MINIO:
+                        from core import storage
+                        for i, (tmp_path, key) in enumerate(zip(saved_paths, saved_keys), 1):
+                            filename = key.split("/")[-1]
+                            print(f"\n🚀 [{user_id}] [{i}/{total_files}] 提取: {filename} -> {workspace}")
+                            try:
+                                # 异步归档到 MinIO raw/（不阻塞解析）
+                                try:
+                                    storage.upload_bytes(key, file_contents[filename])
+                                except Exception as e:
+                                    print(f"⚠️ MinIO 归档失败（不影响解析）: {e}")
+                                # 直接用临时文件解析
+                                flow.run(tmp_path, kb_name=workspace, user_id=user_id)
+                            except Exception as e:
+                                print(f"❌ 提取 {filename} 失败: {e}")
+                            finally:
+                                # 解析完删除临时文件
+                                Path(tmp_path).unlink(missing_ok=True)
+                    else:
+                        # 本地模式：直接读本地路径
+                        for i, fp in enumerate(saved_paths, 1):
+                            print(f"\n🚀 [{user_id}] [{i}/{total_files}] 提取: {fp.name} -> {workspace}")
+                            try:
+                                flow.run(str(fp), kb_name=workspace, user_id=user_id)
+                            except Exception as e:
+                                print(f"❌ 提取 {fp.name} 失败: {e}")
+
+                    task_log.append(user_id, workspace, f"✅ [{user_id}] 全部提炼完成！共处理 {total_files} 个文件", "success")
             finally:
                 _write_ingest_status(user_id, workspace, "idle")
 
@@ -1321,12 +1408,63 @@ async def upload_batch_endpoint(
 @app.get("/api/workspaces")
 async def get_workspaces(user=Depends(get_current_user)):
     user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage
+        from core.path_resolver import minio_wiki_prefix
+        # MinIO 模式：列出 wiki/{user_id}/ 下的所有前缀作为沙箱
+        prefix = minio_wiki_prefix(user_id)
+        all_keys = storage.list_keys(prefix)
+        # 从 key 中提取沙箱名（第三级目录）
+        workspaces = set()
+        for key in all_keys:
+            # key 格式: wiki/{user_id}/{workspace}/...
+            parts = key.split("/")
+            if len(parts) >= 3 and parts[2]:
+                workspaces.add(parts[2])
+        return sorted(list(workspaces), reverse=True)
+
+    # ── 本地模式 ──
     return list_workspaces(user_id)
 
 
 @app.get("/api/graph")
 async def get_graph(workspace: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage
+        # 1. 列出所有概念文件
+        concept_keys = _minio_list_concepts(user_id, workspace)
+        if not concept_keys:
+            return {"nodes": [], "links": []}
+
+        # 2. 构建节点集合
+        nodes = []
+        node_set = set()
+        for key in concept_keys:
+            name = _minio_concept_name(key)
+            nodes.append({"id": name, "group": 1})
+            node_set.add(name.lower())
+
+        # 3. 读取每个概念内容，提取 [[链接]] 构建边
+        links = []
+        for key in concept_keys:
+            source = _minio_concept_name(key)
+            try:
+                content = storage.read(key)
+            except Exception:
+                continue
+            for match in re.findall(r'\[\[(.*?)\]\]', content):
+                target = match.split("|")[0].strip()
+                if target.lower() == "index":
+                    continue
+                if target.lower() in node_set:
+                    links.append({"source": source, "target": target})
+
+        return {"nodes": nodes, "links": links}
+
+    # ── 本地模式 ──
     base_dir = get_wiki_root(user_id) / workspace
     concepts_dir = base_dir / "concepts"
     search_dir = concepts_dir if concepts_dir.exists() else base_dir
@@ -1370,16 +1508,36 @@ async def get_concept(workspace: str, name: str, user=Depends(get_current_user))
     if not workspace or not name:
         raise HTTPException(status_code=400, detail="缺少 workspace 或 name 参数")
 
+    if USE_MINIO:
+        from core import storage
+        from core.path_resolver import minio_concept_key, minio_concepts_prefix
+
+        # 1. 精确匹配
+        key = minio_concept_key(user_id, workspace, f"{name}.md")
+        if storage.exists(key):
+            content = storage.read(key)
+            return {"content": content, "name": name, "path": f"concepts/{name}.md"}
+
+        # 2. 模糊搜索（在子目录中查找）
+        prefix = minio_concepts_prefix(user_id, workspace)
+        all_keys = storage.list_keys(prefix)
+        for k in all_keys:
+            if k.endswith(f"/{name}.md"):
+                content = storage.read(k)
+                rel_path = k.replace(prefix, "")
+                return {"content": content, "name": name, "path": rel_path}
+
+        raise HTTPException(status_code=404, detail=f"概念 [{name}] 不存在于沙箱 [{workspace}]")
+
+    # ── 本地模式 ──
     base_dir = get_wiki_root(user_id) / workspace
     concepts_dir = base_dir / "concepts"
 
-    # 先精确匹配 concepts/{name}.md，再 rglob 递归搜索
     candidates = []
     exact = concepts_dir / f"{name}.md"
     if exact.exists():
         candidates.append(exact)
     else:
-        # rglob 在子目录中查找
         for fp in concepts_dir.rglob(f"{name}.md"):
             candidates.append(fp)
             break
@@ -1405,6 +1563,30 @@ async def get_inbox(workspace: str, user=Depends(get_current_user)):
     if not workspace:
         return []
     user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage
+        concept_keys = _minio_list_concepts(user_id, workspace)
+        files = []
+        for key in concept_keys:
+            try:
+                content = storage.read(key)
+            except Exception:
+                continue
+            if DRAFT_TAG not in content:
+                continue
+            name = _minio_concept_name(key)
+            clean = re.sub(r'<.*?AUTOFILL_DRAFT.*?>', '', content)
+            clean = re.sub(r'[#*\[\]\n]', ' ', clean)[:40].strip()
+            files.append({
+                "id": name,
+                "title": name,
+                "excerpt": f"{clean}..." if clean else "无正文内容...",
+                "timestamp": 0,
+            })
+        return files[:4]
+
+    # ── 本地模式 ──
     concepts_dir = get_concepts_dir(user_id, workspace)
     if not concepts_dir.exists():
         return []
@@ -1435,6 +1617,18 @@ async def get_inbox(workspace: str, user=Depends(get_current_user)):
 @app.post("/api/inbox/approve")
 async def approve_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage
+        from core.path_resolver import minio_concept_key
+        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
+        if storage.exists(key):
+            content = storage.read(key)
+            content = content.replace(DRAFT_TAG + "\n", "").replace(DRAFT_TAG, "")
+            storage.write(key, content)
+        return {"status": "success"}
+
+    # ── 本地模式 ──
     filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if filepath.exists():
         content = filepath.read_text(encoding="utf-8")
@@ -1451,6 +1645,61 @@ async def get_radar(workspace: str, user=Depends(get_current_user)):
     if not workspace:
         return []
     user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage
+        from collections import Counter
+
+        concept_keys = _minio_list_concepts(user_id, workspace)
+        if not concept_keys:
+            return []
+
+        link_counter = Counter()
+        existing_names = []
+        for key in concept_keys:
+            name = _minio_concept_name(key)
+            existing_names.append(name)
+            try:
+                content = storage.read(key)
+            except Exception:
+                continue
+            for link in re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content):
+                clean = link.strip()
+                if clean:
+                    link_counter[clean] += 1
+
+        def _get_real_target(ghost: str, names: list) -> str:
+            def _aliases(text: str) -> set:
+                a = set()
+                c = text.lower().replace("-", "").replace("_", "").replace(" ", "")
+                if c:
+                    a.add(c)
+                m = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
+                if m:
+                    for p in [m.group(1), m.group(2)]:
+                        p = p.lower().replace("-", "").replace("_", "").replace(" ", "")
+                        if p:
+                            a.add(p)
+                return a
+            ga = _aliases(ghost)
+            for n in names:
+                if ga & _aliases(n):
+                    return n
+            return ""
+
+        ghosts = []
+        for link, count in link_counter.items():
+            real = _get_real_target(link, existing_names)
+            if not real and link.lower() != "index" and count >= 1:
+                ghosts.append((link, count))
+        ghosts.sort(key=lambda x: x[1], reverse=True)
+
+        return [
+            {"concept": name, "urgency": min(100, count * 12), "mentions": count}
+            for name, count in ghosts[:5]
+        ]
+
+    # ── 本地模式 ──
     concepts_dir = get_concepts_dir(user_id, workspace)
     if not concepts_dir.exists():
         return []
@@ -1508,6 +1757,17 @@ async def get_radar(workspace: str, user=Depends(get_current_user)):
 @app.get("/api/inbox/file")
 async def get_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage
+        from core.path_resolver import minio_concept_key
+        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
+        if not storage.exists(key):
+            raise HTTPException(status_code=404)
+        content = storage.read(key).replace(DRAFT_TAG + "\n", "")
+        return {"content": content}
+
+    # ── 本地模式 ──
     filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if not filepath.exists():
         raise HTTPException(status_code=404)
@@ -1518,6 +1778,16 @@ async def get_inbox_file(workspace: str, file_id: str, user=Depends(get_current_
 @app.post("/api/inbox/reject")
 async def reject_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage
+        from core.path_resolver import minio_concept_key
+        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
+        if storage.exists(key):
+            storage.delete(key)
+        return {"status": "success"}
+
+    # ── 本地模式 ──
     filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if filepath.exists():
         filepath.unlink()

@@ -10,7 +10,8 @@ from agents.wiki_analyst import WikiAnalyst
 from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
-from tools.edit_tools import _resolve, set_context
+from tools.edit_tools import _resolve, set_context, USE_MINIO, _resolve_key
+from core.path_resolver import minio_concepts_prefix, minio_index_key
 
 
 class IngestFlow:
@@ -35,13 +36,26 @@ class IngestFlow:
 
     def _build_concept_index(self):
         """🔧 P0-1: 一次性构建概念文件索引，后续查找 O(1)"""
-        concepts_dir = _resolve("concepts")
         index = {}
-        if concepts_dir.exists():
-            for f in concepts_dir.glob("*.md"):
-                norm = self._normalize_name(f.stem)
-                if norm:
-                    index[norm] = f
+        if USE_MINIO:
+            from core import storage
+            from tools.edit_tools import get_context
+            ctx = get_context()
+            prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
+            all_keys = storage.list_keys(prefix)
+            for key in all_keys:
+                if key.endswith(".md"):
+                    stem = key.split("/")[-1].replace(".md", "")
+                    norm = self._normalize_name(stem)
+                    if norm:
+                        index[norm] = key  # MinIO key 字符串
+        else:
+            concepts_dir = _resolve("concepts")
+            if concepts_dir.exists():
+                for f in concepts_dir.glob("*.md"):
+                    norm = self._normalize_name(f.stem)
+                    if norm:
+                        index[norm] = f  # 本地 Path 对象
         self._concept_index = index
         print(f"  📇 概念索引已构建: {len(index)} 个文件")
 
@@ -63,11 +77,17 @@ class IngestFlow:
                         return f
         return None
 
-    def _read_file_cached(self, filepath: Path) -> str:
+    def _read_file_cached(self, filepath) -> str:
         """🔧 P0-2: 带缓存的文件读取，同一批次内不重复读盘"""
         key = str(filepath)
         if key not in self._file_cache:
-            self._file_cache[key] = filepath.read_text(encoding="utf-8")
+            if USE_MINIO and not isinstance(filepath, Path):
+                # MinIO 模式：filepath 是 MinIO key 字符串
+                from core import storage
+                self._file_cache[key] = storage.read(filepath)
+            else:
+                # 本地模式：filepath 是 Path 对象
+                self._file_cache[key] = filepath.read_text(encoding="utf-8")
         return self._file_cache[key]
 
     def _fetch_local_context(self, concepts: list) -> str:
@@ -77,22 +97,45 @@ class IngestFlow:
             return self._context_cache[cache_key]
 
         context_str = "\n"
-        index_path = _resolve("index.md")
 
-        if index_path.exists():
-            context_str += f"=== index.md (导航地图) ===\n{self._read_file_cached(index_path)}\n\n"
-        else:
-            context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
+        if USE_MINIO:
+            from core import storage
+            from tools.edit_tools import get_context
+            ctx = get_context()
+            idx_key = minio_index_key(ctx["user_id"], ctx["kb_name"])
 
-        for concept in concepts:
-            real_file = self._find_existing_file(concept)
-            if real_file:
-                content = self._read_file_cached(real_file)
-                rel_path = f"concepts/{real_file.name}"
-                context_str += f"=== {rel_path} (本地已存在) ===\n{content}\n\n"
+            if storage.exists(idx_key):
+                context_str += f"=== index.md (导航地图) ===\n{self._read_file_cached(idx_key)}\n\n"
             else:
-                safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
-                context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
+                context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
+
+            for concept in concepts:
+                existing_key = self._find_existing_file(concept)
+                if existing_key:
+                    content = self._read_file_cached(existing_key)
+                    file_name = existing_key.split("/")[-1]
+                    rel_path = f"concepts/{file_name}"
+                    context_str += f"=== {rel_path} (已存在) ===\n{content}\n\n"
+                else:
+                    safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+                    context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
+        else:
+            index_path = _resolve("index.md")
+
+            if index_path.exists():
+                context_str += f"=== index.md (导航地图) ===\n{self._read_file_cached(index_path)}\n\n"
+            else:
+                context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
+
+            for concept in concepts:
+                real_file = self._find_existing_file(concept)
+                if real_file:
+                    content = self._read_file_cached(real_file)
+                    rel_path = f"concepts/{real_file.name}"
+                    context_str += f"=== {rel_path} (本地已存在) ===\n{content}\n\n"
+                else:
+                    safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+                    context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
 
         self._context_cache[cache_key] = context_str
         return context_str

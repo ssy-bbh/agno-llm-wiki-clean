@@ -5,7 +5,7 @@ import json
 import asyncio
 from pathlib import Path
 
-from core.path_resolver import get_wiki_root
+from core.path_resolver import get_wiki_root, USE_MINIO
 
 
 class LintFlow:
@@ -25,6 +25,124 @@ class LintFlow:
         def format_log(msg: str):
             return f"data: {json.dumps({'type': 'log', 'content': msg})}\n\n"
 
+        yield format_log(f"🕷️ [LintFlow] 启动审查与织网流水线 | 🎯 锁定沙箱: [{kb_name}]")
+        await asyncio.sleep(0.01)
+
+        if USE_MINIO:
+            # ═══════════════════════════════════════════
+            # MinIO 模式
+            # ═══════════════════════════════════════════
+            from core import storage
+            from core.path_resolver import minio_concepts_prefix
+
+            prefix = minio_concepts_prefix(user_id, kb_name)
+            all_keys = storage.list_keys(prefix)
+            # 过滤出 .md 文件，排除 index.md 和 mocs/
+            concept_keys = [k for k in all_keys if k.endswith(".md") 
+                           and not k.endswith("/index.md") 
+                           and "/mocs/" not in k]
+
+            if not concept_keys:
+                yield format_log(f"⚠️ 该沙箱概念仓为空，无需织网。")
+                return
+
+            yield format_log(f"📂 在 [{kb_name}] 核心概念仓中发现 {len(concept_keys)} 个页面。")
+            await asyncio.sleep(0.01)
+
+            # 记录映射表： target_concept -> set(source_file_names)
+            backlinks_map = {}
+
+            yield format_log("🔍 正在地毯式提取跨文件正向引用引用链...")
+            await asyncio.sleep(0.01)
+
+            # 构建文件名索引（用于后续查找）
+            filename_index = {}  # clean_name -> key
+            for key in concept_keys:
+                name = key.split("/")[-1].replace(".md", "")
+                clean = name.lower().replace("-", "").replace("_", "").replace(" ", "")
+                filename_index[clean] = key
+
+            for key in concept_keys:
+                name = key.split("/")[-1].replace(".md", "")
+                if name in ["index", "log"]:
+                    continue
+
+                try:
+                    content = storage.read(key)
+                except Exception as e:
+                    yield format_log(f"⚠️ 读取失败: {key} - {e}")
+                    continue
+
+                # 找到当前文件里所有的 [[概念]] 和 [[别名|显示文本]]
+                links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
+
+                for target in links:
+                    target_clean = target.strip()
+                    if not target_clean:
+                        continue
+                    if target_clean not in backlinks_map:
+                        backlinks_map[target_clean] = set()
+                    backlinks_map[target_clean].add(name)
+
+            yield format_log(f"🕸️ 扫描完毕，累计发现 {len(backlinks_map)} 个处于引用状态的概念节点。")
+            await asyncio.sleep(0.01)
+
+            yield format_log("✍️ 正在自动进行反向链接 (Backlinks) 索引的物理写回...")
+            await asyncio.sleep(0.01)
+
+            updated_count = 0
+            dead_links = []
+
+            for target_concept, sources in backlinks_map.items():
+                # O(1) 索引查找
+                clean_target = target_concept.lower().replace("-", "").replace("_", "").replace(" ", "")
+                target_key = filename_index.get(clean_target)
+
+                if not target_key:
+                    dead_links.append(target_concept)
+                    continue
+
+                try:
+                    content = storage.read(target_key)
+                except Exception:
+                    dead_links.append(target_concept)
+                    continue
+
+                # 构造要注入的反向链接字符串
+                backlink_section = "\n## Backlinks\n"
+                for src in sources:
+                    backlink_section += f"- [[{src}]]\n"
+
+                # 简单剥离旧的 Backlinks 及之后的内容
+                if "## Backlinks" in content:
+                    content = content.split("## Backlinks")[0].strip()
+
+                # 追加新的反向链接
+                new_content = content + "\n\n" + backlink_section
+
+                try:
+                    storage.write(target_key, new_content)
+                    updated_count += 1
+                    target_name = target_key.split("/")[-1]
+                    yield format_log(f"  -> 🔗 成功重织反向链接节点: [{target_name}]")
+                    await asyncio.sleep(0.01)
+                except Exception as e:
+                    yield format_log(f"  -> ❌ 写回失败: {target_key} - {e}")
+
+            yield format_log(f"✅ 成功物理更新了 {updated_count} 个实体的拓扑索引！")
+            await asyncio.sleep(0.01)
+
+            if dead_links:
+                dead_str = ", ".join(list(dead_links)[:5]) + (" ..." if len(dead_links) > 5 else "")
+                yield format_log(f"⚠️ 核心警告：全库发现 {len(dead_links)} 个【幽灵死链】(有提及但在库中无文件): {dead_str}")
+                await asyncio.sleep(0.01)
+
+            yield format_log(f"🕸️ [LintFlow] [{kb_name}] 织网完成，沙箱局部知识拓扑已彻底闭环！")
+            return
+
+        # ═══════════════════════════════════════════
+        # 本地模式（保持原样）
+        # ═══════════════════════════════════════════
         target_kb_dir = get_wiki_root(user_id) / kb_name
         if not target_kb_dir.exists():
             yield format_log(f"❌ 错误：在物理硬盘上未检测到目标沙箱路径: {target_kb_dir}")
