@@ -15,6 +15,20 @@ try:
 except ImportError:
     docx = None
 
+# OCR fallback（扫描图片 PDF）
+try:
+    from pdfminer.high_level import extract_text as _pdfminer_extract
+    _HAS_PDFMINER = True
+except ImportError:
+    _HAS_PDFMINER = False
+
+try:
+    import pytesseract
+    from pdf2image import convert_from_path
+    _HAS_OCR = True
+except ImportError:
+    _HAS_OCR = False
+
 
 def extract_text(file_path: str) -> str:
     """自动识别后缀，提取纯文本"""
@@ -28,11 +42,54 @@ def extract_text(file_path: str) -> str:
     if ext == ".pdf":
         if not pdfplumber:
             raise ImportError("请先安装 pdfplumber: pip install pdfplumber")
+        print(f"  [解析] 打开 PDF: {path.name} ({path.stat().st_size} bytes)", flush=True)
         with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
+            print(f"  [解析] PDF 共 {len(pdf.pages)} 页", flush=True)
+            empty_pages = 0
+            for i, page in enumerate(pdf.pages):
                 extracted = page.extract_text()
-                if extracted:
+                chars = len(extracted) if extracted else 0
+                if chars > 0:
                     text += extracted + "\n\n"
+                else:
+                    empty_pages += 1
+            print(f"  [解析] pdfplumber 提取: {len(text)} 字符 ({empty_pages}/{len(pdf.pages)} 页为空)", flush=True)
+
+        # ── Fallback 1: pdfminer（不同的文本提取引擎）──
+        if not text.strip() and _HAS_PDFMINER:
+            print("  [解析] pdfplumber 提取为空，尝试 pdfminer...", flush=True)
+            try:
+                text = _pdfminer_extract(str(path))
+                print(f"  [解析] pdfminer 提取: {len(text)} 字符", flush=True)
+            except Exception as e:
+                print(f"  [解析] pdfminer 失败: {e}", flush=True)
+
+        # ── Fallback 2: OCR（扫描图片 PDF）──
+        if not text.strip() and _HAS_OCR:
+            print("  [解析] 文本提取均为空，启动 OCR 识别扫描图片...", flush=True)
+            try:
+                images = convert_from_path(str(path))
+                ocr_parts = []
+                for i, img in enumerate(images):
+                    ocr_text = pytesseract.image_to_string(img, lang="eng+chi_sim")
+                    if ocr_text.strip():
+                        ocr_parts.append(ocr_text)
+                    print(f"  [解析] OCR 第 {i+1} 页: {len(ocr_text)} 字符", flush=True)
+                text = "\n\n".join(ocr_parts)
+                print(f"  [解析] OCR 总计: {len(text)} 字符", flush=True)
+            except Exception as e:
+                print(f"  [解析] OCR 失败: {e}", flush=True)
+
+        # ── 诊断提示 ──
+        if not text.strip():
+            msg_parts = ["⚠️ PDF 提取文本为空！"]
+            if not _HAS_OCR:
+                msg_parts.append("这是扫描图片 PDF，需要安装 OCR 支持：")
+                msg_parts.append("  pip install pytesseract pdf2image")
+                msg_parts.append("  并安装 Tesseract: https://tesseract-ocr.github.io/tessdoc/Installation.html")
+            else:
+                msg_parts.append("OCR 也未能识别，PDF 可能损坏或为纯图片格式。")
+            print("\n".join(msg_parts), flush=True)
 
     elif ext == ".docx":
         if not docx:
