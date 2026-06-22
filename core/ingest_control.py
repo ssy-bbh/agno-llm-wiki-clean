@@ -55,6 +55,7 @@ def _read_checkpoint(user_id: str, workspace: str) -> dict:
 
 def save_concept_checkpoint(user_id: str, workspace: str, concept_key: str):
     """记录一个已完成融合的概念"""
+    CONTROL_DIR.mkdir(parents=True, exist_ok=True)
     cp = _read_checkpoint(user_id, workspace)
     if concept_key not in cp["concepts"]:
         cp["concepts"].append(concept_key)
@@ -65,6 +66,7 @@ def save_concept_checkpoint(user_id: str, workspace: str, concept_key: str):
 
 def save_file_checkpoint(user_id: str, workspace: str, filename: str):
     """记录一个已完整处理的文件"""
+    CONTROL_DIR.mkdir(parents=True, exist_ok=True)
     cp = _read_checkpoint(user_id, workspace)
     if filename not in cp["files_done"]:
         cp["files_done"].append(filename)
@@ -93,6 +95,7 @@ def clear_checkpoint(user_id: str, workspace: str):
 
 def mark_terminated(user_id: str, workspace: str):
     """在检查点中标记终止时间"""
+    CONTROL_DIR.mkdir(parents=True, exist_ok=True)
     cp = _read_checkpoint(user_id, workspace)
     cp["terminated_at"] = time.time()
     _checkpoint_path(user_id, workspace).write_text(

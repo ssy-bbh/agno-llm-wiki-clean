@@ -64,3 +64,18 @@ def list_keys(prefix: str) -> list:
 
 def delete(key: str):
     get_client().remove_object(BUCKET, key)
+
+
+def delete_prefix(prefix: str) -> int:
+    """删除指定前缀下的所有对象，返回删除数量"""
+    from minio.deleteobjects import DeleteObject
+    keys = list_keys(prefix)
+    if not keys:
+        return 0
+    errors = list(get_client().remove_objects(
+        BUCKET,
+        [DeleteObject(key) for key in keys]
+    ))
+    if errors:
+        print(f"⚠️ MinIO 批量删除 {prefix} 有 {len(errors)} 个对象删除失败", flush=True)
+    return len(keys) - len(errors)

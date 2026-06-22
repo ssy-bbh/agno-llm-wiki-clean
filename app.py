@@ -1303,19 +1303,19 @@ async def create_workspace(req: SandboxCreate, user=Depends(get_current_user)):
     if not safe_name:
         raise HTTPException(status_code=400, detail="非法的沙箱名称！")
 
-    wiki_dir = get_wiki_root(user_id) / safe_name / "concepts"
-    raw_dir = get_raw_root(user_id) / safe_name
-
     try:
-        wiki_dir.mkdir(parents=True, exist_ok=True)
-        raw_dir.mkdir(parents=True, exist_ok=True)
-
-        # MinIO 模式下，初始化 index.md 让沙箱能被列表接口发现
         if USE_MINIO:
+            # MinIO 模式：只初始化 index.md，不创建本地目录
             from core import storage
             from core.path_resolver import minio_index_key
             idx_key = minio_index_key(user_id, safe_name)
             storage.write(idx_key, f"# {safe_name} - 知识导航\n\n等待知识摄入...\n")
+        else:
+            # 本地模式：创建本地目录
+            wiki_dir = get_wiki_root(user_id) / safe_name / "concepts"
+            raw_dir = get_raw_root(user_id) / safe_name
+            wiki_dir.mkdir(parents=True, exist_ok=True)
+            raw_dir.mkdir(parents=True, exist_ok=True)
 
         return {"status": "success", "workspace": safe_name}
     except Exception as e:
@@ -1353,8 +1353,19 @@ async def delete_workspace(name: str, user=Depends(get_current_user)):
             f.unlink(missing_ok=True)
             deleted.append(str(f))
 
-    print(f"🗑️ 沙箱已删除: {user_id}/{safe_name}, 清理了 {len(deleted)} 项", flush=True)
-    return {"status": "success", "deleted": len(deleted)}
+    # MinIO 模式：同时清理 MinIO 中的对象
+    minio_deleted = 0
+    if USE_MINIO:
+        from core import storage
+        from core.path_resolver import minio_wiki_prefix, minio_raw_prefix
+        wiki_prefix = minio_wiki_prefix(user_id, safe_name)
+        raw_prefix = minio_raw_prefix(user_id, safe_name)
+        minio_deleted += storage.delete_prefix(wiki_prefix)
+        minio_deleted += storage.delete_prefix(raw_prefix)
+
+    total = len(deleted) + minio_deleted
+    print(f"🗑️ 沙箱已删除: {user_id}/{safe_name}, 本地清理 {len(deleted)} 项, MinIO 清理 {minio_deleted} 个对象", flush=True)
+    return {"status": "success", "deleted": total, "local_deleted": len(deleted), "minio_deleted": minio_deleted}
 
 
 # ==========================================
@@ -1481,8 +1492,8 @@ async def upload_batch_endpoint(
                                     storage.upload_bytes(key, file_contents[filename])
                                 except Exception as e:
                                     print(f"⚠️ MinIO 归档失败（不影响解析）: {e}")
-                                # 直接用临时文件解析
-                                result = flow.run(tmp_path, kb_name=workspace, user_id=user_id)
+                                # 直接用临时文件解析，传入原始文件名避免日志显示临时名
+                                result = flow.run(tmp_path, kb_name=workspace, user_id=user_id, doc_name=Path(filename).stem)
                                 if result is False:
                                     terminated = True
                                     task_log.append(user_id, workspace, f"🛑 摄入在文件 {filename} 内被终止", "warning")
@@ -1594,7 +1605,109 @@ async def resume_ingest(
     clear_terminate(user_id, workspace)
     print(f"🔄 [RESUME] user={user_id} workspace={workspace}", flush=True)
 
-    # 查找 raw 目录中的所有文件
+    # 获取检查点信息
+    cp = get_checkpoint(user_id, workspace)
+    done_concepts = len(cp.get("concepts", []))
+    done_files = set(cp.get("files_done", []))
+
+    if USE_MINIO:
+        # ── MinIO 模式：从 MinIO raw/ 下载文件到临时目录 ──
+        from core import storage as minio_storage
+        from core.path_resolver import minio_raw_prefix
+
+        raw_prefix = minio_raw_prefix(user_id, workspace)
+        all_keys = minio_storage.list_keys(raw_prefix)
+        if not all_keys:
+            raise HTTPException(status_code=404, detail="MinIO raw/ 中未找到已上传的原始文件")
+
+        # 过滤已完成文件
+        all_filenames = [k.split("/")[-1] for k in all_keys if k.split("/")[-1]]
+        remaining_items = [(k, k.split("/")[-1]) for k in all_keys
+                           if k.split("/")[-1] not in done_files]
+        print(f"🔄 [RESUME/MINIO] raw_keys={[k.split('/')[-1] for k in all_keys]} done_files={done_files} remaining={len(remaining_items)}", flush=True)
+
+        if not remaining_items:
+            raise HTTPException(status_code=400, detail=f"所有文件均已处理完成（{len(done_files)} 个），无需继续摄入")
+
+        remaining_count = len(remaining_items)
+
+        resume_gen = _next_ingest_gen(user_id, workspace)
+        _write_ingest_status(user_id, workspace, "ingesting", files=remaining_count, started=time.time(), gen=resume_gen)
+        task_log.set_progress(
+            user_id, workspace,
+            phase="parsing", current_file=0, total_files=remaining_count,
+            current_file_name="", total_chunks=0, map_done=0,
+            total_concepts=done_concepts, reduce_done=done_concepts,
+            started=time.time(),
+        )
+
+        def run_resume_batch():
+            clear_terminate(user_id, workspace)
+            terminated = False
+            try:
+                with TaskOutputCapture(
+                    user_id=user_id, workspace=workspace,
+                    checkpoint_concepts=done_concepts, checkpoint_reduce=done_concepts,
+                    gen=resume_gen, gen_fn=lambda: _current_ingest_gen(user_id, workspace),
+                ):
+                    task_log.append(
+                        user_id, workspace,
+                        f"🔄 [继续摄入/MINIO] 重启流水线，共 {remaining_count} 个待处理文件"
+                        f"（跳过 {len(done_files)} 个已完成文件）。"
+                        f"已有 {done_concepts} 个概念在检查点中将被跳过。", "info"
+                    )
+                    import tempfile
+                    flow = IngestFlow()
+                    for i, (key, filename) in enumerate(remaining_items, 1):
+                        if _current_ingest_gen(user_id, workspace) != resume_gen:
+                            task_log.append(user_id, workspace, "⚡ 新的摄入任务已启动，旧线程自动退出", "info")
+                            terminated = True
+                            break
+                        if is_terminate_requested(user_id, workspace):
+                            task_log.append(user_id, workspace, f"🛑 用户再次终止", "warning")
+                            terminated = True
+                            break
+                        print(f"\n🚀 [{user_id}] [resume {i}/{remaining_count}] {filename} (from MinIO)")
+                        try:
+                            # 下载到临时文件
+                            suffix = Path(filename).suffix
+                            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                                tmp_path = tmp.name
+                            minio_storage.download_file(key, tmp_path)
+                            result = flow.run(tmp_path, kb_name=workspace, user_id=user_id, doc_name=Path(filename).stem)
+                            Path(tmp_path).unlink(missing_ok=True)
+                            if result is False:
+                                terminated = True
+                                break
+                            save_file_checkpoint(user_id, workspace, filename)
+                        except Exception as e:
+                            print(f"❌ {filename} 失败: {e}")
+
+                    if not terminated:
+                        task_log.append(user_id, workspace, f"✅ [继续摄入/MINIO] 全部完成！", "success")
+            finally:
+                if _current_ingest_gen(user_id, workspace) == resume_gen:
+                    if terminated:
+                        mark_terminated(user_id, workspace)
+                        task_log.set_progress(
+                            user_id, workspace,
+                            phase="idle", current_file=0, total_files=0,
+                            current_file_name="", total_chunks=0, map_done=0,
+                            total_concepts=0, reduce_done=0, started=0,
+                        )
+                    _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
+
+        threading.Thread(target=run_resume_batch, daemon=True).start()
+
+        return {
+            "status": "ok",
+            "message": f"继续摄入已启动，{remaining_count} 个文件（跳过 {len(done_files)} 个已完成），{done_concepts} 个概念将从检查点跳过",
+            "files": [fn for _, fn in remaining_items],
+            "checkpoint_concepts": done_concepts,
+            "skipped_files": list(done_files),
+        }
+
+    # ── 本地模式 ──
     raw_dir = get_raw_root(user_id) / workspace
     if not raw_dir.exists():
         print(f"❌ [RESUME] raw_dir not found: {raw_dir}", flush=True)
@@ -1605,10 +1718,6 @@ async def resume_ingest(
     if not saved_paths:
         raise HTTPException(status_code=404, detail="raw 目录为空")
 
-    # 获取检查点信息：跳过已完整处理的文件
-    cp = get_checkpoint(user_id, workspace)
-    done_concepts = len(cp.get("concepts", []))
-    done_files = set(cp.get("files_done", []))
     remaining_paths = [f for f in saved_paths if f.name not in done_files]
     print(f"🔄 [RESUME] raw_files={[f.name for f in saved_paths]} done_files={done_files} remaining={len(remaining_paths)} done_concepts={done_concepts}", flush=True)
 

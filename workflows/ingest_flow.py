@@ -188,11 +188,12 @@ class IngestFlow:
         except Exception as e:
             return chunk_id, chunk, None, f"报错: {str(e)}"
 
-    def run(self, input_source: str, kb_name: str = "", user_id: str = ""):
+    def run(self, input_source: str, kb_name: str = "", user_id: str = "", doc_name: str = ""):
         """
         知识摄入入口。
         kb_name: 目标沙箱名称（通过参数传递，避免 os.environ 竞态）
         user_id: 用户 ID（用于路径隔离）
+        doc_name: 原始文档名（MinIO 模式下传入，避免使用临时文件名）
         """
         # 在调用任何 _resolve 前，设置线程安全上下文
         set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
@@ -211,8 +212,9 @@ class IngestFlow:
         path = Path(input_source)
         if path.exists() and path.is_file():
             # ── 单文件模式 ──
-            set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=path.stem)
-            print(f"📄 目标语料：{path.name} ({path.stat().st_size} bytes)", flush=True)
+            _doc = doc_name or path.stem
+            set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=_doc)
+            print(f"📄 目标语料：{_doc} ({path.stat().st_size} bytes)", flush=True)
             try:
                 raw_text = extract_text(str(path))
             except Exception as e:
