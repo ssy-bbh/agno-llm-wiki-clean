@@ -59,25 +59,6 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
   const [messages, setMessages] = useState([])
   const [isTyping, setIsTyping] = useState(false)
   const [isLoadingHistory, setIsLoadingHistory] = useState(false)
-  const [webSearchEnabled, setWebSearchEnabled] = useState(true)
-
-  // 🌐 加载联网搜索开关状态
-  useEffect(() => {
-    apiFetch('/api/web-search/status')
-      .then(r => r.json())
-      .then(d => setWebSearchEnabled(d.enabled))
-      .catch(() => {})
-  }, [])
-
-  const toggleWebSearch = async () => {
-    const next = !webSearchEnabled
-    setWebSearchEnabled(next)
-    try {
-      await apiFetch(`/api/web-search/toggle?enabled=${next}`, { method: 'POST' })
-    } catch (e) {
-      console.error('toggle web search error:', e)
-    }
-  }
   const messagesEndRef = useRef(null)
   const prevSessionIdRef = useRef(null)
 
@@ -217,6 +198,17 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
                   }
                   return newMsgs
                 })
+              } else if (data.type === 'error') {
+                setMessages(prev => {
+                  const newMsgs = [...prev]
+                  const lastIdx = newMsgs.length - 1
+                  newMsgs[lastIdx] = {
+                    ...newMsgs[lastIdx],
+                    content: data.content,
+                    isError: true
+                  }
+                  return newMsgs
+                })
               }
             } catch (err) {
               console.warn("解析 SSE 数据包失败:", dataStr, err)
@@ -285,7 +277,11 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
 
                   {/* 回答正文气泡 */}
                   {msg.content && (
-                    <div className="bg-slate-800/40 border border-slate-800/60 rounded-2xl px-5 py-4 text-slate-200 text-sm shadow-sm leading-relaxed">
+                    <div className={`rounded-2xl px-5 py-4 text-sm shadow-sm leading-relaxed ${
+                      msg.isError
+                        ? 'bg-red-500/10 border border-red-500/30 text-red-200'
+                        : 'bg-slate-800/40 border border-slate-800/60 text-slate-200'
+                    }`}>
                       <div className="prose prose-invert max-w-none prose-sm prose-a:text-cyan-400 hover:prose-a:text-cyan-300">
                         <ReactMarkdown
                           remarkPlugins={remarkPlugins}
@@ -327,17 +323,6 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
             className="flex-1 bg-transparent text-slate-200 text-sm px-3 focus:outline-none placeholder-slate-500"
             disabled={isTyping}
           />
-          <button
-            onClick={toggleWebSearch}
-            title={webSearchEnabled ? '联网搜索已开启，点击关闭' : '联网搜索已关闭，点击开启'}
-            className={`px-2.5 py-2 rounded-lg text-sm transition-all duration-200 flex items-center justify-center ${
-              webSearchEnabled
-                ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40 hover:bg-cyan-500/30'
-                : 'bg-slate-800 text-slate-500 border border-slate-700/40 hover:bg-slate-700'
-            }`}
-          >
-            {webSearchEnabled ? '🌐' : '🔒'}
-          </button>
           <button
             onClick={handleSend}
             disabled={isTyping || !input.trim()}

@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import time
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,10 @@ from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
 from tools.edit_tools import _resolve, set_context
+from core.ingest_control import (
+    is_terminate_requested, save_concept_checkpoint,
+    is_concept_done, save_file_checkpoint
+)
 
 
 class IngestFlow:
@@ -22,52 +27,107 @@ class IngestFlow:
         self.writer = WikiWriter()
         # Editor 会在循环内动态实例化，防止上下文记忆污染
 
+        # ═══ P0 优化：缓存与索引 ═══
+        self._file_cache = {}           # {filepath: content} 文件内容缓存
+        self._context_cache = {}        # {concept_tuple: context_str} 上下文缓存
+        self._concept_index = {}        # {normalized_name: Path} 概念文件索引
+
     def _normalize_name(self, text: str) -> str:
         if not text:
             return ""
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
-    def _find_existing_file(self, concept: str) -> Path:
-        """同义词嗅探器：使用 _resolve 精准定位到当前激活的沙箱路径下"""
+    def _build_concept_index(self):
+        """🔧 P0-1: 一次性构建概念文件索引，后续查找 O(1)"""
         concepts_dir = _resolve("concepts")
-        if not concepts_dir.exists():
-            return None
+        index = {}
+        if concepts_dir.exists():
+            for f in concepts_dir.glob("*.md"):
+                norm = self._normalize_name(f.stem)
+                if norm:
+                    index[norm] = f
+        self._concept_index = index
+        print(f"  📇 概念索引已构建: {len(index)} 个文件")
 
+    def _find_existing_file(self, concept: str) -> Path:
+        """同义词嗅探器：基于预构建索引 O(1) 查找，回退模糊匹配"""
         norm_c = self._normalize_name(concept)
         if not norm_c:
             return None
 
-        for f in concepts_dir.glob("*.md"):
-            norm_f = self._normalize_name(f.stem)
-            if norm_c == norm_f:
-                return f
-            # 模糊包含匹配
-            if len(norm_c) > 2 and len(norm_f) > 2:
-                if norm_c in norm_f or norm_f in norm_c:
-                    return f
+        # O(1) 精确命中
+        if norm_c in self._concept_index:
+            return self._concept_index[norm_c]
+
+        # O(N) 模糊包含匹配（仅对短索引回退）
+        if len(norm_c) > 2:
+            for norm_f, f in self._concept_index.items():
+                if len(norm_f) > 2:
+                    if norm_c in norm_f or norm_f in norm_c:
+                        return f
         return None
 
+    def _read_file_cached(self, filepath: Path) -> str:
+        """🔧 P0-2: 带缓存的文件读取，同一批次内不重复读盘"""
+        key = str(filepath)
+        if key not in self._file_cache:
+            self._file_cache[key] = filepath.read_text(encoding="utf-8")
+        return self._file_cache[key]
+
     def _fetch_local_context(self, concepts: list) -> str:
-        """档案管理员：提取上下文，提供给大模型参考"""
+        """档案管理员：提取上下文，提供给大模型参考（带缓存）
+        
+        💡 Token 瘦身：只传 index.md 标题列表 + 概念文件 Abstract 段，不传全文。
+           Editor 需要知道「哪些概念存在」和「大概是什么」，不需要读全文做融合。
+        """
+        cache_key = tuple(sorted(concepts))
+        if cache_key in self._context_cache:
+            return self._context_cache[cache_key]
+
         context_str = "\n"
         index_path = _resolve("index.md")
 
         if index_path.exists():
-            context_str += f"=== index.md (导航地图) ===\n{index_path.read_text(encoding='utf-8')}\n\n"
+            # index.md 是导航地图，Editor 需要看到完整分类结构才能精准追加链接
+            # 通常只有 1-3KB，传全文不心疼；超大时才截断
+            full = self._read_file_cached(index_path)
+            if len(full) > 8000:
+                # 超大知识库：传标题行 + 前 3000 字
+                toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
+                toc = '\n'.join(toc_lines[:200]) if toc_lines else full[:3000]
+                context_str += f"=== index.md (导航地图，已截断) ===\n{toc}\n\n"
+            else:
+                context_str += f"=== index.md (导航地图) ===\n{full}\n\n"
         else:
             context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
 
         for concept in concepts:
             real_file = self._find_existing_file(concept)
             if real_file:
-                content = real_file.read_text(encoding="utf-8")
+                content = self._read_file_cached(real_file)
                 rel_path = f"concepts/{real_file.name}"
-                context_str += f"=== {rel_path} (本地已存在) ===\n{content}\n\n"
+                # 📉 只传 Abstract 段（~300字），不传全文（~3000字）
+                abstract = self._extract_abstract(content)
+                context_str += f"=== {rel_path} (摘要) ===\n{abstract}\n\n"
             else:
                 safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
                 context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
 
+        self._context_cache[cache_key] = context_str
         return context_str
+
+    @staticmethod
+    def _extract_abstract(content: str) -> str:
+        """从概念页中提取 Abstract 段摘要（~300字），避免传全文给 LLM"""
+        # 优先提取 ## Abstract 到下一个 ## 之间的内容
+        if "## Abstract" in content:
+            after = content.split("## Abstract", 1)[1]
+            # 截断到下一个 ## 标题
+            if "\n## " in after:
+                after = after.split("\n## ", 1)[0]
+            return after.strip()[:500]
+        # 回退：取前 300 字
+        return content[:300]
 
     def _map_extract(self, chunk, chunk_id):
         """Map 阶段的核心逻辑：只提取，不写盘"""
@@ -89,19 +149,58 @@ class IngestFlow:
         # 在调用任何 _resolve 前，设置线程安全上下文
         set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
 
+        # 早期终止检查：还没开始重活之前快速退出
+        if user_id and kb_name and is_terminate_requested(user_id, kb_name):
+            print(f"\n🛑 [IngestFlow] 收到终止信号，跳过 {Path(input_source).name}")
+            return False  # 返回 False 表示被终止
+        # 在调用任何 _resolve 前，设置线程安全上下文
+        set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
+
         print("\n" + "=" * 60)
         print(f"🚀 [IngestFlow] 启动 Map-Reduce 引擎 | 沙箱: {kb_name} | 用户: {user_id}")
 
         # 设置文档名到上下文
         path = Path(input_source)
         if path.exists() and path.is_file():
+            # ── 单文件模式 ──
             set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=path.stem)
-            print(f"📄 目标语料：{path.name}")
-            raw_text = extract_text(str(path))
+            print(f"📄 目标语料：{path.name} ({path.stat().st_size} bytes)", flush=True)
+            try:
+                raw_text = extract_text(str(path))
+            except Exception as e:
+                print(f"❌ extract_text 失败: {type(e).__name__}: {e}", flush=True)
+                raw_text = ""
+            print(f"📝 提取文本: {len(raw_text)} 字符", flush=True)
+            if not raw_text.strip():
+                print("⚠️ 警告：提取出的文本为空！PDF 可能是扫描图片（需要 OCR）或文件损坏。", flush=True)
             chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
-            print(f"✂️ 物理切分为 {len(chunks)} 个知识块。")
+            print(f"✂️ 物理切分为 {len(chunks)} 个知识块。", flush=True)
+        elif path.exists() and path.is_dir():
+            # ── 目录模式：遍历所有文件，合并文本后切块 ──
+            SUPPORTED_EXT = {".pdf", ".docx", ".md", ".txt"}
+            all_text = ""
+            file_count = 0
+            for file in sorted(path.iterdir()):
+                if file.is_file() and file.suffix.lower() in SUPPORTED_EXT:
+                    try:
+                        text = extract_text(str(file))
+                        if text.strip():
+                            all_text += f"\n\n--- [{file.name}] ---\n\n" + text
+                            file_count += 1
+                            print(f"  📄 读取: {file.name} ({len(text)} 字符)")
+                    except Exception as e:
+                        print(f"  ⚠️ 跳过 {file.name}: {e}")
+            if not all_text.strip():
+                print("❌ 目录中没有可解析的文件")
+                chunks = []
+            else:
+                print(f"📚 共读取 {file_count} 个文件 ({len(all_text)} 字符)")
+                chunks = chunk_text(all_text, chunk_size=1500, overlap=200)
+                print(f"✂️ 物理切分为 {len(chunks)} 个知识块。")
         else:
-            chunks = [input_source]
+            # 兜底：把 input_source 当原始文本
+            chunks = chunk_text(input_source, chunk_size=1500, overlap=200)
+            print(f"✂️ 原始文本切分为 {len(chunks)} 个知识块。")
 
         # ==========================================
         # 🟢 PHASE 1: MAP (无锁绝对并发)
@@ -170,31 +269,67 @@ class IngestFlow:
                 concept_payloads[norm_c]["texts"].append(chunk_text_val)
                 concept_payloads[norm_c]["summaries"].append(summary)
 
+        # 📉 SHUFFLE 低频过滤：只在 1 个 chunk 中出现的概念大概率是噪音
+        before_filter = len(concept_payloads)
+        concept_payloads = {
+            k: v for k, v in concept_payloads.items()
+            if len(v["texts"]) >= 2
+        }
+        filtered = before_filter - len(concept_payloads)
+        if filtered:
+            print(f"  🗑️ 过滤低频概念: {filtered} 个（仅 1 个 chunk 提及）")
+
         # ==========================================
-        # 🔴 PHASE 3: REDUCE (按概念逐个融合落盘)
+        # 🔴 PHASE 3: REDUCE (串行概念融合)
         # ==========================================
         print("\n" + "=" * 60)
         total_concepts = len(concept_payloads)
         print(f"🧠 [Phase 3: REDUCE] 惊人降维！发现 {total_concepts} 个独立核心概念。")
 
-        for i, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
+        # 🔧 P0-1: 预构建概念索引（O(N) 一次性扫描，后续查找 O(1)）
+        self._build_concept_index()
+
+        # 🔧 P0-2: 清空缓存（新批次，防止旧数据干扰）
+        self._file_cache.clear()
+        self._context_cache.clear()
+
+        t_reduce_start = time.time()
+
+        skipped_count = 0
+        error_count = 0
+        checkpoint_count = 0  # 从检查点跳过的概念数
+        terminated = False
+
+        for seq, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
             display_name = payload["display_name"]
-            print(f"\n" + "-" * 50)
-            print(f"🔄 [融合 {i}/{total_concepts}] 目标概念: [{display_name}]")
+
+            # ── 终止检查（每个概念开始前）──
+            if user_id and kb_name and is_terminate_requested(user_id, kb_name):
+                print(f"\n🛑 [REDUCE] 收到终止信号，在概念 {seq}/{total_concepts} 前停止")
+                terminated = True
+                break
+
+            # ── 检查点跳过（Resume 时已处理的概念不再重复调 LLM）──
+            if user_id and kb_name and is_concept_done(user_id, kb_name, norm_c):
+                checkpoint_count += 1
+                print(f"  ⏩ [{seq}/{total_concepts}] [{display_name}] 已在检查点中，跳过")
+                continue
+
+            print(f"  🔄 [融合 {seq}/{total_concepts}] 目标概念: [{display_name}]")
+            t0 = time.time()
 
             combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
 
-            # Token 熔断保护 (防止合并后文本过长撑爆大模型)
+            # Token 熔断保护
             MAX_CHARS = 8000
             if len(combined_text) > MAX_CHARS:
-                print(f"  -> ⚠️ 警告：知识碎片过长 ({len(combined_text)} 字符)，已触发自动截断保护！")
+                print(f"  -> ⚠️ [{display_name}] 过长 ({len(combined_text)} 字符)，已截断")
                 combined_text = combined_text[:MAX_CHARS] + "\n\n... [数据过长，出于系统上下文保护已截断，请基于以上核心信息进行融合] ..."
 
             combined_summary = "\n".join(payload["summaries"])
             existing_context = self._fetch_local_context([display_name])
 
             try:
-                # 每次循环重启主编，消除前一个概念的记忆污染
                 fresh_editor = WikiEditor()
                 report = fresh_editor.merge(
                     raw_text=combined_text,
@@ -206,15 +341,43 @@ class IngestFlow:
                     self.writer.execute(report)
                 else:
                     print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
-            except Exception as e:
-                print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
+                    skipped_count += 1
 
+                # ── 保存检查点（融合成功后立即记录）──
+                if user_id and kb_name:
+                    save_concept_checkpoint(user_id, kb_name, norm_c)
+
+                elapsed = time.time() - t0
+                print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)")
+
+            except Exception as e:
+                elapsed = time.time() - t0
+                error_count += 1
+                print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
+                # 继续处理下一个概念，不中断整个流水线
+
+        t_total = time.time() - t_reduce_start
         print("\n" + "=" * 60)
-        print("✅ [IngestFlow] 单文件降维摄入完毕，知识图谱已延展！")
+        stats_parts = [f"REDUCE 耗时: {t_total:.1f}s"]
+        if checkpoint_count:
+            stats_parts.append(f"检查点跳过: {checkpoint_count}")
+        if skipped_count:
+            stats_parts.append(f"无增量: {skipped_count}")
+        if error_count:
+            stats_parts.append(f"失败: {error_count}")
+        if terminated:
+            stats_parts.append("⚠️ 用户终止")
+        print(f"✅ [IngestFlow] 摄入完毕 | {' | '.join(stats_parts)} | 知识图谱已延展！")
+
+        # 返回是否被终止（供外层循环判断）
+        return not terminated
 
 
 if __name__ == "__main__":
-    raw_dir = Path("../data/raw")
+    # 自动定位项目根目录（支持从项目根或 workflows/ 子目录运行）
+    _script_dir = Path(__file__).resolve().parent
+    _project_root = _script_dir.parent if _script_dir.name == "workflows" else _script_dir
+    raw_dir = _project_root / "data" / "raw"
 
     if not raw_dir.exists():
         raw_dir.mkdir(parents=True, exist_ok=True)
