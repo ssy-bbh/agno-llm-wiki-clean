@@ -10,8 +10,7 @@ from agents.wiki_analyst import WikiAnalyst
 from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
-from tools.edit_tools import _resolve, set_context, USE_MINIO, _resolve_key
-from core.path_resolver import minio_concepts_prefix, minio_index_key
+from tools.edit_tools import _resolve, set_context
 from core.ingest_control import (
     is_terminate_requested, save_concept_checkpoint,
     is_concept_done, save_file_checkpoint
@@ -40,26 +39,13 @@ class IngestFlow:
 
     def _build_concept_index(self):
         """🔧 P0-1: 一次性构建概念文件索引，后续查找 O(1)"""
+        concepts_dir = _resolve("concepts")
         index = {}
-        if USE_MINIO:
-            from core import storage
-            from tools.edit_tools import get_context
-            ctx = get_context()
-            prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
-            all_keys = storage.list_keys(prefix)
-            for key in all_keys:
-                if key.endswith(".md"):
-                    stem = key.split("/")[-1].replace(".md", "")
-                    norm = self._normalize_name(stem)
-                    if norm:
-                        index[norm] = key  # MinIO key 字符串
-        else:
-            concepts_dir = _resolve("concepts")
-            if concepts_dir.exists():
-                for f in concepts_dir.glob("*.md"):
-                    norm = self._normalize_name(f.stem)
-                    if norm:
-                        index[norm] = f  # 本地 Path 对象
+        if concepts_dir.exists():
+            for f in concepts_dir.glob("*.md"):
+                norm = self._normalize_name(f.stem)
+                if norm:
+                    index[norm] = f
         self._concept_index = index
         print(f"  📇 概念索引已构建: {len(index)} 个文件")
 
@@ -81,17 +67,11 @@ class IngestFlow:
                         return f
         return None
 
-    def _read_file_cached(self, filepath) -> str:
+    def _read_file_cached(self, filepath: Path) -> str:
         """🔧 P0-2: 带缓存的文件读取，同一批次内不重复读盘"""
         key = str(filepath)
         if key not in self._file_cache:
-            if USE_MINIO and not isinstance(filepath, Path):
-                # MinIO 模式：filepath 是 MinIO key 字符串
-                from core import storage
-                self._file_cache[key] = storage.read(filepath)
-            else:
-                # 本地模式：filepath 是 Path 对象
-                self._file_cache[key] = filepath.read_text(encoding="utf-8")
+            self._file_cache[key] = filepath.read_text(encoding="utf-8")
         return self._file_cache[key]
 
     def _fetch_local_context(self, concepts: list) -> str:
@@ -105,61 +85,33 @@ class IngestFlow:
             return self._context_cache[cache_key]
 
         context_str = "\n"
+        index_path = _resolve("index.md")
 
-        if USE_MINIO:
-            from core import storage
-            from tools.edit_tools import get_context
-            ctx = get_context()
-            idx_key = minio_index_key(ctx["user_id"], ctx["kb_name"])
-
-            if storage.exists(idx_key):
-                full = self._read_file_cached(idx_key)
-                if len(full) > 8000:
-                    toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
-                    toc = '\n'.join(toc_lines[:200]) if toc_lines else full[:3000]
-                    context_str += f"=== index.md (导航地图，已截断) ===\n{toc}\n\n"
-                else:
-                    context_str += f"=== index.md (导航地图) ===\n{full}\n\n"
+        if index_path.exists():
+            # index.md 是导航地图，Editor 需要看到完整分类结构才能精准追加链接
+            # 通常只有 1-3KB，传全文不心疼；超大时才截断
+            full = self._read_file_cached(index_path)
+            if len(full) > 8000:
+                # 超大知识库：传标题行 + 前 3000 字
+                toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
+                toc = '\n'.join(toc_lines[:200]) if toc_lines else full[:3000]
+                context_str += f"=== index.md (导航地图，已截断) ===\n{toc}\n\n"
             else:
-                context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
-
-            for concept in concepts:
-                existing_key = self._find_existing_file(concept)
-                if existing_key:
-                    content = self._read_file_cached(existing_key)
-                    file_name = existing_key.split("/")[-1]
-                    rel_path = f"concepts/{file_name}"
-                    # 📉 只传 Abstract 段（~300字），不传全文（~3000字）
-                    abstract = self._extract_abstract(content)
-                    context_str += f"=== {rel_path} (摘要) ===\n{abstract}\n\n"
-                else:
-                    safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
-                    context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
+                context_str += f"=== index.md (导航地图) ===\n{full}\n\n"
         else:
-            index_path = _resolve("index.md")
+            context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
 
-            if index_path.exists():
-                full = self._read_file_cached(index_path)
-                if len(full) > 8000:
-                    toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
-                    toc = '\n'.join(toc_lines[:200]) if toc_lines else full[:3000]
-                    context_str += f"=== index.md (导航地图，已截断) ===\n{toc}\n\n"
-                else:
-                    context_str += f"=== index.md (导航地图) ===\n{full}\n\n"
+        for concept in concepts:
+            real_file = self._find_existing_file(concept)
+            if real_file:
+                content = self._read_file_cached(real_file)
+                rel_path = f"concepts/{real_file.name}"
+                # 📉 只传 Abstract 段（~300字），不传全文（~3000字）
+                abstract = self._extract_abstract(content)
+                context_str += f"=== {rel_path} (摘要) ===\n{abstract}\n\n"
             else:
-                context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
-
-            for concept in concepts:
-                real_file = self._find_existing_file(concept)
-                if real_file:
-                    content = self._read_file_cached(real_file)
-                    rel_path = f"concepts/{real_file.name}"
-                    # 📉 只传 Abstract 段（~300字），不传全文（~3000字）
-                    abstract = self._extract_abstract(content)
-                    context_str += f"=== {rel_path} (摘要) ===\n{abstract}\n\n"
-                else:
-                    safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
-                    context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
+                safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+                context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
 
         self._context_cache[cache_key] = context_str
         return context_str
@@ -188,12 +140,11 @@ class IngestFlow:
         except Exception as e:
             return chunk_id, chunk, None, f"报错: {str(e)}"
 
-    def run(self, input_source: str, kb_name: str = "", user_id: str = "", doc_name: str = ""):
+    def run(self, input_source: str, kb_name: str = "", user_id: str = ""):
         """
         知识摄入入口。
         kb_name: 目标沙箱名称（通过参数传递，避免 os.environ 竞态）
         user_id: 用户 ID（用于路径隔离）
-        doc_name: 原始文档名（MinIO 模式下传入，避免使用临时文件名）
         """
         # 在调用任何 _resolve 前，设置线程安全上下文
         set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
@@ -212,9 +163,8 @@ class IngestFlow:
         path = Path(input_source)
         if path.exists() and path.is_file():
             # ── 单文件模式 ──
-            _doc = doc_name or path.stem
-            set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=_doc)
-            print(f"📄 目标语料：{_doc} ({path.stat().st_size} bytes)", flush=True)
+            set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=path.stem)
+            print(f"📄 目标语料：{path.name} ({path.stat().st_size} bytes)", flush=True)
             try:
                 raw_text = extract_text(str(path))
             except Exception as e:

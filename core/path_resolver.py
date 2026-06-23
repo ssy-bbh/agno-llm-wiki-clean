@@ -3,15 +3,6 @@ core/path_resolver.py — 统一路径解析器（用户级隔离）
 所有 data/wiki/ 和 data/raw/ 路径必须通过此模块获取。
 """
 from pathlib import Path
-import os
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-except ImportError:
-    pass  # python-dotenv 未安装，依赖系统环境变量或 IDE 注入
-
-USE_MINIO = os.environ.get("USE_MINIO", "false").lower() == "true"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -90,32 +81,3 @@ def get_default_workspace(user_id: str = "") -> str:
     """自动选取默认工作区（最新修改的那个）"""
     all_ws = list_workspaces(user_id)
     return all_ws[0] if all_ws else ""
-
-# ═══════════════════════════════════════════
-# MinIO 对象 Key 路径
-# ═══════════════════════════════════════════
-
-def minio_wiki_prefix(user_id: str = "", workspace: str = "") -> str:
-    parts = ["wiki"]
-    if user_id:
-        parts.append(user_id)
-    if workspace:
-        parts.append(workspace)
-    return "/".join(parts) + "/"
-
-def minio_raw_prefix(user_id: str = "", workspace: str = "") -> str:
-    parts = ["raw"]
-    if user_id:
-        parts.append(user_id)
-    if workspace:
-        parts.append(workspace)
-    return "/".join(parts) + "/"
-
-def minio_concepts_prefix(user_id: str, workspace: str) -> str:
-    return minio_wiki_prefix(user_id, workspace) + "concepts/"
-
-def minio_index_key(user_id: str, workspace: str) -> str:
-    return minio_wiki_prefix(user_id, workspace) + "index.md"
-
-def minio_concept_key(user_id: str, workspace: str, file_name: str) -> str:
-    return minio_wiki_prefix(user_id, workspace) + "concepts/" + file_name

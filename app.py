@@ -25,26 +25,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from core.path_resolver import (
     get_wiki_root, get_raw_root, get_concepts_dir, get_index_path,
     get_memory_db_path, ensure_user_dirs, list_workspaces, get_default_workspace,
-    PROJECT_ROOT, USE_MINIO,
+    PROJECT_ROOT,
 )
-
-
-# ═══════════════════════════════════════════
-# MinIO 辅助函数（前端 API 共用）
-# ═══════════════════════════════════════════
-
-def _minio_list_concepts(user_id: str, workspace: str) -> list:
-    """列出 MinIO 中指定沙箱的所有概念文件 key（排除 index.md 和 mocs/）"""
-    from core import storage
-    from core.path_resolver import minio_concepts_prefix
-    prefix = minio_concepts_prefix(user_id, workspace)
-    all_keys = storage.list_keys(prefix)
-    return [k for k in all_keys if k.endswith(".md") and not k.endswith("/index.md") and "/mocs/" not in k]
-
-
-def _minio_concept_name(key: str) -> str:
-    """从 MinIO key 提取概念名（不含 .md 后缀）"""
-    return key.split("/")[-1].replace(".md", "")
 from core.auth import (
     AuthRequest, AuthResponse,
     register_user, login_user,
@@ -1126,13 +1108,10 @@ async def _stream_scan_response(query: str, workspace: str, user_id: str = ""):
         total_nodes = 0
         ws_stats = []
         for ws_name in all_ws:
+            concepts_dir = get_concepts_dir(user_id, ws_name)
             count = 0
-            if USE_MINIO:
-                count = len(_minio_list_concepts(user_id, ws_name))
-            else:
-                concepts_dir = get_concepts_dir(user_id, ws_name)
-                if concepts_dir.exists():
-                    count = len([f for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
+            if concepts_dir.exists():
+                count = len([f for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
             total_nodes += count
             ws_stats.append((ws_name, count))
 
@@ -1151,14 +1130,10 @@ async def _stream_scan_response(query: str, workspace: str, user_id: str = ""):
         return
 
     # 指定沙箱扫描
+    concepts_dir = get_concepts_dir(user_id, workspace)
     available = []
-    if USE_MINIO:
-        concept_keys = _minio_list_concepts(user_id, workspace)
-        available = sorted([_minio_concept_name(k) for k in concept_keys])
-    else:
-        concepts_dir = get_concepts_dir(user_id, workspace)
-        if concepts_dir.exists():
-            available = sorted([f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
+    if concepts_dir.exists():
+        available = sorted([f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"])
 
     if available:
         group_size = 8
@@ -1195,22 +1170,12 @@ async def _stream_summary_response(query: str, workspace: str, user_id: str = ""
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
 
-    index_content = None
-    if USE_MINIO:
-        from core import storage
-        from core.path_resolver import minio_index_key
-        _idx_key = minio_index_key(user_id, workspace)
-        if storage.exists(_idx_key):
-            index_content = storage.read(_idx_key)
-    else:
-        index_path = get_index_path(user_id, workspace)
-        if index_path.exists():
-            index_content = index_path.read_text(encoding="utf-8")
-
+    index_path = get_index_path(user_id, workspace)
     yield f"data: {json.dumps({'type': 'log', 'content': '📋 [概览] 正在读取导航地图 ...'})}\n\n"
     await asyncio.sleep(0.3)
 
-    if index_content is not None:
+    if index_path.exists():
+        index_content = index_path.read_text(encoding="utf-8")
         if len(index_content.strip()) < 50:
             content = f"📋 沙箱 **{workspace}** 的导航地图几乎空白。\n\n建议先进行知识摄入。"
             for i in range(0, len(content), 15):
@@ -1303,20 +1268,12 @@ async def create_workspace(req: SandboxCreate, user=Depends(get_current_user)):
     if not safe_name:
         raise HTTPException(status_code=400, detail="非法的沙箱名称！")
 
-    try:
-        if USE_MINIO:
-            # MinIO 模式：只初始化 index.md，不创建本地目录
-            from core import storage
-            from core.path_resolver import minio_index_key
-            idx_key = minio_index_key(user_id, safe_name)
-            storage.write(idx_key, f"# {safe_name} - 知识导航\n\n等待知识摄入...\n")
-        else:
-            # 本地模式：创建本地目录
-            wiki_dir = get_wiki_root(user_id) / safe_name / "concepts"
-            raw_dir = get_raw_root(user_id) / safe_name
-            wiki_dir.mkdir(parents=True, exist_ok=True)
-            raw_dir.mkdir(parents=True, exist_ok=True)
+    wiki_dir = get_wiki_root(user_id) / safe_name / "concepts"
+    raw_dir = get_raw_root(user_id) / safe_name
 
+    try:
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        raw_dir.mkdir(parents=True, exist_ok=True)
         return {"status": "success", "workspace": safe_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"开荒失败: {str(e)}")
@@ -1353,19 +1310,8 @@ async def delete_workspace(name: str, user=Depends(get_current_user)):
             f.unlink(missing_ok=True)
             deleted.append(str(f))
 
-    # MinIO 模式：同时清理 MinIO 中的对象
-    minio_deleted = 0
-    if USE_MINIO:
-        from core import storage
-        from core.path_resolver import minio_wiki_prefix, minio_raw_prefix
-        wiki_prefix = minio_wiki_prefix(user_id, safe_name)
-        raw_prefix = minio_raw_prefix(user_id, safe_name)
-        minio_deleted += storage.delete_prefix(wiki_prefix)
-        minio_deleted += storage.delete_prefix(raw_prefix)
-
-    total = len(deleted) + minio_deleted
-    print(f"🗑️ 沙箱已删除: {user_id}/{safe_name}, 本地清理 {len(deleted)} 项, MinIO 清理 {minio_deleted} 个对象", flush=True)
-    return {"status": "success", "deleted": total, "local_deleted": len(deleted), "minio_deleted": minio_deleted}
+    print(f"🗑️ 沙箱已删除: {user_id}/{safe_name}, 清理了 {len(deleted)} 项", flush=True)
+    return {"status": "success", "deleted": len(deleted)}
 
 
 # ==========================================
@@ -1409,42 +1355,19 @@ async def upload_batch_endpoint(
         if f.size and f.size > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail=f"文件 {f.filename} 超过 50MB 限制")
 
-    # ── 根据 USE_MINIO 决定文件存储方式 ──
-    from core.path_resolver import USE_MINIO
+    raw_dir = get_raw_root(user_id) / workspace
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
-    saved_paths = []   # MinIO 模式：临时文件路径 | 本地模式：持久路径
-    saved_keys = []    # MinIO 模式：待归档的 MinIO Key
-    file_contents = {} # MinIO 模式：文件名 → 字节数据（后台线程归档用）
-
+    saved_paths = []
     try:
-        import tempfile
-        if USE_MINIO:
-            # MinIO 模式：写入临时文件直接解析，后台异步归档到 MinIO raw/
-            # 省去"先传 MinIO 再下载回来"的网络往返
-            for f in files:
-                safe_filename = Path(f.filename).name if f.filename else "unnamed"
-                contents = await f.read()
-                suffix = Path(safe_filename).suffix
-                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                    tmp.write(contents)
-                    tmp_path = tmp.name
-                saved_paths.append(tmp_path)
-                saved_keys.append(f"raw/{user_id}/{workspace}/{safe_filename}")
-                file_contents[safe_filename] = contents
-                print(f"  📄 上传: {safe_filename} ({len(contents)} bytes)", flush=True)
-        else:
-            # 本地模式：写入 data/raw/{workspace}/
-            raw_dir = get_raw_root(user_id) / workspace
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                safe_filename = Path(f.filename).name if f.filename else "unnamed"
-                file_path = raw_dir / safe_filename
-                contents = await f.read()
-                file_path.write_bytes(contents)
-                saved_paths.append(file_path)
-                print(f"  📄 上传: {safe_filename} ({len(contents)} bytes)", flush=True)
-
-        total_files = len(saved_paths)
+        for f in files:
+            # 清理文件名：只取 basename，防止路径穿越
+            safe_filename = Path(f.filename).name if f.filename else "unnamed"
+            file_path = raw_dir / safe_filename
+            contents = await f.read()
+            file_path.write_bytes(contents)
+            saved_paths.append(file_path)
+            print(f"  📄 上传: {safe_filename} ({len(contents)} bytes)", flush=True)
 
         # 后台线程：用参数传递代替 os.environ 污染，输出捕获到任务日志
         # Generation counter: 防止旧线程 finally 覆盖新线程的 status
@@ -1454,13 +1377,14 @@ async def upload_batch_endpoint(
             # 新摄入开始：清除旧的终止标记（保留检查点以支持 Resume）
             clear_terminate(user_id, workspace)
 
-            _write_ingest_status(user_id, workspace, "ingesting", files=total_files, started=time.time(), gen=my_gen)
+            _write_ingest_status(user_id, workspace, "ingesting", files=len(saved_paths), started=time.time(), gen=my_gen)
             # 初始化结构化进度
             task_log.set_progress(
                 user_id, workspace,
-                phase="parsing", current_file=0, total_files=total_files,
+                phase="parsing", current_file=0, total_files=len(saved_paths),
                 current_file_name="", total_chunks=0, map_done=0,
                 total_concepts=0, reduce_done=0, started=time.time(),
+                updated=time.time() + 99999,  # 覆盖 terminate 留下的 future sentinel
             )
             terminated = False
             try:
@@ -1468,68 +1392,34 @@ async def upload_batch_endpoint(
                     user_id=user_id, workspace=workspace,
                     gen=my_gen, gen_fn=lambda: _current_ingest_gen(user_id, workspace),
                 ):
-                    task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {total_files} 个文件。AI 正在提炼中，请耐心等待...", "info")
+                    task_log.append(user_id, workspace, f"🚀 [批量摄入流] 启动，共 {len(saved_paths)} 个文件。AI 正在提炼中，请耐心等待...", "info")
                     flow = IngestFlow()
+                    for i, fp in enumerate(saved_paths, 1):
+                        # ── 每个文件前检查：终止信号 + generation 被取代 ──
+                        if _current_ingest_gen(user_id, workspace) != my_gen:
+                            task_log.append(user_id, workspace, "⚡ 新的摄入任务已启动，旧线程自动退出", "info")
+                            terminated = True
+                            break
+                        if is_terminate_requested(user_id, workspace):
+                            task_log.append(user_id, workspace, f"🛑 用户手动终止，已完成 {i-1}/{len(saved_paths)} 个文件", "warning")
+                            terminated = True
+                            break
 
-                    if USE_MINIO:
-                        from core import storage
-                        for i, (tmp_path, key) in enumerate(zip(saved_paths, saved_keys), 1):
-                            # ── 每个文件前检查：终止信号 + generation 被取代 ──
-                            if _current_ingest_gen(user_id, workspace) != my_gen:
-                                task_log.append(user_id, workspace, "⚡ 新的摄入任务已启动，旧线程自动退出", "info")
+                        print(f"\n🚀 [{user_id}] [{i}/{len(saved_paths)}] 提取: {fp.name} -> {workspace}")
+                        try:
+                            result = flow.run(str(fp), kb_name=workspace, user_id=user_id)
+                            if result is False:
+                                # flow.run 内部检测到终止信号
                                 terminated = True
+                                task_log.append(user_id, workspace, f"🛑 摄入在文件 {fp.name} 内被终止", "warning")
                                 break
-                            if is_terminate_requested(user_id, workspace):
-                                task_log.append(user_id, workspace, f"🛑 用户手动终止，已完成 {i-1}/{total_files} 个文件", "warning")
-                                terminated = True
-                                break
-
-                            filename = key.split("/")[-1]
-                            print(f"\n🚀 [{user_id}] [{i}/{total_files}] 提取: {filename} -> {workspace}")
-                            try:
-                                # 异步归档到 MinIO raw/（不阻塞解析）
-                                try:
-                                    storage.upload_bytes(key, file_contents[filename])
-                                except Exception as e:
-                                    print(f"⚠️ MinIO 归档失败（不影响解析）: {e}")
-                                # 直接用临时文件解析，传入原始文件名避免日志显示临时名
-                                result = flow.run(tmp_path, kb_name=workspace, user_id=user_id, doc_name=Path(filename).stem)
-                                if result is False:
-                                    terminated = True
-                                    task_log.append(user_id, workspace, f"🛑 摄入在文件 {filename} 内被终止", "warning")
-                                    break
-                                save_file_checkpoint(user_id, workspace, filename)
-                            except Exception as e:
-                                print(f"❌ 提取 {filename} 失败: {e}")
-                            finally:
-                                # 解析完删除临时文件
-                                Path(tmp_path).unlink(missing_ok=True)
-                    else:
-                        # 本地模式：直接读本地路径
-                        for i, fp in enumerate(saved_paths, 1):
-                            # ── 每个文件前检查：终止信号 + generation 被取代 ──
-                            if _current_ingest_gen(user_id, workspace) != my_gen:
-                                task_log.append(user_id, workspace, "⚡ 新的摄入任务已启动，旧线程自动退出", "info")
-                                terminated = True
-                                break
-                            if is_terminate_requested(user_id, workspace):
-                                task_log.append(user_id, workspace, f"🛑 用户手动终止，已完成 {i-1}/{total_files} 个文件", "warning")
-                                terminated = True
-                                break
-
-                            print(f"\n🚀 [{user_id}] [{i}/{total_files}] 提取: {fp.name} -> {workspace}")
-                            try:
-                                result = flow.run(str(fp), kb_name=workspace, user_id=user_id)
-                                if result is False:
-                                    terminated = True
-                                    task_log.append(user_id, workspace, f"🛑 摄入在文件 {fp.name} 内被终止", "warning")
-                                    break
-                                save_file_checkpoint(user_id, workspace, fp.name)
-                            except Exception as e:
-                                print(f"❌ 提取 {fp.name} 失败: {e}")
+                            # 文件完整处理成功，保存文件检查点
+                            save_file_checkpoint(user_id, workspace, fp.name)
+                        except Exception as e:
+                            print(f"❌ 提取 {fp.name} 失败: {e}")
 
                     if not terminated:
-                        task_log.append(user_id, workspace, f"✅ [{user_id}] 全部提炼完成！共处理 {total_files} 个文件", "success")
+                        task_log.append(user_id, workspace, f"✅ [{user_id}] 全部提炼完成！共处理 {len(saved_paths)} 个文件", "success")
             finally:
                 # 只有当前 generation 的线程才能写 status（防止旧线程覆盖新线程）
                 if _current_ingest_gen(user_id, workspace) == my_gen:
@@ -1541,6 +1431,7 @@ async def upload_batch_endpoint(
                             phase="idle", current_file=0, total_files=0,
                             current_file_name="", total_chunks=0, map_done=0,
                             total_concepts=0, reduce_done=0, started=0,
+                            updated=time.time() + 99999,  # 覆盖旧 sentinel，确保写入成功
                         )
                     # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
                     _write_ingest_status(user_id, workspace, "idle", gen=my_gen)
@@ -1580,7 +1471,7 @@ async def terminate_ingest(
         phase="stopping", current_file=0, total_files=0,
         current_file_name="", total_chunks=0, map_done=0,
         total_concepts=0, reduce_done=0, started=0,
-        updated=time.time() + 9999,  # 未来时间戳，防止旧线程的 set_progress 覆盖
+        updated=time.time() + 99999,  # 未来时间戳，防止旧线程的 set_progress 覆盖
     )
     task_log.append(user_id, workspace, "🛑 摄入已停止，后台任务将在当前操作完成后自动退出", "warning")
     return {"status": "ok", "message": "摄入已停止"}
@@ -1605,109 +1496,7 @@ async def resume_ingest(
     clear_terminate(user_id, workspace)
     print(f"🔄 [RESUME] user={user_id} workspace={workspace}", flush=True)
 
-    # 获取检查点信息
-    cp = get_checkpoint(user_id, workspace)
-    done_concepts = len(cp.get("concepts", []))
-    done_files = set(cp.get("files_done", []))
-
-    if USE_MINIO:
-        # ── MinIO 模式：从 MinIO raw/ 下载文件到临时目录 ──
-        from core import storage as minio_storage
-        from core.path_resolver import minio_raw_prefix
-
-        raw_prefix = minio_raw_prefix(user_id, workspace)
-        all_keys = minio_storage.list_keys(raw_prefix)
-        if not all_keys:
-            raise HTTPException(status_code=404, detail="MinIO raw/ 中未找到已上传的原始文件")
-
-        # 过滤已完成文件
-        all_filenames = [k.split("/")[-1] for k in all_keys if k.split("/")[-1]]
-        remaining_items = [(k, k.split("/")[-1]) for k in all_keys
-                           if k.split("/")[-1] not in done_files]
-        print(f"🔄 [RESUME/MINIO] raw_keys={[k.split('/')[-1] for k in all_keys]} done_files={done_files} remaining={len(remaining_items)}", flush=True)
-
-        if not remaining_items:
-            raise HTTPException(status_code=400, detail=f"所有文件均已处理完成（{len(done_files)} 个），无需继续摄入")
-
-        remaining_count = len(remaining_items)
-
-        resume_gen = _next_ingest_gen(user_id, workspace)
-        _write_ingest_status(user_id, workspace, "ingesting", files=remaining_count, started=time.time(), gen=resume_gen)
-        task_log.set_progress(
-            user_id, workspace,
-            phase="parsing", current_file=0, total_files=remaining_count,
-            current_file_name="", total_chunks=0, map_done=0,
-            total_concepts=done_concepts, reduce_done=done_concepts,
-            started=time.time(),
-        )
-
-        def run_resume_batch():
-            clear_terminate(user_id, workspace)
-            terminated = False
-            try:
-                with TaskOutputCapture(
-                    user_id=user_id, workspace=workspace,
-                    checkpoint_concepts=done_concepts, checkpoint_reduce=done_concepts,
-                    gen=resume_gen, gen_fn=lambda: _current_ingest_gen(user_id, workspace),
-                ):
-                    task_log.append(
-                        user_id, workspace,
-                        f"🔄 [继续摄入/MINIO] 重启流水线，共 {remaining_count} 个待处理文件"
-                        f"（跳过 {len(done_files)} 个已完成文件）。"
-                        f"已有 {done_concepts} 个概念在检查点中将被跳过。", "info"
-                    )
-                    import tempfile
-                    flow = IngestFlow()
-                    for i, (key, filename) in enumerate(remaining_items, 1):
-                        if _current_ingest_gen(user_id, workspace) != resume_gen:
-                            task_log.append(user_id, workspace, "⚡ 新的摄入任务已启动，旧线程自动退出", "info")
-                            terminated = True
-                            break
-                        if is_terminate_requested(user_id, workspace):
-                            task_log.append(user_id, workspace, f"🛑 用户再次终止", "warning")
-                            terminated = True
-                            break
-                        print(f"\n🚀 [{user_id}] [resume {i}/{remaining_count}] {filename} (from MinIO)")
-                        try:
-                            # 下载到临时文件
-                            suffix = Path(filename).suffix
-                            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                                tmp_path = tmp.name
-                            minio_storage.download_file(key, tmp_path)
-                            result = flow.run(tmp_path, kb_name=workspace, user_id=user_id, doc_name=Path(filename).stem)
-                            Path(tmp_path).unlink(missing_ok=True)
-                            if result is False:
-                                terminated = True
-                                break
-                            save_file_checkpoint(user_id, workspace, filename)
-                        except Exception as e:
-                            print(f"❌ {filename} 失败: {e}")
-
-                    if not terminated:
-                        task_log.append(user_id, workspace, f"✅ [继续摄入/MINIO] 全部完成！", "success")
-            finally:
-                if _current_ingest_gen(user_id, workspace) == resume_gen:
-                    if terminated:
-                        mark_terminated(user_id, workspace)
-                        task_log.set_progress(
-                            user_id, workspace,
-                            phase="idle", current_file=0, total_files=0,
-                            current_file_name="", total_chunks=0, map_done=0,
-                            total_concepts=0, reduce_done=0, started=0,
-                        )
-                    _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
-
-        threading.Thread(target=run_resume_batch, daemon=True).start()
-
-        return {
-            "status": "ok",
-            "message": f"继续摄入已启动，{remaining_count} 个文件（跳过 {len(done_files)} 个已完成），{done_concepts} 个概念将从检查点跳过",
-            "files": [fn for _, fn in remaining_items],
-            "checkpoint_concepts": done_concepts,
-            "skipped_files": list(done_files),
-        }
-
-    # ── 本地模式 ──
+    # 查找 raw 目录中的所有文件
     raw_dir = get_raw_root(user_id) / workspace
     if not raw_dir.exists():
         print(f"❌ [RESUME] raw_dir not found: {raw_dir}", flush=True)
@@ -1718,11 +1507,12 @@ async def resume_ingest(
     if not saved_paths:
         raise HTTPException(status_code=404, detail="raw 目录为空")
 
-    remaining_paths = [f for f in saved_paths if f.name not in done_files]
-    print(f"🔄 [RESUME] raw_files={[f.name for f in saved_paths]} done_files={done_files} remaining={len(remaining_paths)} done_concepts={done_concepts}", flush=True)
-
-    if not remaining_paths:
-        raise HTTPException(status_code=400, detail=f"所有文件均已处理完成（{len(done_files)} 个），无需继续摄入")
+    # 获取检查点信息：只保留 concepts（概念级去重），清空 files_done（允许重新处理文件）
+    cp = get_checkpoint(user_id, workspace)
+    done_concepts = len(cp.get("concepts", []))
+    # 不读取 files_done，所有文件都重新处理（概念级去重由 editor 查重机制保证）
+    remaining_paths = saved_paths
+    print(f"🔄 [RESUME] raw_files={[f.name for f in saved_paths]} done_concepts={done_concepts} (files_done cleared for reprocessing)", flush=True)
 
     # Generation counter: 防止旧线程 finally 覆盖新线程的 status
     resume_gen = _next_ingest_gen(user_id, workspace)
@@ -1735,6 +1525,7 @@ async def resume_ingest(
         current_file_name="", total_chunks=0, map_done=0,
         total_concepts=done_concepts, reduce_done=done_concepts,
         started=time.time(),
+        updated=time.time() + 99999,  # 覆盖 terminate 留下的 future sentinel
     )
 
     # 启动后台线程重新处理（只处理未完成文件）
@@ -1787,6 +1578,7 @@ async def resume_ingest(
                         phase="idle", current_file=0, total_files=0,
                         current_file_name="", total_chunks=0, map_done=0,
                         total_concepts=0, reduce_done=0, started=0,
+                        updated=time.time() + 99999,  # 覆盖旧 sentinel，确保写入成功
                     )
                 # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
                 _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
@@ -1795,10 +1587,10 @@ async def resume_ingest(
 
     return {
         "status": "ok",
-        "message": f"继续摄入已启动，{len(remaining_paths)} 个文件（跳过 {len(done_files)} 个已完成），{done_concepts} 个概念将从检查点跳过",
+        "message": f"继续摄入已启动，{len(remaining_paths)} 个文件将重新处理，{done_concepts} 个概念将从检查点跳过",
         "files": [f.name for f in remaining_paths],
         "checkpoint_concepts": done_concepts,
-        "skipped_files": list(done_files),
+        "skipped_files": [],
     }
 
 
@@ -1836,63 +1628,12 @@ async def clear_ingest_checkpoint(
 @app.get("/api/workspaces")
 async def get_workspaces(user=Depends(get_current_user)):
     user_id = user["user_id"]
-
-    if USE_MINIO:
-        from core import storage
-        from core.path_resolver import minio_wiki_prefix
-        # MinIO 模式：列出 wiki/{user_id}/ 下的所有前缀作为沙箱
-        prefix = minio_wiki_prefix(user_id)
-        all_keys = storage.list_keys(prefix)
-        # 从 key 中提取沙箱名（第三级目录）
-        workspaces = set()
-        for key in all_keys:
-            # key 格式: wiki/{user_id}/{workspace}/...
-            parts = key.split("/")
-            if len(parts) >= 3 and parts[2]:
-                workspaces.add(parts[2])
-        return sorted(list(workspaces), reverse=True)
-
-    # ── 本地模式 ──
     return list_workspaces(user_id)
 
 
 @app.get("/api/graph")
 async def get_graph(workspace: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
-
-    if USE_MINIO:
-        from core import storage
-        # 1. 列出所有概念文件
-        concept_keys = _minio_list_concepts(user_id, workspace)
-        if not concept_keys:
-            return {"nodes": [], "links": []}
-
-        # 2. 构建节点集合
-        nodes = []
-        node_set = set()
-        for key in concept_keys:
-            name = _minio_concept_name(key)
-            nodes.append({"id": name, "group": 1})
-            node_set.add(name.lower())
-
-        # 3. 读取每个概念内容，提取 [[链接]] 构建边
-        links = []
-        for key in concept_keys:
-            source = _minio_concept_name(key)
-            try:
-                content = storage.read(key)
-            except Exception:
-                continue
-            for match in re.findall(r'\[\[(.*?)\]\]', content):
-                target = match.split("|")[0].strip()
-                if target.lower() == "index":
-                    continue
-                if target.lower() in node_set:
-                    links.append({"source": source, "target": target})
-
-        return {"nodes": nodes, "links": links}
-
-    # ── 本地模式 ──
     base_dir = get_wiki_root(user_id) / workspace
     concepts_dir = base_dir / "concepts"
     search_dir = concepts_dir if concepts_dir.exists() else base_dir
@@ -1936,36 +1677,16 @@ async def get_concept(workspace: str, name: str, user=Depends(get_current_user))
     if not workspace or not name:
         raise HTTPException(status_code=400, detail="缺少 workspace 或 name 参数")
 
-    if USE_MINIO:
-        from core import storage
-        from core.path_resolver import minio_concept_key, minio_concepts_prefix
-
-        # 1. 精确匹配
-        key = minio_concept_key(user_id, workspace, f"{name}.md")
-        if storage.exists(key):
-            content = storage.read(key)
-            return {"content": content, "name": name, "path": f"concepts/{name}.md"}
-
-        # 2. 模糊搜索（在子目录中查找）
-        prefix = minio_concepts_prefix(user_id, workspace)
-        all_keys = storage.list_keys(prefix)
-        for k in all_keys:
-            if k.endswith(f"/{name}.md"):
-                content = storage.read(k)
-                rel_path = k.replace(prefix, "")
-                return {"content": content, "name": name, "path": rel_path}
-
-        raise HTTPException(status_code=404, detail=f"概念 [{name}] 不存在于沙箱 [{workspace}]")
-
-    # ── 本地模式 ──
     base_dir = get_wiki_root(user_id) / workspace
     concepts_dir = base_dir / "concepts"
 
+    # 先精确匹配 concepts/{name}.md，再 rglob 递归搜索
     candidates = []
     exact = concepts_dir / f"{name}.md"
     if exact.exists():
         candidates.append(exact)
     else:
+        # rglob 在子目录中查找
         for fp in concepts_dir.rglob(f"{name}.md"):
             candidates.append(fp)
             break
@@ -1991,30 +1712,6 @@ async def get_inbox(workspace: str, user=Depends(get_current_user)):
     if not workspace:
         return []
     user_id = user["user_id"]
-
-    if USE_MINIO:
-        from core import storage
-        concept_keys = _minio_list_concepts(user_id, workspace)
-        files = []
-        for key in concept_keys:
-            try:
-                content = storage.read(key)
-            except Exception:
-                continue
-            if DRAFT_TAG not in content:
-                continue
-            name = _minio_concept_name(key)
-            clean = re.sub(r'<.*?AUTOFILL_DRAFT.*?>', '', content)
-            clean = re.sub(r'[#*\[\]\n]', ' ', clean)[:40].strip()
-            files.append({
-                "id": name,
-                "title": name,
-                "excerpt": f"{clean}..." if clean else "无正文内容...",
-                "timestamp": 0,
-            })
-        return files[:4]
-
-    # ── 本地模式 ──
     concepts_dir = get_concepts_dir(user_id, workspace)
     if not concepts_dir.exists():
         return []
@@ -2045,18 +1742,6 @@ async def get_inbox(workspace: str, user=Depends(get_current_user)):
 @app.post("/api/inbox/approve")
 async def approve_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
-
-    if USE_MINIO:
-        from core import storage
-        from core.path_resolver import minio_concept_key
-        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
-        if storage.exists(key):
-            content = storage.read(key)
-            content = content.replace(DRAFT_TAG + "\n", "").replace(DRAFT_TAG, "")
-            storage.write(key, content)
-        return {"status": "success"}
-
-    # ── 本地模式 ──
     filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if filepath.exists():
         content = filepath.read_text(encoding="utf-8")
@@ -2073,61 +1758,6 @@ async def get_radar(workspace: str, user=Depends(get_current_user)):
     if not workspace:
         return []
     user_id = user["user_id"]
-
-    if USE_MINIO:
-        from core import storage
-        from collections import Counter
-
-        concept_keys = _minio_list_concepts(user_id, workspace)
-        if not concept_keys:
-            return []
-
-        link_counter = Counter()
-        existing_names = []
-        for key in concept_keys:
-            name = _minio_concept_name(key)
-            existing_names.append(name)
-            try:
-                content = storage.read(key)
-            except Exception:
-                continue
-            for link in re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content):
-                clean = link.strip()
-                if clean:
-                    link_counter[clean] += 1
-
-        def _get_real_target(ghost: str, names: list) -> str:
-            def _aliases(text: str) -> set:
-                a = set()
-                c = text.lower().replace("-", "").replace("_", "").replace(" ", "")
-                if c:
-                    a.add(c)
-                m = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
-                if m:
-                    for p in [m.group(1), m.group(2)]:
-                        p = p.lower().replace("-", "").replace("_", "").replace(" ", "")
-                        if p:
-                            a.add(p)
-                return a
-            ga = _aliases(ghost)
-            for n in names:
-                if ga & _aliases(n):
-                    return n
-            return ""
-
-        ghosts = []
-        for link, count in link_counter.items():
-            real = _get_real_target(link, existing_names)
-            if not real and link.lower() != "index" and count >= 1:
-                ghosts.append((link, count))
-        ghosts.sort(key=lambda x: x[1], reverse=True)
-
-        return [
-            {"concept": name, "urgency": min(100, count * 12), "mentions": count}
-            for name, count in ghosts[:5]
-        ]
-
-    # ── 本地模式 ──
     concepts_dir = get_concepts_dir(user_id, workspace)
     if not concepts_dir.exists():
         return []
@@ -2185,17 +1815,6 @@ async def get_radar(workspace: str, user=Depends(get_current_user)):
 @app.get("/api/inbox/file")
 async def get_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
-
-    if USE_MINIO:
-        from core import storage
-        from core.path_resolver import minio_concept_key
-        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
-        if not storage.exists(key):
-            raise HTTPException(status_code=404)
-        content = storage.read(key).replace(DRAFT_TAG + "\n", "")
-        return {"content": content}
-
-    # ── 本地模式 ──
     filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if not filepath.exists():
         raise HTTPException(status_code=404)
@@ -2206,16 +1825,6 @@ async def get_inbox_file(workspace: str, file_id: str, user=Depends(get_current_
 @app.post("/api/inbox/reject")
 async def reject_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
-
-    if USE_MINIO:
-        from core import storage
-        from core.path_resolver import minio_concept_key
-        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
-        if storage.exists(key):
-            storage.delete(key)
-        return {"status": "success"}
-
-    # ── 本地模式 ──
     filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if filepath.exists():
         filepath.unlink()

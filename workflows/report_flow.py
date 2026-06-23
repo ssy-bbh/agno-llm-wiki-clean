@@ -11,7 +11,7 @@ from typing import Optional
 
 from agents.wiki_analyst import WikiAnalyst
 from tools.search_tools import search_web_text
-from core.path_resolver import get_wiki_root, get_concepts_dir, USE_MINIO
+from core.path_resolver import get_wiki_root, get_concepts_dir
 
 
 class ReportFlow:
@@ -58,30 +58,14 @@ class ReportFlow:
         await asyncio.sleep(0.1)
 
         # 读取 index 和所有概念标题
+        index_path = ws_dir / "index.md"
         available_titles = []
-        index_content = ""
+        if concepts_dir.exists():
+            available_titles = [f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"]
 
-        if USE_MINIO:
-            from core import storage
-            from core.path_resolver import minio_concepts_prefix, minio_index_key
-            # 获取概念列表
-            prefix = minio_concepts_prefix(self.user_id, workspace)
-            all_keys = storage.list_keys(prefix)
-            concept_keys = [k for k in all_keys if k.endswith(".md") 
-                           and not k.endswith("/index.md") 
-                           and "/mocs/" not in k]
-            available_titles = [k.split("/")[-1].replace(".md", "") for k in concept_keys]
-            # 读取 index
-            index_key = minio_index_key(self.user_id, workspace)
-            if storage.exists(index_key):
-                index_content = storage.read(index_key)[:3000]
-        else:
-            # 本地模式
-            index_path = ws_dir / "index.md"
-            if concepts_dir.exists():
-                available_titles = [f.stem for f in concepts_dir.glob("*.md") if f.stem.lower() != "index"]
-            if index_path.exists():
-                index_content = index_path.read_text(encoding="utf-8")[:3000]
+        index_content = ""
+        if index_path.exists():
+            index_content = index_path.read_text(encoding="utf-8")[:3000]
 
         # 用 LLM 生成大纲和检索策略
         from agno.agent import Agent
@@ -143,52 +127,7 @@ class ReportFlow:
         all_web_context = ""
 
         # 2a. 本地检索
-        if USE_MINIO:
-            from core import storage
-            from core.path_resolver import minio_concepts_prefix
-            prefix = minio_concepts_prefix(self.user_id, workspace)
-            all_keys = storage.list_keys(prefix)
-            concept_keys = [k for k in all_keys if k.endswith(".md") 
-                           and not k.endswith("/index.md") 
-                           and "/mocs/" not in k]
-
-            if concept_keys:
-                all_keywords = set()
-                for ch in report_plan.get("outline", []):
-                    for kw in ch.get("keywords", []):
-                        all_keywords.add(kw.lower())
-
-                yield log(f"🔍 正在扫描 {len(available_titles)} 个本地概念...")
-                await asyncio.sleep(0.1)
-
-                matched_keys = set()
-                for key in concept_keys:
-                    name = key.split("/")[-1].replace(".md", "").lower()
-                    for kw in all_keywords:
-                        if kw in name or name in kw:
-                            matched_keys.add(key)
-                            break
-
-                # 读取匹配的文件内容（限制总量）
-                MAX_CHARS = 20000
-                char_count = 0
-                for key in matched_keys:
-                    if char_count >= MAX_CHARS:
-                        break
-                    try:
-                        content = storage.read(key)
-                        if char_count + len(content) > MAX_CHARS:
-                            content = content[:MAX_CHARS - char_count]
-                        name = key.split("/")[-1].replace(".md", "")
-                        all_local_context += f"\n=== {name} ===\n{content}\n"
-                        char_count += len(content)
-                    except Exception:
-                        pass
-
-                yield log(f"📂 本地命中 {len(matched_keys)} 个概念 ({char_count} 字符)")
-                await asyncio.sleep(0.1)
-        elif concepts_dir.exists():
-            # 本地模式
+        if concepts_dir.exists():
             all_keywords = set()
             for ch in report_plan.get("outline", []):
                 for kw in ch.get("keywords", []):

@@ -5,9 +5,6 @@ import os
 import threading
 from pathlib import Path
 
-# 统一从 path_resolver 获取 USE_MINIO，避免重复读 os.environ 导致值不一致
-from core.path_resolver import USE_MINIO
-
 # 锁定操作根目录，绝对不准越界
 WIKI_ROOT = Path(__file__).parent.parent / "data" / "wiki"
 
@@ -61,71 +58,10 @@ def _resolve(file_name: str) -> Path:
 
     return final_path
 
-def _resolve_key(file_name: str) -> str:
-    """返回 MinIO 对象 Key（对应本地 _resolve 返回的 Path）"""
-    ctx = get_context()
-    parts = ["wiki"]
-    if ctx["user_id"]:
-        parts.append(ctx["user_id"])
-    parts.append(ctx["kb_name"])
-    if ctx["sub_dir"]:
-        parts.append(ctx["sub_dir"])
-    if Path(file_name).name.lower() == "index.md":
-        parts.append("index.md")
-    else:
-        parts.append(file_name)
-    return "/".join(parts)
-
 
 # 💡 注意参数里多了 content
 def create_page(file_name: str, title: str, tags: list[str], abstract: str, content: str = "") -> str:
     """严格按照 schema 模板创建新页面，包含模糊去重机制"""
-
-    if USE_MINIO:
-        from core import storage
-        # 查重
-        prefix = "/".join(_resolve_key(file_name).split("/")[:-1]) + "/"
-        existing_keys = storage.list_keys(prefix)
-        clean_new = file_name.lower().replace("-", "").replace("_", "").replace(" ", "").replace(".md", "")
-        for k in existing_keys:
-            clean_exist = k.split("/")[-1].lower().replace("-", "").replace("_", "").replace(" ", "").replace(".md", "")
-            if clean_new == clean_exist:
-                return f"⚠️ 拦截重复：{k} 已存在，规避新建：{file_name}"
-        # Tags 清洗
-        clean_tags = []
-        if tags:
-            if isinstance(tags, str):
-                cleaned = tags.replace("[", "").replace("]", "").replace("'", "").replace('"', "")
-                clean_tags = [t.strip() for t in cleaned.split(",") if t.strip()]
-            elif isinstance(tags, list):
-                for t in tags:
-                    t_str = str(t).replace("[", "").replace("]", "").replace("'", "").replace('"', "").strip()
-                    if t_str:
-                        clean_tags.append(t_str)
-        tag_str = " ".join(clean_tags)
-        import datetime
-        details = (content or "（等待后续扩展）").replace("\\n", "\n")
-        abs_text = abstract.replace("\\n", "\n")
-        body = f"""# {title}
-
-    > **Tags:** {tag_str}
-    > **Created:** {datetime.datetime.now().strftime("%Y-%m-%d")}
-
-    ## Abstract
-    {abs_text}
-
-    ## Details
-    {details}
-
-    ## Related
-    - 
-
-    ## References
-    - 
-    """
-        storage.write(_resolve_key(file_name), body)
-        return f"✅ 成功创建页面：{file_name}"
-
     path = _resolve(file_name)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -186,20 +122,6 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str, cont
 
 def str_replace(file_name: str, old_str: str, new_str: str) -> str:
     """极其精密的局部替换工具 (带空格宽容 + 活路径路由)"""
-    if USE_MINIO:
-        from core import storage
-        key = _resolve_key(file_name)
-        if not storage.exists(key):
-            return f"❌ 错误：底层工具找不到文件 ({key})"
-        content = storage.read(key)
-        if old_str in content:
-            storage.write(key, content.replace(old_str, new_str, 1))
-            return f"✅ 成功修改文件：{file_name}"
-        old_str_clean = old_str.strip()
-        if old_str_clean and old_str_clean in content:
-            storage.write(key, content.replace(old_str_clean, new_str, 1))
-            return f"✅ 成功修改文件(启用宽容匹配)：{file_name}"
-        return f"❌ 找不到旧文本，大模型可能产生了格式幻觉！\n寻找的: {repr(old_str)}"
 
     # 💡 核心修复：必须用 _resolve 找回动态活路径！
     path = _resolve(file_name)

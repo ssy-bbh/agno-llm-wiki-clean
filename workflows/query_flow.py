@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.search_tools import search_web_text, search_multimodal_image
 from agents.wiki_query import WikiRouter, WikiResponder
-from core.path_resolver import get_wiki_root, list_workspaces, USE_MINIO
+from core.path_resolver import get_wiki_root, list_workspaces
 
 
 class QueryFlow:
@@ -28,14 +28,6 @@ class QueryFlow:
         return list_workspaces(self.user_id)
 
     def _read_specific_map(self, workspace_name: str) -> str:
-        if USE_MINIO:
-            from core import storage
-            from core.path_resolver import minio_index_key
-            key = minio_index_key(self.user_id, workspace_name)
-            if storage.exists(key):
-                return storage.read(key)
-            return "该工作区暂无导航地图。"
-        # 本地模式
         map_path = self.wiki_root / workspace_name / "index.md"
         if map_path.exists():
             return map_path.read_text(encoding="utf-8")
@@ -44,83 +36,6 @@ class QueryFlow:
     def _read_local_concepts(self, workspace_name: str, concepts: list) -> str:
         """在选定的工作区内提取特定概念（双向拆解 + 别名雷达网 + difflib 容错）"""
         context = ""
-
-        if USE_MINIO:
-            from core import storage
-            from core.path_resolver import minio_concepts_prefix
-            prefix = minio_concepts_prefix(self.user_id, workspace_name)
-            all_keys = storage.list_keys(prefix)
-            concept_keys = [k for k in all_keys if k.endswith(".md") 
-                           and not k.endswith("/index.md") 
-                           and "/mocs/" not in k]
-
-            if not concept_keys:
-                return context
-
-            # 建立多重别名雷达图
-            alias_map = {}  # alias -> key
-            for key in concept_keys:
-                stem = key.split("/")[-1].replace(".md", "").lower()
-                alias_map[stem] = key
-                file_parts = [p.strip() for p in re.split(r'[(（)）]', stem) if p.strip()]
-                for p in file_parts:
-                    if p not in alias_map:
-                        alias_map[p] = key
-
-            available_aliases = list(alias_map.keys())
-
-            for concept in concepts:
-                clean_concept = concept.replace("[", "").replace("]", "").strip()
-                safe_name = clean_concept.replace("/", "_").replace("\\", "_")
-                lower_name = safe_name.lower()
-
-                # 防线 1：直接命中
-                if lower_name in alias_map:
-                    match_key = alias_map[lower_name]
-                    try:
-                        content = storage.read(match_key)
-                        match_name = match_key.split("/")[-1]
-                        context += f"【🚨本地知识 == {match_name} ==】\n{content}\n\n"
-                        print(f"  -> 📂 提取: {match_name}")
-                    except Exception:
-                        pass
-                    continue
-
-                # 防线 2：反向拆解
-                parts = [p.strip() for p in re.split(r'[(（)）]', lower_name) if p.strip()]
-                found = False
-                for part in parts:
-                    if part in alias_map:
-                        part_key = alias_map[part]
-                        try:
-                            content = storage.read(part_key)
-                            part_name = part_key.split("/")[-1]
-                            context += f"【🚨本地拆解 == {part_name} ==】\n{content}\n\n"
-                            print(f"  -> 🔍 反向拆解命中: {part_name}")
-                            found = True
-                            break
-                        except Exception:
-                            pass
-                if found:
-                    continue
-
-                # 防线 3：相似度容错
-                close = difflib.get_close_matches(lower_name, available_aliases, n=1, cutoff=0.85)
-                if close:
-                    match_key = alias_map[close[0]]
-                    try:
-                        content = storage.read(match_key)
-                        match_name = match_key.split("/")[-1]
-                        context += f"【🚨本地相似 == {match_name} ==】\n{content}\n\n"
-                        print(f"  -> 🧲 相似纠错: {match_name}")
-                    except Exception:
-                        pass
-                else:
-                    print(f"  ❌ 未找到: [{safe_name}]")
-
-            return context
-
-        # ── 本地模式 ──
         concepts_dir = self.wiki_root / workspace_name / "concepts"
 
         if not concepts_dir.exists():
@@ -179,33 +94,6 @@ class QueryFlow:
     def _fuzzy_find_local_files(self, workspace_name: str, fuzzy_keywords: list) -> str:
         if not fuzzy_keywords:
             return ""
-
-        if USE_MINIO:
-            from core import storage
-            from core.path_resolver import minio_wiki_prefix
-            prefix = minio_wiki_prefix(self.user_id, workspace_name)
-            all_keys = storage.list_keys(prefix)
-            md_keys = [k for k in all_keys if k.endswith(".md")]
-
-            context = ""
-            found = set()
-            for kw in fuzzy_keywords:
-                if not kw.strip():
-                    continue
-                kw_lower = kw.lower()
-                for key in md_keys:
-                    name = key.split("/")[-1].replace(".md", "").lower()
-                    if kw_lower in name and key not in found:
-                        found.add(key)
-                        try:
-                            content = storage.read(key)
-                            display_name = key.split("/")[-1]
-                            context += f"【🚨模糊命中 == {display_name} ==】\n{content}\n\n"
-                        except Exception:
-                            pass
-            return context
-
-        # ── 本地模式 ──
         workspace_dir = self.wiki_root / workspace_name
         if not workspace_dir.exists():
             return ""
@@ -330,29 +218,14 @@ class QueryFlow:
                 local_context += self._read_local_concepts(target_workspace, local_concepts)
                 for c in local_concepts:
                     # 检查是否真的命中了文件
+                    concepts_dir = self.wiki_root / target_workspace / "concepts"
                     matched = False
-                    if USE_MINIO:
-                        from core import storage
-                        from core.path_resolver import minio_concepts_prefix
-                        prefix = minio_concepts_prefix(self.user_id, target_workspace)
-                        all_keys = storage.list_keys(prefix)
-                        c_clean = c.lower().replace(" ", "")
-                        for key in all_keys:
-                            if key.endswith(".md") and not key.endswith("/index.md"):
-                                name = key.split("/")[-1].replace(".md", "").lower().replace(" ", "")
-                                if c_clean in name:
-                                    matched = True
-                                    display_name = key.split("/")[-1]
-                                    yield log(f"   📂 精确命中: {display_name}")
-                                    break
-                    else:
-                        concepts_dir = self.wiki_root / target_workspace / "concepts"
-                        if concepts_dir.exists():
-                            for f in concepts_dir.glob("*.md"):
-                                if c.lower().replace(" ", "") in f.stem.lower().replace(" ", ""):
-                                    matched = True
-                                    yield log(f"   📂 精确命中: {f.name}")
-                                    break
+                    if concepts_dir.exists():
+                        for f in concepts_dir.glob("*.md"):
+                            if c.lower().replace(" ", "") in f.stem.lower().replace(" ", ""):
+                                matched = True
+                                yield log(f"   📂 精确命中: {f.name}")
+                                break
                     if not matched:
                         yield log(f"   ❌ 本地未找到: [{c}]")
                 yield log(f"   ✅ 精确装载完成: {len(local_concepts)} 个概念")
