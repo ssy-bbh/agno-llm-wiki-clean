@@ -1374,8 +1374,9 @@ async def upload_batch_endpoint(
         my_gen = _next_ingest_gen(user_id, workspace)
 
         def run_background_batch():
-            # 新摄入开始：清除旧的终止标记（保留检查点以支持 Resume）
+            # 新摄入开始：清除旧的终止标记和检查点（全新摄入不应跳过任何概念）
             clear_terminate(user_id, workspace)
+            clear_checkpoint(user_id, workspace)
 
             _write_ingest_status(user_id, workspace, "ingesting", files=len(saved_paths), started=time.time(), gen=my_gen)
             # 初始化结构化进度
