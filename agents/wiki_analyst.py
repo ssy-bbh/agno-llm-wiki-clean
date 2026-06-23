@@ -30,8 +30,9 @@ class WikiAnalyst:
                    ✅ 正确示范：`Self-Attention (自注意力机制)`, `YOLO (单阶段目标检测算法)`, `CNN (卷积神经网络)`
                    ❌ 错误示范：`Self-Attention`, `自注意力机制`, `Self-Attention（自注意力机制）等`
                 """
+        # 📉 分层模型：MAP 提取是简单任务，用轻量模型省 90% 费用
         self.agent = Agent(
-            model=get_qwen_model(),
+            model=get_qwen_model(model_id="qwen-turbo"),
             instructions=[self.instructions],
             output_schema=AnalysisReport,
             stream=False

@@ -75,7 +75,11 @@ class IngestFlow:
         return self._file_cache[key]
 
     def _fetch_local_context(self, concepts: list) -> str:
-        """档案管理员：提取上下文，提供给大模型参考（带缓存）"""
+        """档案管理员：提取上下文，提供给大模型参考（带缓存）
+        
+        💡 Token 瘦身：只传 index.md 标题列表 + 概念文件 Abstract 段，不传全文。
+           Editor 需要知道「哪些概念存在」和「大概是什么」，不需要读全文做融合。
+        """
         cache_key = tuple(sorted(concepts))
         if cache_key in self._context_cache:
             return self._context_cache[cache_key]
@@ -84,7 +88,16 @@ class IngestFlow:
         index_path = _resolve("index.md")
 
         if index_path.exists():
-            context_str += f"=== index.md (导航地图) ===\n{self._read_file_cached(index_path)}\n\n"
+            # index.md 是导航地图，Editor 需要看到完整分类结构才能精准追加链接
+            # 通常只有 1-3KB，传全文不心疼；超大时才截断
+            full = self._read_file_cached(index_path)
+            if len(full) > 8000:
+                # 超大知识库：传标题行 + 前 3000 字
+                toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
+                toc = '\n'.join(toc_lines[:200]) if toc_lines else full[:3000]
+                context_str += f"=== index.md (导航地图，已截断) ===\n{toc}\n\n"
+            else:
+                context_str += f"=== index.md (导航地图) ===\n{full}\n\n"
         else:
             context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
 
@@ -93,13 +106,28 @@ class IngestFlow:
             if real_file:
                 content = self._read_file_cached(real_file)
                 rel_path = f"concepts/{real_file.name}"
-                context_str += f"=== {rel_path} (本地已存在) ===\n{content}\n\n"
+                # 📉 只传 Abstract 段（~300字），不传全文（~3000字）
+                abstract = self._extract_abstract(content)
+                context_str += f"=== {rel_path} (摘要) ===\n{abstract}\n\n"
             else:
                 safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
                 context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
 
         self._context_cache[cache_key] = context_str
         return context_str
+
+    @staticmethod
+    def _extract_abstract(content: str) -> str:
+        """从概念页中提取 Abstract 段摘要（~300字），避免传全文给 LLM"""
+        # 优先提取 ## Abstract 到下一个 ## 之间的内容
+        if "## Abstract" in content:
+            after = content.split("## Abstract", 1)[1]
+            # 截断到下一个 ## 标题
+            if "\n## " in after:
+                after = after.split("\n## ", 1)[0]
+            return after.strip()[:500]
+        # 回退：取前 300 字
+        return content[:300]
 
     def _map_extract(self, chunk, chunk_id):
         """Map 阶段的核心逻辑：只提取，不写盘"""
@@ -240,6 +268,16 @@ class IngestFlow:
 
                 concept_payloads[norm_c]["texts"].append(chunk_text_val)
                 concept_payloads[norm_c]["summaries"].append(summary)
+
+        # 📉 SHUFFLE 低频过滤：只在 1 个 chunk 中出现的概念大概率是噪音
+        before_filter = len(concept_payloads)
+        concept_payloads = {
+            k: v for k, v in concept_payloads.items()
+            if len(v["texts"]) >= 2
+        }
+        filtered = before_filter - len(concept_payloads)
+        if filtered:
+            print(f"  🗑️ 过滤低频概念: {filtered} 个（仅 1 个 chunk 提及）")
 
         # ==========================================
         # 🔴 PHASE 3: REDUCE (串行概念融合)
