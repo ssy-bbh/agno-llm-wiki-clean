@@ -11,6 +11,9 @@ class WikiWriter:
         actions = report.get("actions", [])
         results = []
 
+        # 🔄 循环检测：防止重复执行相同的操作
+        seen_actions = set()
+
         def _is_same_concept(name1, name2):
             """聪明且克制的集合交集防撞雷达"""
 
@@ -34,6 +37,18 @@ class WikiWriter:
 
         for action in actions:
             act_type = action.get("type")
+
+            # 🔄 循环检测：同文件 + 同操作 + 同内容前100字 = 重复，跳过
+            dedup_key = (
+                action.get("file", ""),
+                act_type,
+                (action.get("content", "") or "")[:100],
+                (action.get("old_str", "") or "")[:100],
+            )
+            if dedup_key in seen_actions:
+                print(f"  -> 🔄 循环检测：跳过重复操作 [{act_type}] {action.get('file', '?')}")
+                continue
+            seen_actions.add(dedup_key)
 
             raw_file = action.get("file", "concepts/untitled.md")
             if not raw_file.startswith("concepts/") and raw_file != "index.md":

@@ -11,6 +11,9 @@ from core.llm_factory import get_qwen_model
 # 单次 LLM 调用超时（秒）——融合比提取更复杂，给更多时间
 LLM_TIMEOUT_SECONDS = 300
 
+# 🔄 自我验证循环最大尝试次数
+MAX_ATTEMPTS = 2
+
 
 # 💡 我们把 Action 的定义移交给了主编，因为只有它才有权下达动作指令
 class Action(BaseModel):
@@ -50,6 +53,14 @@ class Action(BaseModel):
             # 兜底：如果 rationale 仍然缺失，给个默认值
             if 'rationale' not in data:
                 data['rationale'] = 'LLM 未提供理由'
+            # 智能推断：type=create 但缺少 file 时，从 title 推断文件名
+            if 'file' not in data and data.get('type') == 'create':
+                title = data.get('title', '') or 'untitled'
+                safe = title.replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_')
+                data['file'] = f'concepts/{safe}.md'
+            # append_link 默认目标就是 index.md
+            if 'file' not in data and data.get('type') == 'append_link':
+                data['file'] = 'index.md'
         return data
 
     @field_validator('tags', mode='before')
@@ -93,33 +104,10 @@ class WikiEditor:
             stream=False
         )
 
-    def merge(self, raw_text: str, analyst_summary: str, existing_context: str) -> dict:
-        print("\n[WikiEditor] 🧠 主编正在比对新旧知识，生成精准融合指令...")
-
-        user_prompt = f"""
-        【新资料摘要】:
-        {analyst_summary}
-
-        【新摄入的完整资料】:
-        {raw_text}
-
-        ---
-        【本地已有文件内容】(供查重、对比和提取 old_str 参考):
-        {existing_context}
-
-        请严格按 JSON 格式输出 actions。如果找不到原文字符串，绝对不要编造 old_str！
-        """
-        # 超时保护：防止单个概念融合卡住导致整个流水线停滞
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(self.agent.run, user_prompt)
-            try:
-                response = future.result(timeout=LLM_TIMEOUT_SECONDS)
-            except FuturesTimeoutError:
-                print(f"\n⏰ [WikiEditor] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此概念")
-                return {"actions": []}  # 返回空动作 = 跳过写盘
-
+    def _parse_response(self, response) -> Optional[dict]:
+        """解析 LLM 响应为 EditorReport dict，失败返回 None + 错误信息"""
         if isinstance(response.content, str):
-            # 🔧 JSON 修复兆底：手动修正 LLM 常用的错误字段名
+            # 🔧 JSON 修复兜底：手动修正 LLM 常用的错误字段名
             raw = response.content.strip()
             # 提取 JSON 块
             if '```json' in raw:
@@ -146,11 +134,76 @@ class WikiEditor:
                         act['rationale'] = act.pop('description')
                     if 'rationale' not in act:
                         act['rationale'] = 'LLM 未提供理由'
+                    # 🧠 智能推断 file 字段
+                    if 'file' not in act:
+                        if act.get('type') == 'create':
+                            title = act.get('title', '') or 'untitled'
+                            safe = title.replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_')
+                            act['file'] = f'concepts/{safe}.md'
+                        elif act.get('type') == 'append_link':
+                            act['file'] = 'index.md'
                 report = EditorReport.model_validate(data)
                 print(f"  🔧 JSON 修复成功，恢复 {len(report.actions)} 个 actions")
                 return report.model_dump()
             except Exception as fix_err:
-                print(f"  ❌ JSON 修复失败: {fix_err}")
-                raise ValueError("大模型未返回合法的 Pydantic 对象。")
+                self._last_error = str(fix_err)
+                return None
 
+        # response.content 已经是 Pydantic 对象（Agno 原生解析成功）
         return response.content.model_dump()
+
+    def merge(self, raw_text: str, analyst_summary: str, existing_context: str) -> dict:
+        print("\n[WikiEditor] 🧠 主编正在比对新旧知识，生成精准融合指令...")
+
+        user_prompt = f"""
+        【新资料摘要】:
+        {analyst_summary}
+
+        【新摄入的完整资料】:
+        {raw_text}
+
+        ---
+        【本地已有文件内容】(供查重、对比和提取 old_str 参考):
+        {existing_context}
+
+        请严格按 JSON 格式输出 actions。如果找不到原文字符串，绝对不要编造 old_str！
+        """
+
+        # 自我验证循环：最多尝试 MAX_ATTEMPTS 次（首次 + 重试）
+        self._last_error = "未知错误"
+        for attempt in range(MAX_ATTEMPTS):
+            prompt = user_prompt
+            if attempt > 0:
+                prompt += f"""
+
+⚠️⚠️⚠️ 上一次输出格式有误，已被拒绝！请严格遵守以下字段名规则：
+- 每个 action 必须使用 "type" 字段（不是 "action"）
+- 每个 action 必须使用 "file" 字段（不是 "file_path"、"path" 或 "target"）
+- 每个 action 必须包含 "rationale" 字段说明理由
+- type 只能是 create / edit / append_link / extract_moc 四选一
+上次错误：{self._last_error}
+"""
+                print(f"  🔄 [WikiEditor] 第 {attempt+1} 次尝试（追加格式修正提示）...")
+
+            # 超时保护：防止单个概念融合卡住导致整个流水线停滞
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self.agent.run, prompt)
+                try:
+                    response = future.result(timeout=LLM_TIMEOUT_SECONDS)
+                except FuturesTimeoutError:
+                    print(f"\n⏰ [WikiEditor] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此概念")
+                    return {"actions": []}
+
+            result = self._parse_response(response)
+            if result is not None:
+                if attempt > 0:
+                    print(f"  ✅ 重试成功！")
+                return result
+            else:
+                print(f"  ❌ 第 {attempt+1} 次尝试解析失败: {self._last_error}")
+                if attempt < MAX_ATTEMPTS - 1:
+                    continue  # 还有重试机会
+
+        # 所有尝试均失败
+        print(f"  ❌ {MAX_ATTEMPTS} 次尝试均失败，放弃此概念")
+        return {"actions": []}
