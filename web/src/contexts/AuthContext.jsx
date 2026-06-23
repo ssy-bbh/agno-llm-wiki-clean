@@ -8,20 +8,19 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    // sessionStorage 每个标签页独立，允许多账号同时在线
-    const saved = sessionStorage.getItem('wiki_token')
-    const savedUser = sessionStorage.getItem('wiki_user')
+    const saved = localStorage.getItem('wiki_token')
+    const savedUser = localStorage.getItem('wiki_user')
     if (saved && savedUser) {
       try {
         setToken(saved)
         setUser(JSON.parse(savedUser))
-      } catch { sessionStorage.clear() }
+      } catch { localStorage.clear() }
     }
     setLoading(false)
   }, [])
 
   const apiFetch = useCallback(async (url, options = {}) => {
-    const t = token || sessionStorage.getItem('wiki_token')
+    const t = token || localStorage.getItem('wiki_token')
     const headers = { ...options.headers }
     if (t) headers['Authorization'] = 'Bearer ' + t
     if (!(options.body instanceof FormData) && !headers['Content-Type']) {
@@ -48,8 +47,8 @@ export function AuthProvider({ children }) {
     const data = await res.json()
     setToken(data.token)
     setUser({ user_id: data.user_id, username: data.username, role: data.role || 'user' })
-    sessionStorage.setItem('wiki_token', data.token)
-    sessionStorage.setItem('wiki_user', JSON.stringify({ user_id: data.user_id, username: data.username, role: data.role || 'user' }))
+    localStorage.setItem('wiki_token', data.token)
+    localStorage.setItem('wiki_user', JSON.stringify({ user_id: data.user_id, username: data.username, role: data.role || 'user' }))
     return data
   }
 
@@ -66,16 +65,16 @@ export function AuthProvider({ children }) {
     const data = await res.json()
     setToken(data.token)
     setUser({ user_id: data.user_id, username: data.username, role: data.role || 'user' })
-    sessionStorage.setItem('wiki_token', data.token)
-    sessionStorage.setItem('wiki_user', JSON.stringify({ user_id: data.user_id, username: data.username, role: data.role || 'user' }))
+    localStorage.setItem('wiki_token', data.token)
+    localStorage.setItem('wiki_user', JSON.stringify({ user_id: data.user_id, username: data.username, role: data.role || 'user' }))
     return data
   }
 
   const logout = () => {
     setToken(null)
     setUser(null)
-    sessionStorage.removeItem('wiki_token')
-    sessionStorage.removeItem('wiki_user')
+    localStorage.removeItem('wiki_token')
+    localStorage.removeItem('wiki_user')
   }
 
   return (

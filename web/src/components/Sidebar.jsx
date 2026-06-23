@@ -32,19 +32,6 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
     }
   }
 
-  const handleDeleteSandbox = async (name, e) => {
-    e.stopPropagation()
-    if (!window.confirm(`确定要永久删除沙箱「${name}」及其所有知识数据吗？\n\n此操作不可撤销！`)) return
-    try {
-      const response = await apiFetch(`/api/workspaces/${encodeURIComponent(name)}`, { method: 'DELETE' })
-      if (!response.ok) throw new Error('delete failed')
-      if (name === selectedSandbox) onSandboxSelect(null)
-      fetchWorkspaces()
-    } catch (err) {
-      alert("删除失败: " + err.message)
-    }
-  }
-
   return (
     <aside className="w-[260px] min-w-[260px] h-screen bg-slate-950/80 border-r border-slate-700/60 flex flex-col relative scanline overflow-hidden">
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-transparent via-cyan-500/[0.02] to-transparent h-8 animate-scan" />
@@ -132,18 +119,9 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
                 }`}>
                   {sb.name}
                 </span>
-                <div className="flex items-center gap-1.5 flex-shrink-0">
-                  <button
-                    onClick={(e) => handleDeleteSandbox(sb.id, e)}
-                    className="opacity-0 group-hover:opacity-100 text-[10px] text-red-500/60 hover:text-red-400 transition-all duration-200 p-0.5"
-                    title="删除沙箱"
-                  >
-                    🗑️
-                  </button>
-                  <span className={`w-1.5 h-1.5 rounded-full ${
-                    sb.id === selectedSandbox ? 'bg-cyan-400 animate-pulse shadow-[0_0_5px_rgba(34,211,238,0.8)]' : 'bg-slate-500'
-                  }`} />
-                </div>
+                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                  sb.id === selectedSandbox ? 'bg-cyan-400 animate-pulse shadow-[0_0_5px_rgba(34,211,238,0.8)]' : 'bg-slate-500'
+                }`} />
               </div>
             </button>
           ))}

@@ -5,6 +5,7 @@ import sys
 import re
 import difflib
 from pathlib import Path
+import os
 import json
 import asyncio
 
@@ -15,6 +16,18 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.search_tools import search_web_text, search_multimodal_image
 from agents.wiki_query import WikiRouter, WikiResponder
 from core.path_resolver import get_wiki_root, list_workspaces
+
+# ==========================================
+# 🌐 联网搜索全局开关
+# ==========================================
+_web_search_enabled: bool = os.environ.get("ENABLE_WEB_SEARCH", "true").lower() in ("true", "1", "yes")
+
+def is_web_search_enabled() -> bool:
+    return _web_search_enabled
+
+def set_web_search_enabled(enabled: bool):
+    global _web_search_enabled
+    _web_search_enabled = enabled
 
 
 class QueryFlow:
@@ -138,7 +151,7 @@ class QueryFlow:
             local_context += self._fuzzy_find_local_files(target_workspace, fk)
 
         web_context, image_context = "", ""
-        if decision.get("needs_web_search", True):
+        if is_web_search_enabled() and decision.get("needs_web_search", True):
             sq = decision.get("search_query", user_question)
             web_context = search_web_text(sq)
             images = search_multimodal_image(sq)
@@ -244,6 +257,10 @@ class QueryFlow:
 
         web_context, image_context = "", ""
         images = None
+        # 🌐 检查全局联网开关
+        if not is_web_search_enabled():
+            needs_web = False
+            yield log("🚫 联网搜索已关闭（全局开关），仅使用本地知识库")
         if needs_web and search_query:
             yield log(f"🌐 全网检索: [{search_query}]")
             web_context = search_web_text(search_query)
