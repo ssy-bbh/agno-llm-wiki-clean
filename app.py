@@ -1508,12 +1508,21 @@ async def resume_ingest(
     if not saved_paths:
         raise HTTPException(status_code=404, detail="raw 目录为空")
 
-    # 获取检查点信息：只保留 concepts（概念级去重），清空 files_done（允许重新处理文件）
+    # 获取检查点信息
     cp = get_checkpoint(user_id, workspace)
     done_concepts = len(cp.get("concepts", []))
-    # 不读取 files_done，所有文件都重新处理（概念级去重由 editor 查重机制保证）
-    remaining_paths = saved_paths
-    print(f"🔄 [RESUME] raw_files={[f.name for f in saved_paths]} done_concepts={done_concepts} (files_done cleared for reprocessing)", flush=True)
+    done_files = set(cp.get("files_done", []))
+    # 跳过已完整处理的文件（文件级断点），只处理剩余文件
+    remaining_paths = [f for f in saved_paths if f.name not in done_files]
+    print(f"🔄 [RESUME] raw_files={[f.name for f in saved_paths]} done_files={done_files} remaining={len(remaining_paths)} done_concepts={done_concepts}", flush=True)
+
+    if not remaining_paths:
+        # 所有文件已完成，清除检查点让用户可以重新摄入
+        clear_checkpoint(user_id, workspace)
+        raise HTTPException(
+            status_code=400,
+            detail=f"所有 {len(done_files)} 个文件均已处理完成。如需重新摄入，请先删除沙箱中的知识后重新上传。"
+        )
 
     # Generation counter: 防止旧线程 finally 覆盖新线程的 status
     resume_gen = _next_ingest_gen(user_id, workspace)
@@ -1588,10 +1597,10 @@ async def resume_ingest(
 
     return {
         "status": "ok",
-        "message": f"继续摄入已启动，{len(remaining_paths)} 个文件将重新处理，{done_concepts} 个概念将从检查点跳过",
+        "message": f"继续摄入已启动，{len(remaining_paths)} 个文件待处理（跳过 {len(done_files)} 个已完成），{done_concepts} 个概念将从检查点跳过",
         "files": [f.name for f in remaining_paths],
         "checkpoint_concepts": done_concepts,
-        "skipped_files": [],
+        "skipped_files": list(done_files),
     }
 
 
