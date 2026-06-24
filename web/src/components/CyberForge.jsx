@@ -170,63 +170,64 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     }
   }
 
-  // ── Resume ingest ──
+  // ── Resume ingest (non-blocking: click once, poll in background) ──
   const handleResume = async () => {
     if (!selectedSandbox || resuming) return
-    setResuming(true)
-    try {
-      // 停止保护：轮询等待后台线程完全停止（最多 60s）
-      let serverIdle = false
-      for (let attempt = 0; attempt < 12; attempt++) {
-        const statusRes = await apiFetch(`/api/task-logs/${encodeURIComponent(selectedSandbox)}/status`)
-        if (statusRes.ok) {
-          const statusData = await statusRes.json()
-          if (statusData.status === 'idle') {
-            serverIdle = true
-            break
+    setResuming(true)  // 立即显示"等待停止中..."
+    setForgeLogs(prev => [...prev, { text: '⏳ 正在等待后台任务完全停止...', level: 'info' }])
+
+    // 后台轮询，不阻塞 UI
+    (async () => {
+      try {
+        let serverIdle = false
+        for (let attempt = 0; attempt < 12; attempt++) {
+          const statusRes = await apiFetch(`/api/task-logs/${encodeURIComponent(selectedSandbox)}/status`)
+          if (statusRes.ok) {
+            const statusData = await statusRes.json()
+            if (statusData.status === 'idle') {
+              serverIdle = true
+              break
+            }
           }
-          console.log(`[RESUME] waiting for stop... attempt ${attempt+1}, status: ${statusData.status}`)
+          await new Promise(r => setTimeout(r, 5000))
         }
-        // 等待 5s 后重试
-        await new Promise(r => setTimeout(r, 5000))
-      }
 
-      if (!serverIdle) {
-        setForgeLogs(prev => [...prev, { text: '⏳ 后台任务尚未完全停止（可能正在处理长 LLM 调用），请稍后再试', level: 'warning' }])
-        setTimeout(() => setResuming(false), 1000)
-        return
-      }
+        if (!serverIdle) {
+          setForgeLogs(prev => [...prev, { text: '⏳ 后台任务尚未完全停止（可能正在处理长 LLM 调用），请稍后再试', level: 'warning' }])
+          setResuming(false)
+          return
+        }
 
-      const formData = new FormData()
-      formData.append('workspace', selectedSandbox)
-      const res = await apiFetch('/api/ingest/resume', { method: 'POST', body: formData })
-      if (res.ok) {
-        const data = await res.json()
-        setForgeLogs(prev => [...prev, {
-          text: `🔄 继续摄入已启动：${data.files.length} 个文件，${data.checkpoint_concepts} 个概念将从检查点跳过`,
-          level: 'info'
-        }])
-        setIngestStatus('ingesting')
-        // 初始化进度：total_concepts 用 checkpoint 数作为预估，让进度条不卡在 0
-        setProgress({
-          phase: 'parsing',
-          current_file: 0, total_files: data.files.length,
-          current_file_name: '', total_chunks: 0, map_done: 0,
-          total_concepts: data.checkpoint_concepts || 0,
-          reduce_done: data.checkpoint_concepts || 0,
-        })
-        setElapsed(0)
-        optimisticUntilRef.current = Date.now() + 30000
-        setSseKey(k => k + 1)  // 强制 SSE 重连
-      } else {
-        const err = await res.json().catch(() => ({}))
-        setForgeLogs(prev => [...prev, { text: `❌ 继续失败: ${err.detail || res.status}`, level: 'error' }])
+        const formData = new FormData()
+        formData.append('workspace', selectedSandbox)
+        const res = await apiFetch('/api/ingest/resume', { method: 'POST', body: formData })
+        if (res.ok) {
+          const data = await res.json()
+          setForgeLogs(prev => [...prev, {
+            text: `🔄 继续摄入已启动：${data.files.length} 个文件，${data.checkpoint_concepts} 个概念将从检查点跳过`,
+            level: 'info'
+          }])
+          setIngestStatus('ingesting')
+          setProgress({
+            phase: 'parsing',
+            current_file: 0, total_files: data.files.length,
+            current_file_name: '', total_chunks: 0, map_done: 0,
+            total_concepts: data.checkpoint_concepts || 0,
+            reduce_done: data.checkpoint_concepts || 0,
+          })
+          setElapsed(0)
+          optimisticUntilRef.current = Date.now() + 30000
+          setSseKey(k => k + 1)
+        } else {
+          const err = await res.json().catch(() => ({}))
+          setForgeLogs(prev => [...prev, { text: `❌ 继续失败: ${err.detail || res.status}`, level: 'error' }])
+        }
+      } catch (e) {
+        setForgeLogs(prev => [...prev, { text: `❌ 继续请求失败: ${e.message}`, level: 'error' }])
+      } finally {
+        setResuming(false)
       }
-    } catch (e) {
-      setForgeLogs(prev => [...prev, { text: `❌ 继续请求失败: ${e.message}`, level: 'error' }])
-    } finally {
-      setTimeout(() => setResuming(false), 2000)
-    }
+    })()
   }
 
   // ── Elapsed timer ──
