@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 
 from core.path_resolver import get_wiki_root
+from core.concept_resolver import build_alias_index, resolve_link
 
 
 class LintFlow:
@@ -78,16 +79,19 @@ class LintFlow:
         updated_count = 0
         dead_links = []
 
-        # 🔧 P0 优化：预构建归一化名称索引，O(N) 一次性扫描
-        filename_index = {}
-        for f in all_md_files:
-            clean = f.stem.lower().replace("-", "").replace("_", "").replace(" ", "")
-            filename_index[clean] = f
+        # 🔧 使用公共别名索引：支持 英文/中文/括号解构 的模糊匹配
+        alias_index = build_alias_index(all_md_files)
 
         for target_concept, sources in backlinks_map.items():
-            # O(1) 索引查找替代 O(N) 暴力扫描
-            clean_target = target_concept.lower().replace("-", "").replace("_", "").replace(" ", "")
-            target_file = filename_index.get(clean_target)
+            # 别名解析：[[YOLOv8]] → "YOLOv8 (YOLOv8模型)"
+            resolved_stem = resolve_link(target_concept, alias_index)
+            target_file = None
+            if resolved_stem:
+                # 根据 stem 找到实际文件路径
+                for f in all_md_files:
+                    if f.stem == resolved_stem:
+                        target_file = f
+                        break
 
             if not target_file:
                 dead_links.append(target_concept)

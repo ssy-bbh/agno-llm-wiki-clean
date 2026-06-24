@@ -47,9 +47,13 @@ class TaskLogManager:
 
         Timestamp protection: if existing progress has a FUTURE 'updated' timestamp
         (set by terminate endpoint), reject older writes to prevent stale threads
-        from overwriting the stopping sentinel."""
+        from overwriting the stopping sentinel.
+
+        force=True: bypass timestamp guard (used by _TeeWriter for active thread updates).
+        """
         key = f"{user_id}:{workspace}"
         now = time.time()
+        force = kwargs.pop("force", False)
         new_updated = kwargs.pop("updated", now)
         with self._progress_lock:
             if key not in self._progress:
@@ -66,7 +70,7 @@ class TaskLogManager:
                 }
             # Timestamp guard: reject writes older than existing timestamp
             existing_updated = self._progress[key].get("updated", 0)
-            if new_updated < existing_updated:
+            if not force and new_updated < existing_updated:
                 return  # Stale write (e.g. old thread trying to overwrite terminate's stopping)
             self._progress[key].update(kwargs)
             self._progress[key]["updated"] = new_updated
@@ -289,6 +293,7 @@ class _TeeWriter(io.TextIOBase):
                 map_done=self._cumulative_map,
                 total_concepts=self._cumulative_concepts,
                 reduce_done=self._cumulative_reduce,
+                force=True,
             )
             return
 
@@ -300,12 +305,13 @@ class _TeeWriter(io.TextIOBase):
                 self._uid, self._ws,
                 total_chunks=self._cumulative_chunks + self._current_file_chunks,
                 phase="extracting",
+                force=True,
             )
             return
 
         # ── MAP start ──
         if self._RE_MAP_START.search(line):
-            self._log.set_progress(self._uid, self._ws, phase="extracting")
+            self._log.set_progress(self._uid, self._ws, phase="extracting", force=True)
             return
 
         # ── MAP chunk done ──
@@ -315,12 +321,13 @@ class _TeeWriter(io.TextIOBase):
                 self._uid, self._ws,
                 map_done=prog.get("map_done", 0) + 1,
                 phase="extracting",
+                force=True,
             )
             return
 
         # ── SHUFFLE phase ──
         if self._RE_SHUFFLE.search(line):
-            self._log.set_progress(self._uid, self._ws, phase="clustering")
+            self._log.set_progress(self._uid, self._ws, phase="clustering", force=True)
             return
 
         # ── REDUCE total concepts ──
@@ -334,6 +341,7 @@ class _TeeWriter(io.TextIOBase):
                 self._uid, self._ws,
                 total_concepts=self._cumulative_concepts + self._current_file_concepts,
                 phase="merging",
+                force=True,
             )
             return
 
@@ -345,6 +353,7 @@ class _TeeWriter(io.TextIOBase):
                 self._uid, self._ws,
                 reduce_done=self._cumulative_reduce + self._current_file_reduce,
                 phase="merging",
+                force=True,
             )
             return
 
@@ -373,6 +382,7 @@ class _TeeWriter(io.TextIOBase):
                 map_done=self._cumulative_map,
                 total_concepts=self._cumulative_concepts,
                 reduce_done=self._cumulative_reduce,
+                force=True,
             )
             return
 

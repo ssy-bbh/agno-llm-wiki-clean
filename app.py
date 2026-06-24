@@ -46,6 +46,7 @@ from workflows.lint_flow import LintFlow
 from workflows.autofill_flow import AutoFillFlow
 from workflows.ingest_flow import IngestFlow
 from core.task_log import task_log, TaskOutputCapture
+from core.concept_resolver import build_alias_index, resolve_link
 
 
 # ==========================================
@@ -1641,26 +1642,34 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
     if not base_dir.exists():
         return {"nodes": [], "links": []}
 
-    nodes, links, node_set = [], [], set()
+    nodes, links = [], []
     try:
-        for fp in search_dir.rglob("*.md"):
-            name = fp.stem
-            if name.lower() == "index":
-                continue
-            nodes.append({"id": name, "group": 1})
-            node_set.add(name.lower())
+        all_files = list(search_dir.rglob("*.md"))
+        # 构建别名索引：英文/中文/去符号全名 → 文件名 stem
+        alias_index = build_alias_index(all_files)
+        # 记录所有真实节点 ID（文件名 stem）
+        node_ids = {v for v in alias_index.values()}
 
-        for fp in search_dir.rglob("*.md"):
+        for stem in node_ids:
+            nodes.append({"id": stem, "group": 1})
+
+        seen_links = set()
+        for fp in all_files:
             source = fp.stem
             if source.lower() == "index":
                 continue
             content = fp.read_text(encoding="utf-8")
             for match in re.findall(r'\[\[(.*?)\]\]', content):
-                target = match.split("|")[0].strip()
-                if target.lower() == "index":
+                raw_target = match.split("|")[0].strip()
+                if raw_target.lower() == "index":
                     continue
-                if target.lower() in node_set:
-                    links.append({"source": source, "target": target})
+                # 别名解析：[[YOLOv8]] → "YOLOv8 (YOLOv8模型)"
+                resolved = resolve_link(raw_target, alias_index)
+                if resolved and resolved != source:
+                    link_key = (source, resolved)
+                    if link_key not in seen_links:
+                        seen_links.add(link_key)
+                        links.append({"source": source, "target": resolved})
 
         return {"nodes": nodes, "links": links}
     except Exception as e:

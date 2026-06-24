@@ -12,6 +12,7 @@ from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.edit_tools import _resolve, set_context
 from core.path_resolver import get_wiki_root
+from core.concept_resolver import get_aliases, build_alias_index, resolve_link
 
 
 class AutoFillFlow:
@@ -73,26 +74,11 @@ class AutoFillFlow:
         target_ghosts = []
         existing_files = list(concepts_dir.glob("*.md"))
 
-        def _get_real_target_if_exists(ghost_name: str, files: list) -> str:
-            """基于括号解构的别名集合交集法"""
-            def _get_aliases(text: str) -> set:
-                aliases = set()
-                clean_text = text.lower().replace("-", "").replace("_", "").replace(" ", "")
-                if clean_text: aliases.add(clean_text)
-                match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
-                if match:
-                    part1 = match.group(1).lower().replace("-", "").replace("_", "").replace(" ", "")
-                    part2 = match.group(2).lower().replace("-", "").replace("_", "").replace(" ", "")
-                    if part1: aliases.add(part1)
-                    if part2: aliases.add(part2)
-                return aliases
+        alias_index = build_alias_index(existing_files)
 
-            ghost_aliases = _get_aliases(ghost_name)
-            for ex_file in files:
-                ex_aliases = _get_aliases(ex_file.stem)
-                if ghost_aliases & ex_aliases:
-                    return ex_file.stem
-            return ""
+        def _get_real_target_if_exists(ghost_name: str, files: list) -> str:
+            """基于公共别名解析器匹配"""
+            return resolve_link(ghost_name, alias_index)
 
         yield format_log("🛠️ [自愈系统] 正在清理异名同义假空节点并自动重定向物理指针...")
         await asyncio.sleep(0.01)

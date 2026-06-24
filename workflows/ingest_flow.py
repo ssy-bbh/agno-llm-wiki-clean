@@ -4,7 +4,7 @@ import re
 import time
 import threading
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 from agents.wiki_analyst import WikiAnalyst
 from agents.wiki_editor import WikiEditor
@@ -299,6 +299,7 @@ class IngestFlow:
         error_count = 0
         checkpoint_count = 0  # 从检查点跳过的概念数
         terminated = False
+        reduce_pool = ThreadPoolExecutor(max_workers=1)  # 用于可中断的 merge 调用
 
         for seq, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
             display_name = payload["display_name"]
@@ -329,13 +330,36 @@ class IngestFlow:
             combined_summary = "\n".join(payload["summaries"])
             existing_context = self._fetch_local_context([display_name])
 
-            try:
-                fresh_editor = WikiEditor()
-                report = fresh_editor.merge(
+            # ── 可中断的 LLM 调用：merge() 在线程池中执行，主线程每 2s 检查终止信号 ──
+            def _do_merge():
+                editor = WikiEditor()
+                return editor.merge(
                     raw_text=combined_text,
                     analyst_summary=combined_summary,
                     existing_context=existing_context
                 )
+
+            merge_future = reduce_pool.submit(_do_merge)
+
+            try:
+                # 轮询等待 merge 完成，每 2s 检查一次终止信号
+                while not merge_future.done():
+                    if user_id and kb_name and is_terminate_requested(user_id, kb_name):
+                        # 用户终止 → 放弃当前概念，不保存检查点
+                        print(f"\n🛑 [REDUCE] 收到终止信号，放弃当前概念 [{display_name}]，已完成的概念已保存")
+                        terminated = True
+                        break
+                    try:
+                        merge_future.result(timeout=2)
+                    except FuturesTimeoutError:
+                        continue  # 2s 内没完成，继续轮询
+
+                if terminated:
+                    reduce_pool.shutdown(wait=False)  # 不等待被放弃的线程
+                    break
+
+                # merge 完成，获取结果
+                report = merge_future.result()
 
                 if report and report.get("actions"):
                     self.writer.execute(report)
@@ -355,6 +379,9 @@ class IngestFlow:
                 error_count += 1
                 print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
                 # 继续处理下一个概念，不中断整个流水线
+
+        # 清理线程池（无论循环是正常结束还是被终止）
+        reduce_pool.shutdown(wait=False)
 
         t_total = time.time() - t_reduce_start
         print("\n" + "=" * 60)
