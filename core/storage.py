@@ -79,3 +79,46 @@ def delete_prefix(prefix: str) -> int:
     if errors:
         print(f"⚠️ MinIO 批量删除 {prefix} 有 {len(errors)} 个对象删除失败", flush=True)
     return len(keys) - len(errors)
+
+
+# ═══════════════════════════════════════════
+# MinIO ↔ 本地同步（forge/inbox/radar 用）
+# ═══════════════════════════════════════════
+
+def sync_minio_to_local(prefix: str, local_dir: "Path") -> int:
+    """将 MinIO 前缀下所有文件下载到本地目录，返回下载数量"""
+    keys = list_keys(prefix)
+    if not keys:
+        return 0
+    client = get_client()
+    count = 0
+    for key in keys:
+        # 计算相对路径: wiki/user/ws/concepts/foo.md → concepts/foo.md
+        rel = key[len(prefix):].lstrip("/")
+        if not rel:
+            continue
+        target = local_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            client.fget_object(BUCKET, key, str(target))
+            count += 1
+        except Exception as e:
+            print(f"  ⚠️ MinIO→Local 下载失败 {key}: {e}", flush=True)
+    return count
+
+
+def sync_local_to_minio(local_dir: "Path", prefix: str) -> int:
+    """将本地目录下所有 .md 文件上传到 MinIO 前缀，返回上传数量"""
+    if not local_dir.exists():
+        return 0
+    client = get_client()
+    count = 0
+    for f in local_dir.rglob("*.md"):
+        rel = f.relative_to(local_dir).as_posix()
+        key = f"{prefix}/{rel}"
+        try:
+            client.fput_object(BUCKET, key, str(f))
+            count += 1
+        except Exception as e:
+            print(f"  ⚠️ Local→MinIO 上传失败 {key}: {e}", flush=True)
+    return count

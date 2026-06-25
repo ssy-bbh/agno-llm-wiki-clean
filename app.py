@@ -25,7 +25,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from core.path_resolver import (
     get_wiki_root, get_raw_root, get_concepts_dir, get_index_path,
     get_memory_db_path, ensure_user_dirs, list_workspaces, get_default_workspace,
-    PROJECT_ROOT,
+    PROJECT_ROOT, USE_MINIO, minio_concepts_prefix, minio_wiki_prefix,
 )
 from core.auth import (
     AuthRequest, AuthResponse,
@@ -37,6 +37,7 @@ from core.auth import (
 from core.ingest_control import (
     request_terminate, clear_terminate, is_terminate_requested,
     get_checkpoint, clear_checkpoint, mark_terminated, save_file_checkpoint,
+    load_shuffle_cache, is_concept_done,
 )
 from core.llm_factory import set_user_context
 from core.model_router import get_model_for_user, get_default_model, list_providers
@@ -741,13 +742,18 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
                     if ts > last_ts:
                         yield f"data: {json.dumps(entry)}\n\n"
                         last_ts = ts
-                # 进度变化时也推送（但仅在摄入中时，避免终止后推送残留旧进度）
+                # 进度变化时推送；状态变为 idle/stopping 时也推送（让前端及时响应）
                 cur_status = _read_ingest_status(user_id, workspace)
                 prog = task_log.get_progress(user_id, workspace)
                 prog_ts = prog.get("updated", 0)
-                if prog_ts > last_progress_ts and cur_status.get("status") == "ingesting":
+                cur_st = cur_status.get("status", "idle")
+                if cur_st == "ingesting" and prog_ts > last_progress_ts:
                     yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
                     last_progress_ts = prog_ts
+                elif cur_st in ("idle", "stopping") and last_progress_ts > 0:
+                    # 状态变为 idle/stopping → 推送一次让前端更新，然后重置标记防止重复
+                    yield f"data: {json.dumps({'type': 'progress', 'status': cur_st, 'phase': 'idle'})}\n\n"
+                    last_progress_ts = 0  # 重置，下次不再重复推送
         except (asyncio.CancelledError, GeneratorExit):
             pass
 
@@ -1229,9 +1235,19 @@ async def forge_endpoint(request: ForgeRequest, user=Depends(get_current_user)):
         action_name = "织网" if request.action == "reweave" else "填补黑洞" if request.action == "fill_blackhole" else request.action
         task_log.append(user_id, request.workspace, f"🔥 [锻造炉] 启动: {action_name}", "info")
         try:
+            # 🔄 MinIO → 本地同步：仅 reweave 需要（lint_flow 仍依赖本地文件）
+            # fill_blackhole v2 已全程直操 MinIO，不需要本地同步
+            needs_local_sync = USE_MINIO and request.action == "reweave"
+            if needs_local_sync:
+                from core import storage as minio_storage
+                local_concepts = get_concepts_dir(user_id, request.workspace)
+                local_concepts.mkdir(parents=True, exist_ok=True)
+                prefix = f"wiki/{user_id}/{request.workspace}/concepts"
+                n = minio_storage.sync_minio_to_local(prefix, local_concepts)
+                task_log.append(user_id, request.workspace, f"☁️ MinIO 同步: {n} 个概念文件已拉取", "info")
+
             if request.action == "reweave":
                 async for log in lint_flow.stream_run(request.workspace, user_id=user_id):
-                    # 同时写入任务日志
                     try:
                         data = json.loads(log.replace("data: ", "").strip())
                         if data.get("type") == "log":
@@ -1250,11 +1266,20 @@ async def forge_endpoint(request: ForgeRequest, user=Depends(get_current_user)):
                     yield log
             else:
                 yield f"data: {json.dumps({'type': 'log', 'content': '❌ 未知的织网指令。'})}\n\n"
+
+            # 🛡️ MinIO 回写：仅 reweave 需要（lint_flow 仍写本地文件）
+            if needs_local_sync:
+                from core import storage as minio_storage
+                local_concepts = get_concepts_dir(user_id, request.workspace)
+                prefix = f"wiki/{user_id}/{request.workspace}/concepts"
+                n = minio_storage.sync_local_to_minio(local_concepts, prefix)
+                task_log.append(user_id, request.workspace, f"☁️ MinIO 回写: {n} 个概念文件已推送", "info")
+
+            task_log.append(user_id, request.workspace, f"✅ [锻造炉] {action_name} 完成", "success")
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
         except Exception as e:
             task_log.append(user_id, request.workspace, f"💥 熔炉崩溃: {str(e)}", "error")
             yield f"data: {json.dumps({'type': 'log', 'content': f'💥 熔炉崩溃: {str(e)}'})}\n\n"
-        task_log.append(user_id, request.workspace, f"✅ [锻造炉] {action_name} 完成", "success")
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(run_forge_task(), media_type="text/event-stream")
 
@@ -1378,6 +1403,8 @@ async def upload_batch_endpoint(
             # 新摄入开始：清除旧的终止标记和检查点（全新摄入不应跳过任何概念）
             clear_terminate(user_id, workspace)
             clear_checkpoint(user_id, workspace)
+            # 🔧 清除残留进度文件（防止 done 卡片闪烁）
+            task_log.clear_progress(user_id, workspace)
 
             _write_ingest_status(user_id, workspace, "ingesting", files=len(saved_paths), started=time.time(), gen=my_gen)
             # 初始化结构化进度
@@ -1425,6 +1452,9 @@ async def upload_batch_endpoint(
             finally:
                 # 只有当前 generation 的线程才能写 status（防止旧线程覆盖新线程）
                 if _current_ingest_gen(user_id, workspace) == my_gen:
+                    # ⚠️ 关键顺序：先写 status=idle，再写 progress
+                    # 否则前端 SSE 可能在 status 更新前读到 phase=idle + status=ingesting → 卡住
+                    _write_ingest_status(user_id, workspace, "idle", gen=my_gen)
                     if terminated:
                         mark_terminated(user_id, workspace)
                         # 终止时：重置进度为 idle（清除残留的 phase）
@@ -1433,10 +1463,9 @@ async def upload_batch_endpoint(
                             phase="idle", current_file=0, total_files=0,
                             current_file_name="", total_chunks=0, map_done=0,
                             total_concepts=0, reduce_done=0, started=0,
-                            updated=time.time() + 99999,  # 覆盖旧 sentinel，确保写入成功
+                            updated=time.time() + 99999,
                         )
                     # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
-                    _write_ingest_status(user_id, workspace, "idle", gen=my_gen)
 
         threading.Thread(target=run_background_batch, daemon=True).start()
 
@@ -1485,17 +1514,16 @@ async def resume_ingest(
     user=Depends(get_current_user),
 ):
     """
-    继续摄入：清除终止标记，重新处理 raw 目录中的所有文件。
-    已处理的概念会从检查点跳过，只对新概念调用 LLM。
+    继续摄入：清除终止标记，从 SHUFFLE 缓存加载待处理概念列表。
+    已融合的概念会跳过，只对待融合概念调用 LLM。
+    如果有 SHUFFLE 缓存，跳过 MAP+SHUFFLE（节省 LLM tokens）。
     """
     user_id = user["user_id"]
 
-    # 不再检查 status 文件——generation counter 保证旧线程不会干扰新线程
-    # 用户点击“继续”时，旧线程可能仍在跑 LLM（最长 300s），但 gen 已递增
-    # 旧线程 finally 检查 gen 不匹配会跳过写入
-
     # 清除终止标记
     clear_terminate(user_id, workspace)
+    # 🔧 清除残留进度文件（防止 done 卡片闪烁）
+    task_log.clear_progress(user_id, workspace)
     print(f"🔄 [RESUME] user={user_id} workspace={workspace}", flush=True)
 
     # 查找 raw 目录中的所有文件
@@ -1509,12 +1537,40 @@ async def resume_ingest(
     if not saved_paths:
         raise HTTPException(status_code=404, detail="raw 目录为空")
 
-    # 获取检查点信息（概念级断点，不跳文件）
+    # 获取检查点信息
     cp = get_checkpoint(user_id, workspace)
-    done_concepts = len(cp.get("concepts", []))
-    # Resume 策略：重跑所有文件的 MAP+SHUFFLE（快、本地），仅在 REDUCE 跳过已处理概念
-    remaining_paths = saved_paths
-    print(f"🔄 [RESUME] raw_files={[f.name for f in saved_paths]} done_concepts={done_concepts} (concept-level checkpoint)", flush=True)
+    done_concepts = len(cp.get("done_concepts", []))
+    files_done = cp.get("files_done", [])
+
+    # 尝试加载 SHUFFLE 缓存（待处理列表）
+    shuffle_cache = load_shuffle_cache(user_id, workspace)
+    use_cache = shuffle_cache is not None
+
+    if use_cache:
+        # 过滤已完成文件，只处理有待处理概念的文件
+        remaining_paths = []
+        pending_map = {}  # {filepath: payloads}
+        for fp in saved_paths:
+            fname = fp.name
+            if fname in files_done:
+                continue  # 文件已完整处理，跳过
+            payloads = shuffle_cache.get(fname, {})
+            # 过滤已融合概念
+            pending = {k: v for k, v in payloads.items()
+                       if not is_concept_done(user_id, workspace, k)}
+            if pending:
+                remaining_paths.append(fp)
+                pending_map[fp.name] = pending
+
+        total_pending = sum(len(v) for v in pending_map.values())
+        print(f"🔄 [RESUME] 缓存模式: {len(remaining_paths)} 文件, {total_pending} 待处理概念 "
+              f"(已完成 {done_concepts} 个)", flush=True)
+    else:
+        # 无缓存，回退到传统模式：重跑 MAP+SHUFFLE，REDUCE 跳过已处理概念
+        remaining_paths = [fp for fp in saved_paths if fp.name not in files_done]
+        pending_map = {}
+        print(f"🔄 [RESUME] 传统模式(无缓存): {len(remaining_paths)} 文件, "
+              f"已完成 {done_concepts} 个概念", flush=True)
 
     # Generation counter: 防止旧线程 finally 覆盖新线程的 status
     resume_gen = _next_ingest_gen(user_id, workspace)
@@ -1558,7 +1614,10 @@ async def resume_ingest(
                         break
                     print(f"\n🚀 [{user_id}] [resume {i}/{len(remaining_paths)}] {fp.name}")
                     try:
-                        result = flow.run(str(fp), kb_name=workspace, user_id=user_id)
+                        # 如果有缓存，传入 pending_payloads 跳过 MAP+SHUFFLE
+                        payloads = pending_map.get(fp.name) if use_cache else None
+                        result = flow.run(str(fp), kb_name=workspace, user_id=user_id,
+                                          pending_payloads=payloads)
                         if result is False:
                             terminated = True
                             break
@@ -1571,27 +1630,27 @@ async def resume_ingest(
         finally:
             # 只有当前 generation 的线程才能写 status（防止旧线程覆盖新线程）
             if _current_ingest_gen(user_id, workspace) == resume_gen:
+                # ⚠️ 先写 status=idle，再写 progress（防止前端 SSE 读到 phase=idle + status=ingesting）
+                _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
                 if terminated:
                     mark_terminated(user_id, workspace)
-                    # 终止时：重置进度为 idle（清除残留的 phase）
                     task_log.set_progress(
                         user_id, workspace,
                         phase="idle", current_file=0, total_files=0,
                         current_file_name="", total_chunks=0, map_done=0,
                         total_concepts=0, reduce_done=0, started=0,
-                        updated=time.time() + 99999,  # 覆盖旧 sentinel，确保写入成功
+                        updated=time.time() + 99999,
                     )
-                # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
-                _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
 
     threading.Thread(target=run_resume_batch, daemon=True).start()
 
     return {
         "status": "ok",
-        "message": f"继续摄入已启动，{len(remaining_paths)} 个文件，{done_concepts} 个概念将从检查点跳过",
+        "message": f"继续摄入已启动，{len(remaining_paths)} 个文件，{done_concepts} 个概念已从检查点跳过",
         "files": [f.name for f in remaining_paths],
         "checkpoint_concepts": done_concepts,
-        "skipped_files": [],
+        "cache_mode": use_cache,
+        "skipped_files": files_done,
     }
 
 
@@ -1600,14 +1659,27 @@ async def get_ingest_checkpoint(
     workspace: str,
     user=Depends(get_current_user),
 ):
-    """获取检查点信息（已处理的概念和文件数）"""
+    """获取检查点信息（已处理的概念、文件数、待处理数）"""
     user_id = user["user_id"]
     cp = get_checkpoint(user_id, workspace)
+    done_concepts = len(cp.get("done_concepts", []))
+    files_done = len(cp.get("files_done", []))
+    has_cache = bool(cp.get("concept_payloads", {}))
+
+    # 计算待处理概念数
+    pending = 0
+    if has_cache:
+        for payloads in cp.get("concept_payloads", {}).values():
+            for k in payloads:
+                if k not in cp.get("done_concepts", []):
+                    pending += 1
+
     return {
-        "concepts": len(cp.get("concepts", [])),
-        "files_done": len(cp.get("files_done", [])),
-        "terminated_at": cp.get("terminated_at"),
-        "has_checkpoint": len(cp.get("concepts", [])) > 0,
+        "concepts": done_concepts,
+        "files_done": files_done,
+        "pending_concepts": pending,
+        "has_checkpoint": done_concepts > 0 or pending > 0,
+        "has_cache": has_cache,
     }
 
 
@@ -1639,6 +1711,83 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
     concepts_dir = base_dir / "concepts"
     search_dir = concepts_dir if concepts_dir.exists() else base_dir
 
+    # ── MinIO 模式：从 MinIO 读取概念文件（本地可能为空） ──
+    if USE_MINIO:
+        from core import storage
+        prefix = minio_concepts_prefix(user_id, workspace)
+        minio_keys = [k for k in storage.list_keys(prefix) if k.endswith('.md')]
+
+        if not minio_keys and not (base_dir.exists() and any(search_dir.rglob('*.md'))):
+            return {"nodes": [], "links": []}
+
+        # 用临时 Path 对象模拟文件，复用 build_alias_index
+        from io import BytesIO
+        class _MinIOFile:
+            """轻量封装：让 MinIO 文件能像 Path 一样被 graph 算法使用"""
+            def __init__(self, key, content):
+                self.stem = key.split('/')[-1].replace('.md', '')
+                self.name = self.stem + '.md'
+                self._content = content
+            def read_text(self, encoding='utf-8'):
+                return self._content
+
+        # 读取 MinIO 文件
+        minio_files = []
+        for key in minio_keys:
+            try:
+                content = storage.read(key)
+                minio_files.append(_MinIOFile(key, content))
+            except Exception:
+                continue
+
+        # 同时读本地文件（老数据可能未迁移到 MinIO）
+        local_files = []
+        if search_dir.exists():
+            local_files = [fp for fp in search_dir.rglob('*.md') if fp.is_file()]
+
+        # 合并去重（MinIO 优先，本地作为补充）
+        seen_stems = set()
+        all_files = []
+        for f in minio_files:
+            seen_stems.add(f.stem.lower())
+            all_files.append(f)
+        for f in local_files:
+            if f.stem.lower() not in seen_stems and f.stem.lower() != 'index':
+                all_files.append(f)
+
+        # 构建别名索引 — 需要兼容 _MinIOFile（没有 .is_file() 但有 .stem）
+        alias_index = {}
+        for f in all_files:
+            if f.stem.lower() == 'index':
+                continue
+            from core.concept_resolver import get_aliases
+            for alias in get_aliases(f.stem):
+                alias_index[alias] = f.stem
+
+        node_ids = {v for v in alias_index.values()}
+        nodes = [{"id": stem, "group": 1} for stem in node_ids]
+
+        seen_links = set()
+        links = []
+        for fp in all_files:
+            source = fp.stem
+            if source.lower() == 'index':
+                continue
+            content = fp.read_text(encoding='utf-8')
+            for match in re.findall(r'\[\[(.*?)\]\]', content):
+                raw_target = match.split('|')[0].strip()
+                if raw_target.lower() == 'index':
+                    continue
+                resolved = resolve_link(raw_target, alias_index)
+                if resolved and resolved != source:
+                    link_key = (source, resolved)
+                    if link_key not in seen_links:
+                        seen_links.add(link_key)
+                        links.append({"source": source, "target": resolved})
+
+        return {"nodes": nodes, "links": links}
+
+    # ── 纯本地模式（原逻辑） ──
     if not base_dir.exists():
         return {"nodes": [], "links": []}
 
@@ -1663,7 +1812,6 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
                 raw_target = match.split("|")[0].strip()
                 if raw_target.lower() == "index":
                     continue
-                # 别名解析：[[YOLOv8]] → "YOLOv8 (YOLOv8模型)"
                 resolved = resolve_link(raw_target, alias_index)
                 if resolved and resolved != source:
                     link_key = (source, resolved)
@@ -1689,25 +1837,52 @@ async def get_concept(workspace: str, name: str, user=Depends(get_current_user))
     base_dir = get_wiki_root(user_id) / workspace
     concepts_dir = base_dir / "concepts"
 
-    # 先精确匹配 concepts/{name}.md，再 rglob 递归搜索
+    # ── 1. 先尝试本地文件系统 ──
     candidates = []
     exact = concepts_dir / f"{name}.md"
     if exact.exists():
         candidates.append(exact)
     else:
-        # rglob 在子目录中查找
         for fp in concepts_dir.rglob(f"{name}.md"):
             candidates.append(fp)
             break
 
-    if not candidates:
-        raise HTTPException(status_code=404, detail=f"概念 [{name}] 不存在于沙箱 [{workspace}]")
+    if candidates:
+        try:
+            content = candidates[0].read_text(encoding="utf-8")
+            return {"content": content, "name": name, "path": str(candidates[0].relative_to(base_dir))}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
-    try:
-        content = candidates[0].read_text(encoding="utf-8")
-        return {"content": content, "name": name, "path": str(candidates[0].relative_to(base_dir))}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # ── 2. MinIO 回退：本地没有时从 MinIO 读取 ──
+    if USE_MINIO:
+        from core import storage
+        from core.concept_resolver import get_aliases
+        prefix = minio_concepts_prefix(user_id, workspace)
+        minio_keys = [k for k in storage.list_keys(prefix) if k.endswith('.md')]
+
+        # 精确匹配
+        target_key = prefix + f"{name}.md"
+        if target_key in minio_keys:
+            try:
+                content = storage.read(target_key)
+                return {"content": content, "name": name, "path": f"concepts/{name}.md"}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+        # 别名模糊匹配
+        name_aliases = get_aliases(name)
+        for key in minio_keys:
+            stem = key.split('/')[-1].replace('.md', '')
+            stem_aliases = get_aliases(stem)
+            if name_aliases & stem_aliases:
+                try:
+                    content = storage.read(key)
+                    return {"content": content, "name": stem, "path": f"concepts/{stem}.md"}
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=str(e))
+
+    raise HTTPException(status_code=404, detail=f"概念 [{name}] 不存在于沙箱 [{workspace}]")
 
 
 # ==========================================
@@ -1722,6 +1897,12 @@ async def get_inbox(workspace: str, user=Depends(get_current_user)):
         return []
     user_id = user["user_id"]
     concepts_dir = get_concepts_dir(user_id, workspace)
+    # 🔄 MinIO → 本地同步（每次请求都同步，因为 data 可能是 symlink 指向空目录）
+    if USE_MINIO:
+        from core import storage as minio_storage
+        concepts_dir.mkdir(parents=True, exist_ok=True)
+        minio_storage.sync_minio_to_local(
+            f"wiki/{user_id}/{workspace}/concepts", concepts_dir)
     if not concepts_dir.exists():
         return []
 
@@ -1756,6 +1937,11 @@ async def approve_inbox_file(workspace: str, file_id: str, user=Depends(get_curr
         content = filepath.read_text(encoding="utf-8")
         content = content.replace(DRAFT_TAG + "\n", "").replace(DRAFT_TAG, "")
         filepath.write_text(content, encoding="utf-8")
+        # 🔄 本地 → MinIO 同步
+        if USE_MINIO:
+            from core import storage as minio_storage
+            key = f"wiki/{user_id}/{workspace}/concepts/{file_id}.md"
+            minio_storage.upload_file(key, str(filepath))
     return {"status": "success"}
 
 
@@ -1768,6 +1954,12 @@ async def get_radar(workspace: str, user=Depends(get_current_user)):
         return []
     user_id = user["user_id"]
     concepts_dir = get_concepts_dir(user_id, workspace)
+    # 🔄 MinIO → 本地同步（每次请求都同步）
+    if USE_MINIO:
+        from core import storage as minio_storage
+        concepts_dir.mkdir(parents=True, exist_ok=True)
+        minio_storage.sync_minio_to_local(
+            f"wiki/{user_id}/{workspace}/concepts", concepts_dir)
     if not concepts_dir.exists():
         return []
 
@@ -1837,6 +2029,14 @@ async def reject_inbox_file(workspace: str, file_id: str, user=Depends(get_curre
     filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if filepath.exists():
         filepath.unlink()
+        # 🔄 MinIO 同步删除
+        if USE_MINIO:
+            from core import storage as minio_storage
+            key = f"wiki/{user_id}/{workspace}/concepts/{file_id}.md"
+            try:
+                minio_storage.delete(key)
+            except Exception:
+                pass
     return {"status": "success"}
 
 

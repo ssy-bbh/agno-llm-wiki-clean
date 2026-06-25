@@ -93,6 +93,10 @@ export default function Inbox({ selectedSandbox }) {
 
   return (
     <div className="space-y-2 p-1">
+      <div className="flex justify-between items-center px-1">
+        <span className="text-[10px] text-slate-500 font-mono">{items.length} pending</span>
+        <button onClick={fetchInbox} className="text-[10px] text-slate-500 hover:text-amber-400 font-mono">[🔄 refresh]</button>
+      </div>
       {loading && items.length === 0 ? (
         <div className="text-xs text-amber-500/50 font-mono animate-pulse p-2">SCANNING INBOX...</div>
       ) : items.length === 0 ? (

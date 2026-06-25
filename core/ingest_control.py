@@ -1,8 +1,13 @@
 """
-core/ingest_control.py — 摄入流水线控制（终止 / 继续）
+core/ingest_control.py — 摄入流水线控制（终止 / 继续 / SHUFFLE 缓存）
 
 基于文件系统实现跨 worker 控制，支持多进程 uvicorn 部署。
-每个 user+workspace 独立管理终止标记和已处理概念检查点。
+每个 user+workspace 独立管理终止标记和检查点。
+
+检查点设计（v2）：
+- 保存 SHUFFLE 产出的完整 concept_payloads（待处理列表）
+- 已融合概念从 pending 中移除
+- resume 时直接从 pending 继续，不需要重跑 MAP+SHUFFLE
 """
 import json
 import time
@@ -41,7 +46,7 @@ def clear_terminate(user_id: str, workspace: str):
         fp.unlink()
 
 
-# ── 概念检查点（用于 Resume 跳过已处理概念） ──
+# ── 检查点 v2（待处理列表模式） ──
 
 def _read_checkpoint(user_id: str, workspace: str) -> dict:
     cp = _checkpoint_path(user_id, workspace)
@@ -50,33 +55,110 @@ def _read_checkpoint(user_id: str, workspace: str) -> dict:
             return json.loads(cp.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"concepts": [], "files_done": [], "terminated_at": None}
+    return {
+        "concept_payloads": {},  # {filename: {norm_key: payload_dict}}
+        "files_done": [],        # 已完整处理（所有概念融合完毕）的文件
+        "done_concepts": [],     # 已融合的概念 key 列表（用于兼容和统计）
+        "terminated_at": None,
+    }
 
 
-def save_concept_checkpoint(user_id: str, workspace: str, concept_key: str):
-    """记录一个已完成融合的概念"""
+def save_shuffle_result(user_id: str, workspace: str, filename: str,
+                        payloads: dict):
+    """
+    保存某文件 SHUFFLE 产出的 concept_payloads（待处理列表）。
+    payloads: {norm_key: {"primary_key", "display_name", "aliases", "texts", "summaries"}}
+    注意：aliases 是 set，需要转 list 以 JSON 序列化。
+    """
     cp = _read_checkpoint(user_id, workspace)
-    if concept_key not in cp["concepts"]:
-        cp["concepts"].append(concept_key)
+
+    # 序列化 payloads（set → list）
+    serialized = {}
+    for k, v in payloads.items():
+        serialized[k] = {
+            "primary_key": v.get("primary_key", k),
+            "display_name": v.get("display_name", k),
+            "aliases": list(v.get("aliases", set())),
+            "texts": v.get("texts", []),
+            "summaries": v.get("summaries", []),
+        }
+
+    cp["concept_payloads"][filename] = serialized
+    _checkpoint_path(user_id, workspace).write_text(
+        json.dumps(cp, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def load_shuffle_cache(user_id: str, workspace: str) -> dict | None:
+    """
+    加载 SHUFFLE 缓存（concept_payloads）。
+    返回: {filename: {norm_key: payload_dict}} 或 None（无缓存）。
+    加载时将 list 转回 set（还原 aliases）。
+    """
+    cp = _read_checkpoint(user_id, workspace)
+    raw = cp.get("concept_payloads", {})
+    if not raw:
+        return None
+
+    # 反序列化（list → set）
+    result = {}
+    for filename, payloads in raw.items():
+        file_payloads = {}
+        for k, v in payloads.items():
+            file_payloads[k] = {
+                "primary_key": v.get("primary_key", k),
+                "display_name": v.get("display_name", k),
+                "aliases": set(v.get("aliases", [])),
+                "texts": v.get("texts", []),
+                "summaries": v.get("summaries", []),
+            }
+        result[filename] = file_payloads
+    return result
+
+
+def mark_concept_done(user_id: str, workspace: str, concept_key: str):
+    """记录一个已完成融合的概念（从待处理列表中移除）"""
+    cp = _read_checkpoint(user_id, workspace)
+    if concept_key not in cp["done_concepts"]:
+        cp["done_concepts"].append(concept_key)
+    # 同时从所有文件的 payloads 中移除此概念（减少 pending）
+    for filename in list(cp.get("concept_payloads", {}).keys()):
+        cp["concept_payloads"][filename].pop(concept_key, None)
     _checkpoint_path(user_id, workspace).write_text(
         json.dumps(cp, ensure_ascii=False), encoding="utf-8"
     )
 
 
 def save_file_checkpoint(user_id: str, workspace: str, filename: str):
-    """记录一个已完整处理的文件"""
+    """记录一个已完整处理的文件（所有概念已融合）"""
     cp = _read_checkpoint(user_id, workspace)
     if filename not in cp["files_done"]:
         cp["files_done"].append(filename)
+    # 文件完成 → 清除其 payloads（不再需要）
+    cp.get("concept_payloads", {}).pop(filename, None)
     _checkpoint_path(user_id, workspace).write_text(
         json.dumps(cp, ensure_ascii=False), encoding="utf-8"
     )
 
 
 def is_concept_done(user_id: str, workspace: str, concept_key: str) -> bool:
-    """检查某概念是否已在检查点中"""
+    """检查某概念是否已融合"""
     cp = _read_checkpoint(user_id, workspace)
-    return concept_key in cp["concepts"]
+    return concept_key in cp.get("done_concepts", [])
+
+
+def get_pending_concepts(user_id: str, workspace: str) -> int:
+    """统计所有文件中待处理的概念总数"""
+    cache = load_shuffle_cache(user_id, workspace)
+    if not cache:
+        return 0
+    done = set(_read_checkpoint(user_id, workspace).get("done_concepts", []))
+    total = 0
+    for payloads in cache.values():
+        for k in payloads:
+            if k not in done:
+                total += 1
+    return total
 
 
 def get_checkpoint(user_id: str, workspace: str) -> dict:

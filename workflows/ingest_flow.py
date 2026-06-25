@@ -12,8 +12,8 @@ from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
 from tools.edit_tools import _resolve, set_context
 from core.ingest_control import (
-    is_terminate_requested, save_concept_checkpoint,
-    is_concept_done, save_file_checkpoint
+    is_terminate_requested, mark_concept_done,
+    is_concept_done, save_file_checkpoint, save_shuffle_result,
 )
 
 
@@ -78,56 +78,41 @@ class IngestFlow:
         """档案管理员：提取上下文，提供给大模型参考（带缓存）
         
         💡 Token 瘦身：只传 index.md 标题列表 + 概念文件 Abstract 段，不传全文。
-           Editor 需要知道「哪些概念存在」和「大概是什么」，不需要读全文做融合。
         """
-        cache_key = tuple(sorted(concepts))
-        if cache_key in self._context_cache:
-            return self._context_cache[cache_key]
-
-        context_str = "\n"
+        context_parts = []
+        
+        # 1) 从 index.md 获取目录概览（只取前 30 行）
         index_path = _resolve("index.md")
-
         if index_path.exists():
-            # index.md 是导航地图，Editor 需要看到完整分类结构才能精准追加链接
-            # 通常只有 1-3KB，传全文不心疼；超大时才截断
-            full = self._read_file_cached(index_path)
-            if len(full) > 8000:
-                # 超大知识库：传标题行 + 前 3000 字
-                toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
-                toc = '\n'.join(toc_lines[:200]) if toc_lines else full[:3000]
-                context_str += f"=== index.md (导航地图，已截断) ===\n{toc}\n\n"
-            else:
-                context_str += f"=== index.md (导航地图) ===\n{full}\n\n"
-        else:
-            context_str += "=== index.md (导航地图) ===\n(文件不存在)\n\n"
-
+            try:
+                lines = index_path.read_text(encoding="utf-8").splitlines()[:30]
+                context_parts.append("📋 知识目录:\n" + "\n".join(lines))
+            except Exception:
+                pass
+        
+        # 2) 获取相关概念的 Abstract（每个限 200 字）
         for concept in concepts:
-            real_file = self._find_existing_file(concept)
-            if real_file:
-                content = self._read_file_cached(real_file)
-                rel_path = f"concepts/{real_file.name}"
-                # 📉 只传 Abstract 段（~300字），不传全文（~3000字）
-                abstract = self._extract_abstract(content)
-                context_str += f"=== {rel_path} (摘要) ===\n{abstract}\n\n"
-            else:
-                safe_name = concept.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
-                context_str += f"=== concepts/{safe_name}.md ===\n(全新概念)\n\n"
-
-        self._context_cache[cache_key] = context_str
-        return context_str
-
-    @staticmethod
-    def _extract_abstract(content: str) -> str:
-        """从概念页中提取 Abstract 段摘要（~300字），避免传全文给 LLM"""
-        # 优先提取 ## Abstract 到下一个 ## 之间的内容
-        if "## Abstract" in content:
-            after = content.split("## Abstract", 1)[1]
-            # 截断到下一个 ## 标题
-            if "\n## " in after:
-                after = after.split("\n## ", 1)[0]
-            return after.strip()[:500]
-        # 回退：取前 300 字
-        return content[:300]
+            existing = self._find_existing_file(concept)
+            if existing:
+                cache_key = ("abstract", str(existing))
+                if cache_key not in self._context_cache:
+                    content = self._read_file_cached(existing)
+                    # 只提取 Abstract 段
+                    abs_match = re.search(
+                        r'## Abstract\s*\n(.*?)(?=\n## |\Z)',
+                        content, re.DOTALL
+                    )
+                    abstract = abs_match.group(1).strip()[:200] if abs_match else ""
+                    self._context_cache[cache_key] = abstract
+                abstract = self._context_cache[cache_key]
+                if abstract:
+                    context_parts.append(f"[{concept}]: {abstract}")
+        
+        ctx = "\n".join(context_parts)
+        # Token 熔断：如果上下文过长，截断保留目录
+        if len(ctx) > 3000:
+            ctx = ctx[:3000] + "\n... [上下文过长，已截断] ..."
+        return ctx
 
     def _map_extract(self, chunk, chunk_id):
         """Map 阶段的核心逻辑：只提取，不写盘"""
@@ -140,11 +125,14 @@ class IngestFlow:
         except Exception as e:
             return chunk_id, chunk, None, f"报错: {str(e)}"
 
-    def run(self, input_source: str, kb_name: str = "", user_id: str = ""):
+    def run(self, input_source: str, kb_name: str = "", user_id: str = "",
+            pending_payloads: dict = None):
         """
         知识摄入入口。
         kb_name: 目标沙箱名称（通过参数传递，避免 os.environ 竞态）
         user_id: 用户 ID（用于路径隔离）
+        pending_payloads: 可选，SHUFFLE 缓存的概念载荷。
+                         提供后跳过 MAP+SHUFFLE，直接进入 REDUCE。
         """
         # 在调用任何 _resolve 前，设置线程安全上下文
         set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
@@ -159,125 +147,143 @@ class IngestFlow:
         print("\n" + "=" * 60)
         print(f"🚀 [IngestFlow] 启动 Map-Reduce 引擎 | 沙箱: {kb_name} | 用户: {user_id}")
 
-        # 设置文档名到上下文
         path = Path(input_source)
-        if path.exists() and path.is_file():
-            # ── 单文件模式 ──
-            set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=path.stem)
-            print(f"📄 目标语料：{path.name} ({path.stat().st_size} bytes)", flush=True)
-            try:
-                raw_text = extract_text(str(path))
-            except Exception as e:
-                print(f"❌ extract_text 失败: {type(e).__name__}: {e}", flush=True)
-                raw_text = ""
-            print(f"📝 提取文本: {len(raw_text)} 字符", flush=True)
-            if not raw_text.strip():
-                print("⚠️ 警告：提取出的文本为空！PDF 可能是扫描图片（需要 OCR）或文件损坏。", flush=True)
-            chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
-            print(f"✂️ 物理切分为 {len(chunks)} 个知识块。", flush=True)
-        elif path.exists() and path.is_dir():
-            # ── 目录模式：遍历所有文件，合并文本后切块 ──
-            SUPPORTED_EXT = {".pdf", ".docx", ".md", ".txt"}
-            all_text = ""
-            file_count = 0
-            for file in sorted(path.iterdir()):
-                if file.is_file() and file.suffix.lower() in SUPPORTED_EXT:
-                    try:
-                        text = extract_text(str(file))
-                        if text.strip():
-                            all_text += f"\n\n--- [{file.name}] ---\n\n" + text
-                            file_count += 1
-                            print(f"  📄 读取: {file.name} ({len(text)} 字符)")
-                    except Exception as e:
-                        print(f"  ⚠️ 跳过 {file.name}: {e}")
-            if not all_text.strip():
-                print("❌ 目录中没有可解析的文件")
-                chunks = []
-            else:
-                print(f"📚 共读取 {file_count} 个文件 ({len(all_text)} 字符)")
-                chunks = chunk_text(all_text, chunk_size=1500, overlap=200)
-                print(f"✂️ 物理切分为 {len(chunks)} 个知识块。")
+
+        # ── Resume 快速路径：从 SHUFFLE 缓存直接进入 REDUCE ──
+        if pending_payloads is not None:
+            concept_payloads = pending_payloads
+            filename = path.name if path.exists() else input_source
+            set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="",
+                        doc_name=path.stem if path.exists() else "")
+            print(f"🔄 [RESUME] 从检查点加载缓存，跳过 MAP+SHUFFLE")
+            # 合成文件进度行，让 _TeeWriter 正确初始化进度
+            print(f"\n🚀 [1/1] 提取: {filename} -> {kb_name}")
+
         else:
-            # 兜底：把 input_source 当原始文本
-            chunks = chunk_text(input_source, chunk_size=1500, overlap=200)
-            print(f"✂️ 原始文本切分为 {len(chunks)} 个知识块。")
-
-        # ==========================================
-        # 🟢 PHASE 1: MAP (无锁绝对并发)
-        # ==========================================
-        map_lock = threading.Lock()
-
-        print("\n" + "=" * 60)
-        print("⚡ [Phase 1: MAP] 启动侦察兵并发提取 (释放全部线程)...")
-
-        map_results = []
-        # 使用 12 个并发线程进行提取
-        with ThreadPoolExecutor(max_workers=12) as executor:
-            futures = {executor.submit(self._map_extract, chunk, i + 1): i for i, chunk in enumerate(chunks)}
-
-            for future in as_completed(futures):
-                cid, chunk_text_val, res, status = future.result()
-                if res:
-                    # 进入临界区，安全写入内存
-                    with map_lock:
-                        map_results.append((chunk_text_val, res))
-                    print(f"  -> ✅ 线程 {cid} 提取完毕: {res.get('new_concepts')}")
-
-        # ==========================================
-        # 🟡 PHASE 2: SHUFFLE (内存级同义词聚类)
-        # ==========================================
-        print("\n" + "=" * 60)
-        print("🔀 [Phase 2: SHUFFLE] 正在将碎片知识按概念重新洗牌聚类 (启动双语解构引擎)...")
-
-        concept_payloads = {}
-        for chunk_text_val, res in map_results:
-            concepts = res.get("new_concepts", [])
-            summary = res.get("summary", "")
-
-            for raw_c in concepts:
-                # 尝试剥离 "English (中文)" 格式
-                match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', raw_c)
-                if match:
-                    en_key = match.group(1).strip()
-                    zh_alias = match.group(2).strip()
-                    full_display = f"{en_key} ({zh_alias})"
+            # ── 正常路径：解析文档 → MAP → SHUFFLE ──
+            # 设置文档名到上下文
+            if path.exists() and path.is_file():
+                # ── 单文件模式 ──
+                set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="", doc_name=path.stem)
+                print(f"📄 目标语料：{path.name} ({path.stat().st_size} bytes)", flush=True)
+                try:
+                    raw_text = extract_text(str(path))
+                except Exception as e:
+                    print(f"❌ extract_text 失败: {type(e).__name__}: {e}", flush=True)
+                    raw_text = ""
+                print(f"📝 提取文本: {len(raw_text)} 字符", flush=True)
+                if not raw_text.strip():
+                    print("⚠️ 警告：提取出的文本为空！PDF 可能是扫描图片（需要 OCR）或文件损坏。", flush=True)
+                chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
+                print(f"✂️ 物理切分为 {len(chunks)} 个知识块。", flush=True)
+            elif path.exists() and path.is_dir():
+                # ── 目录模式：遍历所有文件，合并文本后切块 ──
+                SUPPORTED_EXT = {".pdf", ".docx", ".md", ".txt"}
+                all_text = ""
+                file_count = 0
+                for file in sorted(path.iterdir()):
+                    if file.is_file() and file.suffix.lower() in SUPPORTED_EXT:
+                        try:
+                            text = extract_text(str(file))
+                            if text.strip():
+                                all_text += f"\n\n--- [{file.name}] ---\n\n" + text
+                                file_count += 1
+                                print(f"  📄 读取: {file.name} ({len(text)} 字符)")
+                        except Exception as e:
+                            print(f"  ⚠️ 跳过 {file.name}: {e}")
+                if not all_text.strip():
+                    print("❌ 目录中没有可解析的文件")
+                    chunks = []
                 else:
-                    en_key = raw_c.strip()
-                    zh_alias = ""
-                    full_display = en_key
+                    print(f"📚 共读取 {file_count} 个文件 ({len(all_text)} 字符)")
+                    chunks = chunk_text(all_text, chunk_size=1500, overlap=200)
+                    print(f"✂️ 物理切分为 {len(chunks)} 个知识块。")
+            else:
+                # 兜底：把 input_source 当原始文本
+                chunks = chunk_text(input_source, chunk_size=1500, overlap=200)
+                print(f"✂️ 原始文本切分为 {len(chunks)} 个知识块。")
 
-                # 过滤明显不是概念的超长垃圾数据
-                if len(en_key.split()) > 4 or len(en_key) > 25:
-                    continue
+            # ==========================================
+            # 🟢 PHASE 1: MAP (无锁绝对并发)
+            # ==========================================
+            map_lock = threading.Lock()
 
-                norm_c = self._normalize_name(en_key)
-                if not norm_c or len(norm_c) < 2:
-                    continue
+            print("\n" + "=" * 60)
+            print("⚡ [Phase 1: MAP] 启动侦察兵并发提取 (释放全部线程)...")
 
-                if norm_c not in concept_payloads:
-                    concept_payloads[norm_c] = {
-                        "primary_key": en_key,
-                        "display_name": full_display,
-                        "aliases": set(),
-                        "texts": [],
-                        "summaries": []
-                    }
+            map_results = []
+            # 使用 12 个并发线程进行提取
+            with ThreadPoolExecutor(max_workers=12) as executor:
+                futures = {executor.submit(self._map_extract, chunk, i + 1): i for i, chunk in enumerate(chunks)}
 
-                if zh_alias:
-                    concept_payloads[norm_c]["aliases"].add(zh_alias)
+                for future in as_completed(futures):
+                    cid, chunk_text_val, res, status = future.result()
+                    if res:
+                        # 进入临界区，安全写入内存
+                        with map_lock:
+                            map_results.append((chunk_text_val, res))
+                        print(f"  -> ✅ 线程 {cid} 提取完毕: {res.get('new_concepts')}")
 
-                concept_payloads[norm_c]["texts"].append(chunk_text_val)
-                concept_payloads[norm_c]["summaries"].append(summary)
+            # ==========================================
+            # 🟡 PHASE 2: SHUFFLE (内存级同义词聚类)
+            # ==========================================
+            print("\n" + "=" * 60)
+            print("🔀 [Phase 2: SHUFFLE] 正在将碎片知识按概念重新洗牌聚类 (启动双语解构引擎)...")
 
-        # 📉 SHUFFLE 低频过滤：只在 1 个 chunk 中出现的概念大概率是噪音
-        before_filter = len(concept_payloads)
-        concept_payloads = {
-            k: v for k, v in concept_payloads.items()
-            if len(v["texts"]) >= 2
-        }
-        filtered = before_filter - len(concept_payloads)
-        if filtered:
-            print(f"  🗑️ 过滤低频概念: {filtered} 个（仅 1 个 chunk 提及）")
+            concept_payloads = {}
+            for chunk_text_val, res in map_results:
+                concepts = res.get("new_concepts", [])
+                summary = res.get("summary", "")
+
+                for raw_c in concepts:
+                    # 尝试剥离 "English (中文)" 格式
+                    match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', raw_c)
+                    if match:
+                        en_key = match.group(1).strip()
+                        zh_alias = match.group(2).strip()
+                        full_display = f"{en_key} ({zh_alias})"
+                    else:
+                        en_key = raw_c.strip()
+                        zh_alias = ""
+                        full_display = en_key
+
+                    # 过滤明显不是概念的超长垃圾数据
+                    if len(en_key.split()) > 4 or len(en_key) > 25:
+                        continue
+
+                    norm_c = self._normalize_name(en_key)
+                    if not norm_c or len(norm_c) < 2:
+                        continue
+
+                    if norm_c not in concept_payloads:
+                        concept_payloads[norm_c] = {
+                            "primary_key": en_key,
+                            "display_name": full_display,
+                            "aliases": set(),
+                            "texts": [],
+                            "summaries": []
+                        }
+
+                    if zh_alias:
+                        concept_payloads[norm_c]["aliases"].add(zh_alias)
+
+                    concept_payloads[norm_c]["texts"].append(chunk_text_val)
+                    concept_payloads[norm_c]["summaries"].append(summary)
+
+            # 📉 SHUFFLE 低频过滤：只在 1 个 chunk 中出现的概念大概率是噪音
+            before_filter = len(concept_payloads)
+            concept_payloads = {
+                k: v for k, v in concept_payloads.items()
+                if len(v["texts"]) >= 2
+            }
+            filtered = before_filter - len(concept_payloads)
+            if filtered:
+                print(f"  🗑️ 过滤低频概念: {filtered} 个（仅 1 个 chunk 提及）")
+
+            # 💾 保存 SHUFFLE 结果到检查点缓存（供 resume 跳过 MAP+SHUFFLE）
+            if user_id and kb_name:
+                filename = path.name if path.exists() else input_source
+                save_shuffle_result(user_id, kb_name, filename, concept_payloads)
 
         # ==========================================
         # 🔴 PHASE 3: REDUCE (串行概念融合)
@@ -331,7 +337,12 @@ class IngestFlow:
             existing_context = self._fetch_local_context([display_name])
 
             # ── 可中断的 LLM 调用：merge() 在线程池中执行，主线程每 2s 检查终止信号 ──
+            # 🔧 关键修复：threading.local() 不传播到子线程，必须在 worker 内重设上下文
+            _merge_user_id = user_id
+            _merge_kb_name = kb_name
+
             def _do_merge():
+                set_context(user_id=_merge_user_id, kb_name=_merge_kb_name or "default", sub_dir="")
                 editor = WikiEditor()
                 return editor.merge(
                     raw_text=combined_text,
@@ -342,17 +353,17 @@ class IngestFlow:
             merge_future = reduce_pool.submit(_do_merge)
 
             try:
-                # 轮询等待 merge 完成，每 2s 检查一次终止信号
+                # 轮询等待 merge 完成，每 0.5s 检查一次终止信号（确保 <1s 响应）
                 while not merge_future.done():
                     if user_id and kb_name and is_terminate_requested(user_id, kb_name):
-                        # 用户终止 → 放弃当前概念，不保存检查点
+                        # 用户终止 → 立即放弃当前概念，线程池 shutdown(wait=False)
                         print(f"\n🛑 [REDUCE] 收到终止信号，放弃当前概念 [{display_name}]，已完成的概念已保存")
                         terminated = True
                         break
                     try:
-                        merge_future.result(timeout=2)
+                        merge_future.result(timeout=0.5)
                     except FuturesTimeoutError:
-                        continue  # 2s 内没完成，继续轮询
+                        continue  # 0.5s 内没完成，继续轮询
 
                 if terminated:
                     reduce_pool.shutdown(wait=False)  # 不等待被放弃的线程
@@ -367,9 +378,9 @@ class IngestFlow:
                     print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
                     skipped_count += 1
 
-                # ── 保存检查点（融合成功后立即记录）──
+                # ── 保存检查点（融合成功后立即记录，从待处理列表移除）──
                 if user_id and kb_name:
-                    save_concept_checkpoint(user_id, kb_name, norm_c)
+                    mark_concept_done(user_id, kb_name, norm_c)
 
                 elapsed = time.time() - t0
                 print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)")
@@ -408,7 +419,7 @@ if __name__ == "__main__":
 
     if not raw_dir.exists():
         raw_dir.mkdir(parents=True, exist_ok=True)
-        print(f"⚠️ 找不到 {raw_dir} 目录，已为您自动创建。请先将数据放入该目录！")
+        print(f"⚠️ 找不到 {raw_dir} 目录，已自动创建。请先将数据放入该目录！")
         sys.exit(0)
 
     # 读取 raw/ 下的所有文件夹（作为沙箱）和 PDF
