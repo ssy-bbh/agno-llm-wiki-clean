@@ -1896,16 +1896,39 @@ async def get_inbox(workspace: str, user=Depends(get_current_user)):
     if not workspace:
         return []
     user_id = user["user_id"]
-    concepts_dir = get_concepts_dir(user_id, workspace)
-    # 🔄 MinIO → 本地同步（每次请求都同步，因为 data 可能是 symlink 指向空目录）
+
     if USE_MINIO:
-        from core import storage as minio_storage
-        concepts_dir.mkdir(parents=True, exist_ok=True)
-        minio_storage.sync_minio_to_local(
-            f"wiki/{user_id}/{workspace}/concepts", concepts_dir)
+        from core import storage as ms
+        prefix = f"wiki/{user_id}/{workspace}/concepts"
+        try:
+            keys = [k for k in ms.list_keys(prefix) if k.endswith(".md")]
+        except Exception:
+            return []
+        files = []
+        for key in keys:
+            stem = key.split("/")[-1].replace(".md", "")
+            if stem.lower() == "index":
+                continue
+            try:
+                content = ms.read(key)
+            except Exception:
+                continue
+            if DRAFT_TAG not in content:
+                continue
+            clean = re.sub(r'<.*?AUTOFILL_DRAFT.*?>', '', content)
+            clean = re.sub(r'[#*\[\]\n]', ' ', clean)[:40].strip()
+            files.append({
+                "id": stem,
+                "title": stem,
+                "excerpt": f"{clean}..." if clean else "无正文内容...",
+                "timestamp": 0,
+            })
+        return files[:4]
+
+    # ── 本地模式 ──
+    concepts_dir = get_concepts_dir(user_id, workspace)
     if not concepts_dir.exists():
         return []
-
     files = []
     try:
         for f in concepts_dir.glob("*.md"):
@@ -1932,16 +1955,63 @@ async def get_inbox(workspace: str, user=Depends(get_current_user)):
 @app.post("/api/inbox/approve")
 async def approve_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
     user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage as ms
+        from core.path_resolver import minio_concept_key
+        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
+        if ms.exists(key):
+            content = ms.read(key)
+            content = content.replace(DRAFT_TAG + "\n", "").replace(DRAFT_TAG, "")
+            ms.write(key, content)
+        return {"status": "success"}
+
+    # ── 本地模式 ──
     filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
     if filepath.exists():
         content = filepath.read_text(encoding="utf-8")
         content = content.replace(DRAFT_TAG + "\n", "").replace(DRAFT_TAG, "")
         filepath.write_text(content, encoding="utf-8")
-        # 🔄 本地 → MinIO 同步
-        if USE_MINIO:
-            from core import storage as minio_storage
-            key = f"wiki/{user_id}/{workspace}/concepts/{file_id}.md"
-            minio_storage.upload_file(key, str(filepath))
+    return {"status": "success"}
+
+
+@app.get("/api/inbox/file")
+async def get_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
+    user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage as ms
+        from core.path_resolver import minio_concept_key
+        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
+        if not ms.exists(key):
+            raise HTTPException(status_code=404)
+        content = ms.read(key).replace(DRAFT_TAG + "\n", "")
+        return {"content": content}
+
+    # ── 本地模式 ──
+    filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
+    if not filepath.exists():
+        raise HTTPException(status_code=404)
+    content = filepath.read_text(encoding="utf-8").replace(DRAFT_TAG + "\n", "")
+    return {"content": content}
+
+
+@app.post("/api/inbox/reject")
+async def reject_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
+    user_id = user["user_id"]
+
+    if USE_MINIO:
+        from core import storage as ms
+        from core.path_resolver import minio_concept_key
+        key = minio_concept_key(user_id, workspace, f"{file_id}.md")
+        if ms.exists(key):
+            ms.delete(key)
+        return {"status": "success"}
+
+    # ── 本地模式 ──
+    filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
+    if filepath.exists():
+        filepath.unlink()
     return {"status": "success"}
 
 
@@ -2009,35 +2079,6 @@ async def get_radar(workspace: str, user=Depends(get_current_user)):
     except Exception:
         return []
 
-
-# ==========================================
-# ⚖️ 8. Inbox 物理审批 (CRUD)
-# ==========================================
-@app.get("/api/inbox/file")
-async def get_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
-    user_id = user["user_id"]
-    filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
-    if not filepath.exists():
-        raise HTTPException(status_code=404)
-    content = filepath.read_text(encoding="utf-8").replace(DRAFT_TAG + "\n", "")
-    return {"content": content}
-
-
-@app.post("/api/inbox/reject")
-async def reject_inbox_file(workspace: str, file_id: str, user=Depends(get_current_user)):
-    user_id = user["user_id"]
-    filepath = get_concepts_dir(user_id, workspace) / f"{file_id}.md"
-    if filepath.exists():
-        filepath.unlink()
-        # 🔄 MinIO 同步删除
-        if USE_MINIO:
-            from core import storage as minio_storage
-            key = f"wiki/{user_id}/{workspace}/concepts/{file_id}.md"
-            try:
-                minio_storage.delete(key)
-            except Exception:
-                pass
-    return {"status": "success"}
 
 
 # ==========================================
