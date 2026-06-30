@@ -14,6 +14,8 @@ data/users.db
 data/raw/
 data/wiki/
 !data/wiki/README.md
+data/.ingest_control/
+data/.ingest_status/
 
 # =============================================
 # 📦 构建产物 & 依赖
