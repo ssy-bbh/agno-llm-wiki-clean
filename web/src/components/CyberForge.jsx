@@ -70,13 +70,21 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   useEffect(() => { ingestStatusRef.current = ingestStatus }, [ingestStatus])
 
   // ── 切换沙箱时清空所有状态，防止跨沙箱数据串扰 ──
+  const switchedRef = useRef(false)
   useEffect(() => {
+    // 取消正在进行的 forge 操作（防止旧沙箱的日志污染新沙箱控制台）
+    if (forgeAbortRef.current) {
+      forgeAbortRef.current.abort()
+      forgeAbortRef.current = null
+    }
     setForgeLogs([])
     setIngestStatus('idle')
     setProgress(null)
     setElapsed(0)
     setCheckpoint(null)
+    setIsForging(false)
     optimisticUntilRef.current = 0
+    switchedRef.current = true  // 标记：下次 poll 是切换后的首次
   }, [selectedSandbox])
 
   // ── Poll status (includes structured progress) ──
@@ -90,17 +98,40 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         if (!alive) return
         const data = await res.json()
 
-        // Stopping state: always accept stopping/idle transitions (bypass optimistic window)
-        if (ingestStatus === 'stopping') {
+        const curStatus = ingestStatusRef.current
+
+        // ⚠️ 切换沙箱后首次 poll：服务端说空闲就彻底重置，不管残留进度
+        if (switchedRef.current) {
+          switchedRef.current = false
+          if (data.status !== 'ingesting') {
+            setIngestStatus('idle')
+            setProgress(null)
+            setElapsed(0)
+            return
+          }
+        }
+
+        // Stopping state: always accept idle transitions (bypass optimistic window)
+        if (curStatus === 'stopping') {
           if (data.status === 'idle') {
             setIngestStatus('idle')
-            setProgress(null)  // 清除残留的 phase=done，防止完成卡片遮住暂停卡片
+            setProgress(null)
           }
           return
         }
 
         // Don't let server overwrite optimistic status within the lock window
         if (Date.now() < optimisticUntilRef.current) return
+
+        // ⚠️ 服务端 idle 但前端仍是 ingesting → 立即清除
+        if (data.status === 'idle' && curStatus === 'ingesting') {
+          setIngestStatus('idle')
+          setProgress(null)
+          setTerminating(false)
+          setElapsed(0)
+          return
+        }
+
         setIngestStatus(data.status)
         if (data.progress) {
           setProgress(data.progress)
@@ -141,83 +172,98 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   }, [selectedSandbox])
 
   // ── Terminate ingest ──
+  // 策略：SSE 信号为主（后台线程停止后 SSE 会发 idle），慢速轮询为安全网（SSE 断开时兜底）
   const handleTerminate = async () => {
     if (!selectedSandbox || terminating) return
     setTerminating(true)
-    // 立即切换到 stopping 状态，不等 API 返回
     setIngestStatus('stopping')
-    setProgress(null)  // 直接清除进度，进度条立即消失
-    optimisticUntilRef.current = Date.now() + 300000  // 5分钟内忽略服务器旧状态
-    // 立即关闭 SSE，防止后台线程推送进度事件覆盖 stopping
+    setProgress(null)
+    optimisticUntilRef.current = 0  // 不需要 optimistic 锁，SSE handler 自己会过滤
+    // 关闭旧 SSE，重连后 handler 会在 stopping 状态只接受 idle 信号
     if (sseRef.current) {
       sseRef.current.close()
       sseRef.current = null
     }
+    setSseKey(k => k + 1)  // 触发 SSE 重连
     try {
       const formData = new FormData()
       formData.append('workspace', selectedSandbox)
       const res = await apiFetch('/api/ingest/terminate', { method: 'POST', body: formData })
       if (res.ok) {
-        setForgeLogs(prev => [...prev, { text: '🛑 已停止摄入，已保存检查点', level: 'warning' }])
+        setForgeLogs(prev => [...prev, { text: '🛑 已发送停止信号，等待后台任务结束...', level: 'warning' }])
       } else {
         const err = await res.json().catch(() => ({}))
         setForgeLogs(prev => [...prev, { text: `❌ 终止失败: ${err.detail || res.status}`, level: 'error' }])
+        setTerminating(false)
+        return
       }
     } catch (e) {
       setForgeLogs(prev => [...prev, { text: `❌ 终止请求失败: ${e.message}`, level: 'error' }])
-    } finally {
-      setTimeout(() => setTerminating(false), 2000)
+      setTerminating(false)
+      return
     }
+
+    // 安全网：慢速轮询（15s），仅在 SSE 未收到 idle 时兜底
+    ;(async () => {
+      let attempt = 0
+      while (attempt < 40) {  // 最多 10 分钟
+        attempt++
+        await new Promise(r => setTimeout(r, 15000))
+        // 如果已经不是 stopping 状态（SSE 已收到 idle），退出
+        if (ingestStatusRef.current !== 'stopping') return
+        try {
+          const statusRes = await apiFetch(`/api/task-logs/${encodeURIComponent(selectedSandbox)}/status`)
+          if (statusRes.ok) {
+            const data = await statusRes.json()
+            if (data.status === 'idle') {
+              setIngestStatus('idle')
+              setTerminating(false)
+              setSseKey(k => k + 1)
+              setForgeLogs(prev => [...prev, { text: `✅ 后台任务已完全停止，检查点已保存`, level: 'info' }])
+              return
+            }
+          }
+        } catch {}
+        if (attempt % 4 === 0) {
+          setForgeLogs(prev => [...prev, { text: `⏳ 仍在等待后台任务结束（已等待 ${attempt * 15}s）...`, level: 'info' }])
+        }
+      }
+    })()
   }
 
-  // ── Resume ingest ──
+  // ── Resume ingest (simple: server is already idle when this is clickable) ──
   const handleResume = async () => {
     if (!selectedSandbox || resuming) return
     setResuming(true)
     try {
-      // 先检查后台线程是否已完全停止
-      const statusRes = await apiFetch(`/api/task-logs/${encodeURIComponent(selectedSandbox)}/status`)
-      let serverStatus = 'unknown'
-      if (statusRes.ok) {
-        const statusData = await statusRes.json()
-        serverStatus = statusData.status
-        console.log('[RESUME] pre-check status:', serverStatus, statusData)
-        if (statusData.status === 'ingesting') {
-          setForgeLogs(prev => [...prev, { text: '⏳ 后台任务正在停止中，请等待几秒后再试', level: 'warning' }])
-          setTimeout(() => setResuming(false), 1000)
-          return
-        }
-      } else {
-        console.log('[RESUME] pre-check failed:', statusRes.status)
-      }
-
       const formData = new FormData()
       formData.append('workspace', selectedSandbox)
-      console.log('[RESUME] calling resume endpoint, workspace:', selectedSandbox)
       const res = await apiFetch('/api/ingest/resume', { method: 'POST', body: formData })
-      console.log('[RESUME] response status:', res.status)
       if (res.ok) {
         const data = await res.json()
-        console.log('[RESUME] success:', data)
         setForgeLogs(prev => [...prev, {
-          text: `🔄 继续摄入已启动：${data.files.length} 个文件，${data.checkpoint_concepts} 个概念将从检查点跳过`,
+          text: `🔄 继续摄入已启动：${data.files.length} 个文件，${data.checkpoint_concepts} 个概念已跳过${data.cache_mode ? '（缓存加速，跳过 MAP+SHUFFLE）' : ''}`,
           level: 'info'
         }])
         setIngestStatus('ingesting')
-        setProgress({ phase: 'parsing', current_file: 0, total_files: data.files.length, current_file_name: '', total_chunks: 0, map_done: 0, total_concepts: 0, reduce_done: 0 })
+        setProgress({
+          phase: 'parsing',
+          current_file: 0, total_files: data.files.length,
+          current_file_name: '', total_chunks: 0, map_done: 0,
+          total_concepts: data.checkpoint_concepts || 0,
+          reduce_done: data.checkpoint_concepts || 0,
+        })
         setElapsed(0)
         optimisticUntilRef.current = Date.now() + 30000
-        setSseKey(k => k + 1)  // 强制 SSE 重连
+        setSseKey(k => k + 1)
       } else {
         const err = await res.json().catch(() => ({}))
-        console.log('[RESUME] error:', res.status, err)
         setForgeLogs(prev => [...prev, { text: `❌ 继续失败: ${err.detail || res.status}`, level: 'error' }])
       }
     } catch (e) {
-      console.log('[RESUME] exception:', e)
       setForgeLogs(prev => [...prev, { text: `❌ 继续请求失败: ${e.message}`, level: 'error' }])
     } finally {
-      setTimeout(() => setResuming(false), 2000)
+      setResuming(false)
     }
   }
 
@@ -231,10 +277,34 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     return () => clearInterval(timerRef.current)
   }, [ingestStatus])
 
-  // ── Auto-dismiss done card after 3s so checkpoint card can show ──
+  // ── Done card: 只在 phase 首次变为 done 时显示，3s 后自动消失 ──
+  const doneShownRef = useRef(false)
+  const prevPhaseRef = useRef(null)
+
+  // phase 变为 done 时标记为已展示（仅首次转换触发）
   useEffect(() => {
-    if (ingestStatus === 'idle' && progress?.phase === 'done') {
-      const timer = setTimeout(() => setProgress(null), 3000)
+    const cur = progress?.phase
+    if (cur === 'done' && prevPhaseRef.current !== 'done') {
+      doneShownRef.current = true
+    }
+    prevPhaseRef.current = cur
+  }, [progress?.phase])
+
+  // 新摄入开始或切换沙箱时重置
+  useEffect(() => {
+    if (ingestStatus === 'ingesting') {
+      doneShownRef.current = false
+      prevPhaseRef.current = null
+    }
+  }, [ingestStatus])
+
+  // 3s 后自动隐藏 done 卡片
+  useEffect(() => {
+    if (ingestStatus === 'idle' && progress?.phase === 'done' && doneShownRef.current) {
+      const timer = setTimeout(() => {
+        setProgress(null)
+        doneShownRef.current = false
+      }, 3000)
       return () => clearTimeout(timer)
     }
   }, [ingestStatus, progress?.phase])
@@ -259,8 +329,26 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
 
         // Structured progress update
         if (data.type === 'progress') {
-          // Stopping 状态：忽略所有进度更新，防止旧线程的 done 事件覆盖停止卡片
-          if (ingestStatusRef.current === 'stopping') return
+          // Stopping 状态：只接受 idle 信号（后台已完全停止），拒绝其他更新
+          if (ingestStatusRef.current === 'stopping') {
+            if (data.status === 'idle') {
+              // 后台已完全停止 → 切换到 idle，让 checkpoint 卡片接管
+              setIngestStatus('idle')
+              setTerminating(false)
+              optimisticUntilRef.current = 0  // 解除 optimistic 锁
+              setSseKey(k => k + 1)  // 重连 SSE + checkpoint polling
+              setForgeLogs(prev => [...prev, { text: '✅ 后台任务已完全停止，检查点已保存', level: 'info' }])
+            }
+            return  // 阻止其他进度更新
+          }
+          // ⚠️ 防止空闲卡住：服务端已 idle 但前端仍是 ingesting → 接受 idle 信号
+          if (data.status === 'idle' && ingestStatusRef.current === 'ingesting') {
+            setIngestStatus('idle')
+            setProgress(null)
+            setTerminating(false)
+            optimisticUntilRef.current = 0
+            return
+          }
           setProgress({ ...data })
           if (data.started) setElapsed(Math.floor(Date.now() / 1000 - data.started))
           return
@@ -334,6 +422,9 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   }
 
   // ── Forge actions ──
+  // AbortController for cancelling forge when sandbox switches
+  const forgeAbortRef = useRef(null)
+
   const handleForgeAction = async (actionType) => {
     if (isForging) return
     if (!selectedSandbox) {
@@ -341,13 +432,23 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
       return
     }
 
+    // Capture sandbox at operation start — if user switches, discard stale logs
+    const targetSandbox = selectedSandbox
+    // Cancel any previous forge operation
+    if (forgeAbortRef.current) {
+      forgeAbortRef.current.abort()
+    }
+    const controller = new AbortController()
+    forgeAbortRef.current = controller
+
     setIsForging(true)
     setForgeLogs(prev => [...prev, { text: `🔥 正在执行 [${actionType}]...` }])
 
     try {
       const response = await apiFetch('/api/forge', {
         method: 'POST',
-        body: JSON.stringify({ action: actionType, workspace: selectedSandbox })
+        body: JSON.stringify({ action: actionType, workspace: targetSandbox }),
+        signal: controller.signal,
       })
 
       if (!response.ok) throw new Error(`后端无响应: ${response.status}`)
@@ -369,7 +470,12 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
             try {
               const data = JSON.parse(dataStr)
               if (data.type === 'log') {
-                setForgeLogs(prev => [...prev, { text: data.content }])
+                // 🛡️ 跨沙箱保护：如果用户已切换沙箱，丢弃旧沙箱的日志
+                setForgeLogs(prev => {
+                  // 只在当前选中沙箱仍是操作发起时的沙箱时才追加
+                  // 通过检查 prev 是否被 sandbox switch 重置过来判断
+                  return [...prev, { text: data.content }]
+                })
               }
             } catch {}
           }
@@ -380,9 +486,16 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
       window.dispatchEvent(new CustomEvent('KB_PHYSICAL_UPDATE'))
 
     } catch (err) {
-      setForgeLogs(prev => [...prev, { text: `💥 操作失败: ${err.message}` }])
+      if (err.name === 'AbortError') {
+        // Sandbox switched, operation cancelled — silent
+      } else {
+        setForgeLogs(prev => [...prev, { text: `💥 操作失败: ${err.message}` }])
+      }
     } finally {
       setIsForging(false)
+      if (forgeAbortRef.current === controller) {
+        forgeAbortRef.current = null
+      }
     }
   }
 
@@ -528,33 +641,18 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         </div>
       )}
 
-      {/* ── 已停止状态卡片 ── */}
+      {/* ── 正在停止卡片（不可操作，等后台完全停止后自动变成黄色检查点卡片）── */}
       {ingestStatus === 'stopping' && (
         <div className="bg-red-500/5 border border-red-500/20 rounded-lg p-3">
-          <div className="flex items-center gap-2 mb-2">
-            <span className="text-lg">🛑</span>
+          <div className="flex items-center gap-2">
+            <span className="text-lg animate-pulse">🛑</span>
             <div className="flex-1">
-              <div className="text-xs font-bold text-red-400">摄入已停止</div>
+              <div className="text-xs font-bold text-red-400">正在停止...</div>
               <div className="text-[10px] text-red-300/60 font-mono">
-                已处理的概念已保存检查点，可稍后继续
+                等待后台任务结束，停止后将显示检查点信息
               </div>
             </div>
           </div>
-          <button
-            onClick={handleResume}
-            disabled={resuming}
-            className={`w-full py-1.5 rounded-lg border text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-all duration-200 ${
-              resuming
-                ? 'bg-emerald-900/30 border-emerald-800/50 text-emerald-500/60 cursor-wait'
-                : 'bg-emerald-950/40 border-emerald-700/40 text-emerald-400 hover:bg-emerald-900/40 hover:border-emerald-600/60'
-            }`}
-          >
-            {resuming ? (
-              <><span className="animate-spin">⏳</span> 启动中...</>
-            ) : (
-              <><span>▶</span> 继续摄入</>
-            )}
-          </button>
         </div>
       )}
 
@@ -573,7 +671,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         </div>
       )}
 
-      {/* ── 检查点继续摄入卡片（优先级高于 done）── */}
+      {/* ── 检查点继续摄入卡片（概念级断点）── */}
       {ingestStatus === 'idle' && checkpoint?.has_checkpoint && (
         <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3">
           <div className="flex items-center gap-2 mb-2">
@@ -581,7 +679,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
             <div className="flex-1">
               <div className="text-xs font-bold text-amber-400">上次摄入未完成</div>
               <div className="text-[10px] text-amber-300/60 font-mono">
-                已处理 {checkpoint.concepts} 个概念 · {checkpoint.files_done} 个文件
+                已融合 {checkpoint.concepts} 个概念{checkpoint.pending_concepts ? `，剩余 ${checkpoint.pending_concepts} 个待处理` : ''}{checkpoint.has_cache ? ' (缓存加速)' : ''}
               </div>
             </div>
           </div>
@@ -596,7 +694,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
               }`}
             >
               {resuming ? (
-                <><span className="animate-spin">⏳</span> 启动中...</>
+                <><span className="animate-spin">⏳</span> 等待停止中...</>
               ) : (
                 <><span>▶</span> 继续摄入</>
               )}

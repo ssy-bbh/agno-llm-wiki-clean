@@ -5,8 +5,7 @@ import os
 import threading
 from pathlib import Path
 
-# 统一从 path_resolver 获取 USE_MINIO，避免重复读 os.environ 导致值不一致
-from core.path_resolver import USE_MINIO
+from core.storage import get_storage
 
 # 锁定操作根目录，绝对不准越界
 WIKI_ROOT = Path(__file__).parent.parent / "data" / "wiki"
@@ -77,73 +76,46 @@ def _resolve_key(file_name: str) -> str:
     return "/".join(parts)
 
 
-# 💡 注意参数里多了 content
-def create_page(file_name: str, title: str, tags: list[str], abstract: str, content: str = "") -> str:
-    """严格按照 schema 模板创建新页面，包含模糊去重机制"""
 
-    if USE_MINIO:
-        from core import storage
-        # 查重
-        prefix = "/".join(_resolve_key(file_name).split("/")[:-1]) + "/"
-        existing_keys = storage.list_keys(prefix)
-        clean_new = file_name.lower().replace("-", "").replace("_", "").replace(" ", "").replace(".md", "")
-        for k in existing_keys:
-            clean_exist = k.split("/")[-1].lower().replace("-", "").replace("_", "").replace(" ", "").replace(".md", "")
-            if clean_new == clean_exist:
-                return f"⚠️ 拦截重复：{k} 已存在，规避新建：{file_name}"
-        # Tags 清洗
-        clean_tags = []
-        if tags:
-            if isinstance(tags, str):
-                cleaned = tags.replace("[", "").replace("]", "").replace("'", "").replace('"', "")
-                clean_tags = [t.strip() for t in cleaned.split(",") if t.strip()]
-            elif isinstance(tags, list):
-                for t in tags:
-                    t_str = str(t).replace("[", "").replace("]", "").replace("'", "").replace('"', "").strip()
-                    if t_str:
-                        clean_tags.append(t_str)
-        tag_str = " ".join(clean_tags)
-        import datetime
-        details = (content or "（等待后续扩展）").replace("\\n", "\n")
-        abs_text = abstract.replace("\\n", "\n")
-        body = f"""# {title}
 
-    > **Tags:** {tag_str}
-    > **Created:** {datetime.datetime.now().strftime("%Y-%m-%d")}
+def _sanitize_filename(file_name: str) -> str:
+    """清洗 LLM 生成的脏文件名：保留 concepts/ 前缀，只清洗文件名部分"""
+    import re
+    name = file_name.strip()
 
-    ## Abstract
-    {abs_text}
+    # 分离目录前缀和文件名
+    if "/" in name:
+        dir_part = "/".join(name.split("/")[:-1]) + "/"
+        base = name.split("/")[-1]
+    else:
+        dir_part = ""
+        base = name
 
-    ## Details
-    {details}
+    # 去 markdown 标记 (###, ##, #, -, *)
+    base = re.sub(r"^[#\-*]+\s*", "", base)
+    # 去 create_ 前缀
+    base = re.sub(r"^create_", "", base)
+    # 去 concepts_ 前缀（LLM 有时把目录名拼进文件名）
+    base = re.sub(r"^concepts_", "", base)
+    # 去双重扩展名 (.md.md → .md)
+    while base.endswith(".md.md"):
+        base = base[:-3]
+    # 去非法字符
+    base = re.sub(r'[<>:"|?*]', "", base)
+    # 去首尾空格和点
+    base = base.strip(" .")
 
-    ## Related
-    - 
+    result = dir_part + base if base else file_name
 
-    ## References
-    - 
-    """
-        storage.write(_resolve_key(file_name), body)
-        return f"✅ 成功创建页面：{file_name}"
+    # 确保概念文件在 concepts/ 下（除非是 index.md）
+    if base and base.lower() != "index.md" and not result.startswith("concepts/"):
+        result = "concepts/" + result
 
-    path = _resolve(file_name)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    return result
 
-    # 1. 物理级模糊去重锁 (保持不变)
-    clean_new_name = path.stem.lower().replace("-", "").replace("_", "").replace(" ", "")
-    for existing_file in path.parent.glob("*.md"):
-        clean_existing = existing_file.stem.lower().replace("-", "").replace("_", "").replace(" ", "")
-        if clean_new_name == clean_existing:
-            return f"⚠️ 拦截重复：检测到异名同义词 ({existing_file.name} 已存在)，规避新建：{file_name}"
 
-    if path.exists():
-        return f"⚠️ 警告：页面已存在，拒绝覆写 ({file_name})"
-
-    # 💡 2. 核心修复：解决换行符明文显示的 Bug
-    abstract = abstract.replace("\\n", "\n")
-    content = content.replace("\\n", "\n")
-
-    # 3. 终极 Tags 脏数据清洗 (保持不变)
+def _clean_tags(tags) -> list[str]:
+    """清洗标签脏数据，返回干净的标签列表"""
     clean_tags = []
     if tags:
         if isinstance(tags, str):
@@ -154,25 +126,26 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str, cont
                 t_str = str(t).replace("[", "").replace("]", "").replace("'", "").replace('"', "").strip()
                 if t_str:
                     clean_tags.append(t_str)
-    tag_str = " ".join(clean_tags)
+    return clean_tags
 
+
+def _build_body(title: str, tags: list[str], abstract: str, content: str = "") -> str:
+    """生成标准页面模板（统一 MinIO/Local 两种模式的输出格式）"""
     import datetime
+    tag_str = " ".join(_clean_tags(tags))
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-
-    # 4. 动态注入正文
-    details_text = content if content else "（等待后续扩展）"
-
-    # 强制套用标准模板
-    body = f"""# {title}
+    abs_text = abstract.replace("\\n", "\n")
+    details = (content or "（等待后续扩展）").replace("\\n", "\n")
+    return f"""# {title}
 
 > **Tags:** {tag_str}
 > **Created:** {date_str}
 
 ## Abstract
-{abstract}
+{abs_text}
 
 ## Details
-{details_text}
+{details}
 
 ## Related
 - 
@@ -180,44 +153,55 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str, cont
 ## References
 - 
 """
-    path.write_text(body, encoding="utf-8")
-    return f"✅ 成功创建页面：{path.name}"
+
+
+# 💡 注意参数里多了 content
+def create_page(file_name: str, title: str, tags: list[str], abstract: str, content: str = "") -> str:
+    """严格按照 schema 模板创建新页面，包含模糊去重机制"""
+    from pathlib import PurePosixPath
+
+    file_name = _sanitize_filename(file_name)
+    s = get_storage()
+    key = _resolve_key(file_name)
+
+    # 本地模式下确保目录存在
+    path = _resolve(file_name)
+
+    # ── 统一查重：模糊名称匹配（去 -/_/空格/.md 后比较） ──
+    parent_prefix = str(PurePosixPath(key).parent) + "/"
+    sibling_keys = s.list_keys(parent_prefix)
+    clean_new = PurePosixPath(key).stem.lower().replace("-", "").replace("_", "").replace(" ", "")
+    for k in sibling_keys:
+        if k.endswith(".md"):
+            clean_exist = PurePosixPath(k).stem.lower().replace("-", "").replace("_", "").replace(" ", "")
+            if clean_new == clean_exist:
+                return f"⚠️ 拦截重复：{k} 已存在，规避新建：{file_name}"
+
+    # 生成标准页面内容（统一模板，消除两个分支的重复代码）
+    body = _build_body(title, tags, abstract, content)
+    s.write_text(key, body)
+    return f"✅ 成功创建页面：{file_name}"
 
 
 def str_replace(file_name: str, old_str: str, new_str: str) -> str:
     """极其精密的局部替换工具 (带空格宽容 + 活路径路由)"""
-    if USE_MINIO:
-        from core import storage
-        key = _resolve_key(file_name)
-        if not storage.exists(key):
-            return f"❌ 错误：底层工具找不到文件 ({key})"
-        content = storage.read(key)
-        if old_str in content:
-            storage.write(key, content.replace(old_str, new_str, 1))
-            return f"✅ 成功修改文件：{file_name}"
-        old_str_clean = old_str.strip()
-        if old_str_clean and old_str_clean in content:
-            storage.write(key, content.replace(old_str_clean, new_str, 1))
-            return f"✅ 成功修改文件(启用宽容匹配)：{file_name}"
-        return f"❌ 找不到旧文本，大模型可能产生了格式幻觉！\n寻找的: {repr(old_str)}"
+    s = get_storage()
+    key = _resolve_key(file_name)
 
-    # 💡 核心修复：必须用 _resolve 找回动态活路径！
-    path = _resolve(file_name)
+    if not s.exists(key):
+        return f"❌ 错误：底层工具找不到文件 ({key})"
 
-    if not path.exists():
-        return f"❌ 错误：底层工具找不到文件 ({path})"
-
-    content = path.read_text(encoding="utf-8")
+    content = s.read_text(key)
 
     # 1. 尝试绝对精确匹配
     if old_str in content:
-        path.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
-        return f"✅ 成功修改文件：{path.name}"
+        s.write_text(key, content.replace(old_str, new_str, 1))
+        return f"✅ 成功修改文件：{file_name}"
 
     # 2. 尝试宽容匹配 (去掉大模型首尾乱加的换行和空格)
     old_str_clean = old_str.strip()
     if old_str_clean and old_str_clean in content:
-        path.write_text(content.replace(old_str_clean, new_str, 1), encoding="utf-8")
-        return f"✅ 成功修改文件(启用宽容匹配)：{path.name}"
+        s.write_text(key, content.replace(old_str_clean, new_str, 1))
+        return f"✅ 成功修改文件(启用宽容匹配)：{file_name}"
 
     return f"❌ 找不到旧文本，大模型可能产生了格式幻觉！\n寻找的: {repr(old_str)}"

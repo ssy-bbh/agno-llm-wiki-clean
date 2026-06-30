@@ -43,17 +43,25 @@ class AutoFillFlow:
             # ═══════════════════════════════════════════
             # MinIO 模式
             # ═══════════════════════════════════════════
-            from core import storage
+            from core.storage import get_storage
             from core.path_resolver import minio_concepts_prefix, minio_concept_key
 
+            s = get_storage()
             prefix = minio_concepts_prefix(user_id, kb_name)
-            all_keys = storage.list_keys(prefix)
+            all_keys = s.list_keys(prefix)
             concept_keys = [k for k in all_keys if k.endswith(".md") 
                            and not k.endswith("/index.md") 
                            and "/mocs/" not in k]
 
             if not concept_keys:
-                yield format_log("❌ 错误：concepts 核心概念仓不存在，图谱为空，无法探测。")
+                # Check if raw files exist (sandbox might be completely empty)
+                from core.path_resolver import minio_raw_prefix
+                raw_prefix = minio_raw_prefix(user_id, kb_name)
+                raw_keys = s.list_keys(raw_prefix)
+                if not raw_keys:
+                    yield format_log(f"⚠️ 沙箱 [{kb_name}] 是空的，请先上传文档并执行摄入，生成知识图谱后再填补黑洞。")
+                else:
+                    yield format_log(f"⚠️ 沙箱 [{kb_name}] 有原始文档但尚未摄入，请先执行摄入生成知识图谱。")
                 return
 
             # 1. 扫描与入度统计
@@ -72,7 +80,7 @@ class AutoFillFlow:
             for key in concept_keys:
                 name = key.split("/")[-1].replace(".md", "")
                 try:
-                    content = storage.read(key)
+                    content = s.read_text(key)
                 except Exception:
                     continue
                 links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
@@ -120,11 +128,11 @@ class AutoFillFlow:
                             source_key = name_to_key.get(source_file)
                             if source_key:
                                 try:
-                                    content = storage.read(source_key)
+                                    content = s.read_text(source_key)
                                     pattern = re.compile(rf'\[\[{re.escape(link)}(?:\|([^\]]+))?\]\]')
                                     new_content = pattern.sub(lambda m: f"[[{real_target}|{m.group(1) or link}]]", content)
                                     if new_content != content:
-                                        storage.write(source_key, new_content)
+                                        s.write_text(source_key, new_content)
                                 except Exception:
                                     pass
                 else:
@@ -153,7 +161,7 @@ class AutoFillFlow:
                     source_key = name_to_key.get(source_file)
                     if source_key:
                         try:
-                            snippet = storage.read(source_key)[:600]
+                            snippet = s.read_text(source_key)[:600]
                             source_docs_str += f"\n=== {source_file} (提及了该概念) ===\n{snippet}...\n"
                         except Exception:
                             pass
@@ -178,9 +186,9 @@ class AutoFillFlow:
 
                         # 给新生成的实体打上"待审批草稿"烙印
                         new_key = minio_concept_key(user_id, kb_name, f"{node}.md")
-                        if storage.exists(new_key):
-                            old_content = storage.read(new_key)
-                            storage.write(new_key, "<!-- AUTOFILL_DRAFT -->\n" + old_content)
+                        if s.exists(new_key):
+                            old_content = s.read_text(new_key)
+                            s.write_text(new_key, "<!-- AUTOFILL_DRAFT -->\n" + old_content)
 
                         yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: concepts/{node}.md")
                     else:
@@ -197,7 +205,12 @@ class AutoFillFlow:
         # ═══════════════════════════════════════════
         concepts_dir = get_wiki_root(user_id) / kb_name / "concepts"
         if not concepts_dir.exists():
-            yield format_log("❌ 错误：concepts 核心概念仓不存在，图谱为空，无法探测。")
+            # Check if raw files exist
+            raw_dir = get_wiki_root(user_id) / kb_name / "raw" if user_id else Path("data/raw") / kb_name
+            if not raw_dir.exists() or not list(raw_dir.glob("*")):
+                yield format_log(f"⚠️ 沙箱 [{kb_name}] 是空的，请先上传文档并执行摄入，生成知识图谱后再填补黑洞。")
+            else:
+                yield format_log(f"⚠️ 沙箱 [{kb_name}] 有原始文档但尚未摄入，请先执行摄入生成知识图谱。")
             return
 
         # ==========================================

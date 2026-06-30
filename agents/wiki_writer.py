@@ -2,8 +2,9 @@
 wiki_writer.py — 知识撰稿人 (活路径雷达 + 严格写盘版)
 """
 import re
-from tools.edit_tools import _resolve, create_page, str_replace, USE_MINIO, _resolve_key
-from core.path_resolver import minio_wiki_prefix
+from tools.edit_tools import _resolve, create_page, str_replace, _resolve_key, get_context
+from core.storage import get_storage
+from core.path_resolver import minio_wiki_prefix, minio_concepts_prefix
 
 class WikiWriter:
     def execute(self, report: dict) -> list[str]:
@@ -72,42 +73,26 @@ class WikiWriter:
                 perfect_raw_file = f"concepts/{safe_title}.md"
                 perfect_target_path = _resolve(perfect_raw_file)
 
-                # 🛡️ 物理拦截雷达启动（基于真实目标目录）
-                found_existing = None
-                if USE_MINIO:
-                    from core import storage
-                    from tools.edit_tools import get_context
-                    _w_ctx = get_context()
-                    _w_prefix = minio_wiki_prefix(_w_ctx["user_id"], _w_ctx["kb_name"])
-                    _w_all_keys = storage.list_keys(_w_prefix + "concepts/")
-                    for _w_k in _w_all_keys:
-                        if _w_k.endswith(".md"):
-                            _w_stem = _w_k.split("/")[-1].replace(".md", "")
-                            if _is_same_concept(_w_stem, title):
-                                found_existing = _w_k  # MinIO key
-                                break
-                else:
-                    if perfect_target_path.parent.exists():
-                        for existing_file in perfect_target_path.parent.glob("*.md"):
-                            if _is_same_concept(existing_file.stem, title):
-                                found_existing = existing_file  # 本地 Path
-                                break
+                # 🛡️ 物理拦截雷达启动（统一存储接口，消除 MinIO/Local 分支）
+                s = get_storage()
+                ctx = get_context()
+                concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
+                found_existing_key = None
+                all_concept_keys = s.list_keys(concepts_prefix)
+                for _w_k in all_concept_keys:
+                    if _w_k.endswith(".md"):
+                        _w_stem = _w_k.split("/")[-1].replace(".md", "")
+                        if _is_same_concept(_w_stem, title):
+                            found_existing_key = _w_k
+                            break
 
-                if found_existing:
-                    if USE_MINIO:
-                        _ex_name = found_existing.split("/")[-1]
-                        print(f"  -> 🛡️ 拦截创建冲突：同义词文件 [{_ex_name}] 已存在，自动转为 [增量追加]...")
-                        from core import storage
-                        safe_new_content = action.get("content", "").replace("\\n", "\n")
-                        updated_content = storage.read(found_existing) + f"\n\n---\n### 🧠 增量融合视角 ({title})\n{safe_new_content}\n"
-                        storage.write(found_existing, updated_content)
-                        results.append(f"成功合并至: {_ex_name}")
-                    else:
-                        print(f"  -> 🛡️ 拦截创建冲突：同义词文件 [{found_existing.name}] 已存在，自动转为 [增量追加]...")
-                        safe_new_content = action.get("content", "").replace("\\n", "\n")
-                        updated_content = found_existing.read_text(encoding="utf-8") + f"\n\n---\n### 🧠 增量融合视角 ({title})\n{safe_new_content}\n"
-                        found_existing.write_text(updated_content, encoding="utf-8")
-                        results.append(f"成功合并至: {found_existing.name}")
+                if found_existing_key:
+                    _ex_name = found_existing_key.split("/")[-1]
+                    print(f"  -> 🛡️ 拦截创建冲突：同义词文件 [{_ex_name}] 已存在，自动转为 [增量追加]...")
+                    safe_new_content = action.get("content", "").replace("\\n", "\n")
+                    updated_content = s.read_text(found_existing_key) + f"\n\n---\n### 🧠 增量融合视角 ({title})\n{safe_new_content}\n"
+                    s.write_text(found_existing_key, updated_content)
+                    results.append(f"成功合并至: {_ex_name}")
                     continue
 
                 # 工具层依然接收相对的 perfect_raw_file 即可，里面会再次 _resolve
@@ -116,48 +101,34 @@ class WikiWriter:
                 results.append(res)
 
             elif act_type == "edit":
+                s = get_storage()
+                ctx = get_context()
                 _edit_found = False
-                if USE_MINIO:
-                    from core import storage
-                    from tools.edit_tools import get_context
-                    _e_ctx = get_context()
-                    # index.md 在根目录，直接放行
-                    if raw_file == "index.md":
-                        _e_idx_key = _resolve_key("index.md")
-                        if storage.exists(_e_idx_key):
-                            _edit_found = True
-                    if not _edit_found:
-                        _e_prefix = minio_wiki_prefix(_e_ctx["user_id"], _e_ctx["kb_name"])
-                        _e_keys = storage.list_keys(_e_prefix + "concepts/")
-                        _e_target_stem = raw_file.replace("concepts/", "").replace(".md", "")
-                        for _e_k in _e_keys:
-                            if _e_k.endswith(".md"):
-                                _e_stem = _e_k.split("/")[-1].replace(".md", "")
-                                if _is_same_concept(_e_stem, _e_target_stem):
-                                    raw_file = f"concepts/{_e_stem}.md"
-                                    print(f"  -> 🔍 纠错重定向：已自动扭转至 [{_e_stem}.md]")
-                                    _edit_found = True
-                                    break
-                    if not _edit_found:
-                        msg = f"  -> ❌ 严格模式拦截：找不到编辑目标 ({raw_file})，已丢弃动作。"
-                        print(msg)
-                        results.append(msg)
-                        continue
-                else:
-                    if not target_path.exists():
-                        if target_path.parent.exists():
-                            for existing_file in target_path.parent.glob("*.md"):
-                                if _is_same_concept(existing_file.stem, target_path.stem):
-                                    target_path = existing_file
-                                    raw_file = f"concepts/{existing_file.name}" if raw_file != "index.md" else "index.md"
-                                    print(f"  -> 🔍 纠错重定向：大模型编辑路径存在幻觉，已自动扭转至真实物理文件 [{target_path.name}]")
-                                    _edit_found = True
-                                    break
-                        if not _edit_found:
-                            msg = f"  -> ❌ 严格模式拦截：找不到编辑目标 ({target_path.name})，已丢弃动作。"
-                            print(msg)
-                            results.append(msg)
-                            continue
+
+                # index.md 在根目录，直接放行
+                if raw_file == "index.md":
+                    _e_idx_key = _resolve_key("index.md")
+                    if s.exists(_e_idx_key):
+                        _edit_found = True
+
+                if not _edit_found:
+                    concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
+                    _e_keys = s.list_keys(concepts_prefix)
+                    _e_target_stem = raw_file.replace("concepts/", "").replace(".md", "")
+                    for _e_k in _e_keys:
+                        if _e_k.endswith(".md"):
+                            _e_stem = _e_k.split("/")[-1].replace(".md", "")
+                            if _is_same_concept(_e_stem, _e_target_stem):
+                                raw_file = f"concepts/{_e_stem}.md"
+                                print(f"  -> 🔍 纠错重定向：已自动扭转至 [{_e_stem}.md]")
+                                _edit_found = True
+                                break
+
+                if not _edit_found:
+                    msg = f"  -> ❌ 严格模式拦截：找不到编辑目标 ({raw_file})，已丢弃动作。"
+                    print(msg)
+                    results.append(msg)
+                    continue
 
                 res = str_replace(raw_file, (action.get("old_str") or "").replace("\\n", "\n"), (action.get("content") or "").replace("\\n", "\n"))
                 print(f"  -> {res}")
@@ -189,18 +160,11 @@ class WikiWriter:
 
                 # 2. 核心：守护上下文的智能折叠算法
 
+                s = get_storage()
+                _m_idx_key = _resolve_key("index.md")
                 _moc_content = None
-                if USE_MINIO:
-                    from core import storage
-                    from tools.edit_tools import get_context
-                    _m_ctx = get_context()
-                    _m_idx_key = _resolve_key("index.md")
-                    if storage.exists(_m_idx_key):
-                        _moc_content = storage.read(_m_idx_key)
-                else:
-                    _m_path = _resolve("index.md")
-                    if _m_path.exists():
-                        _moc_content = _m_path.read_text(encoding="utf-8")
+                if s.exists(_m_idx_key):
+                    _moc_content = s.read_text(_m_idx_key)
 
                 if _moc_content is not None:
                     content = _moc_content
@@ -266,10 +230,7 @@ class WikiWriter:
 
                             new_lines.append(line)
 
-                    if USE_MINIO:
-                        storage.write(_m_idx_key, '\n'.join(new_lines))
-                    else:
-                        _m_path.write_text('\n'.join(new_lines), encoding="utf-8")
+                    s.write_text(_m_idx_key, '\n'.join(new_lines))
 
                     print(f"  -> ✂️ [精细截断] index.md 导航地图已优雅折叠至 [[{moc_title}]] (已保留上下文描述)")
 
@@ -288,74 +249,39 @@ class WikiWriter:
                     links = [l for l in links if re.search(r'\[\[(?!None\]\]).+?\]\]', l)
                              and '/' not in l and '.md' not in l]
 
-                    if USE_MINIO:
-                        from core import storage
-                        _al_key = _resolve_key(raw_file)
-                        if not storage.exists(_al_key):
-                            from tools.edit_tools import get_context
-                            _al_ctx = get_context()
-                            _al_folder = _al_ctx["kb_name"] or "全局"
-                            storage.write(_al_key, f"# {_al_folder} 知识导航\n\n{old_str}\n")
+                    s = get_storage()
+                    _al_key = _resolve_key(raw_file)
+                    if not s.exists(_al_key):
+                        _al_ctx = get_context()
+                        _al_folder = _al_ctx["kb_name"] or "全局"
+                        s.write_text(_al_key, f"# {_al_folder} 知识导航\n\n{old_str}\n")
 
-                        content = storage.read(_al_key)
-                        if old_str not in content:
-                            content += f"\n\n{old_str}\n"
-                            storage.write(_al_key, content)
-                            content = storage.read(_al_key)
+                    content = s.read_text(_al_key)
+                    if old_str not in content:
+                        content += f"\n\n{old_str}\n"
+                        s.write_text(_al_key, content)
+                        content = s.read_text(_al_key)
 
-                        for single_link in links:
-                            clean_target = single_link.lower().replace("-", "").replace("_", "").replace(" ", "")
-                            existing_links = re.findall(r'\[\[(.*?)\]\]', content)
-                            is_duplicate = False
+                    for single_link in links:
+                        clean_target = single_link.lower().replace("-", "").replace("_", "").replace(" ", "")
+                        existing_links = re.findall(r'\[\[(.*?)\]\]', content)
+                        is_duplicate = False
 
-                            for ex_link in existing_links:
-                                clean_ex = f"[[{ex_link}]]".lower().replace("-", "").replace("_", "").replace(" ", "")
-                                if clean_target == clean_ex:
-                                    print(f"  -> ⏭️ 拦截相似：导航地图已存在 [[{ex_link}]]，跳过追加。")
-                                    is_duplicate = True
-                                    break
+                        for ex_link in existing_links:
+                            clean_ex = f"[[{ex_link}]]".lower().replace("-", "").replace("_", "").replace(" ", "")
+                            if clean_target == clean_ex:
+                                print(f"  -> ⏭️ 拦截相似：导航地图已存在 [[{ex_link}]]，跳过追加。")
+                                is_duplicate = True
+                                break
 
-                            if is_duplicate:
-                                continue
+                        if is_duplicate:
+                            continue
 
-                            new_str = f"{old_str}\n- {single_link}"
-                            res = str_replace(raw_file, old_str, new_str)
-                            print(f"  -> [导航地图更新] 追加 {single_link} 成功")
-                            old_str = new_str
-                            results.append(res)
-                    else:
-                        if not target_path.exists():
-                            folder_name = target_path.parent.name if target_path.parent.name else "全局"
-                            target_path.parent.mkdir(parents=True, exist_ok=True)
-                            target_path.write_text(f"# {folder_name} 知识导航\n\n{old_str}\n", encoding="utf-8")
-
-                        content = target_path.read_text(encoding="utf-8")
-                        if old_str not in content:
-                            content += f"\n\n{old_str}\n"
-                            target_path.write_text(content, encoding="utf-8")
-                            content = target_path.read_text(encoding="utf-8")
-
-                        for single_link in links:
-                            clean_target = single_link.lower().replace("-", "").replace("_", "").replace(" ", "")
-                            existing_links = re.findall(r'\[\[(.*?)\]\]', content)
-                            is_duplicate = False
-
-                            for ex_link in existing_links:
-                                clean_ex = f"[[{ex_link}]]".lower().replace("-", "").replace("_", "").replace(" ", "")
-                                if clean_target == clean_ex:
-                                    print(f"  -> ⏭️ 拦截相似：导航地图已存在 [[{ex_link}]]，跳过追加。")
-                                    is_duplicate = True
-                                    break
-
-                            if is_duplicate:
-                                continue
-
-                            new_str = f"{old_str}\n- {single_link}"
-                            # 确保交给工具的是相对路径，由 _resolve 接管
-                            res = str_replace(raw_file, old_str, new_str)
-                            print(f"  -> [导航地图更新] 追加 {single_link} 成功")
-                            old_str = new_str
-                            results.append(res)
+                        new_str = f"{old_str}\n- {single_link}"
+                        res = str_replace(raw_file, old_str, new_str)
+                        print(f"  -> [导航地图更新] 追加 {single_link} 成功")
+                        old_str = new_str
+                        results.append(res)
             else:
                 print(f" -> ⚠️ 暂未实现的操作类型: {act_type}")
 

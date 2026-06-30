@@ -62,19 +62,20 @@ class ReportFlow:
         index_content = ""
 
         if USE_MINIO:
-            from core import storage
+            from core.storage import get_storage
             from core.path_resolver import minio_concepts_prefix, minio_index_key
+            s = get_storage()
             # 获取概念列表
             prefix = minio_concepts_prefix(self.user_id, workspace)
-            all_keys = storage.list_keys(prefix)
+            all_keys = s.list_keys(prefix)
             concept_keys = [k for k in all_keys if k.endswith(".md") 
                            and not k.endswith("/index.md") 
                            and "/mocs/" not in k]
             available_titles = [k.split("/")[-1].replace(".md", "") for k in concept_keys]
             # 读取 index
             index_key = minio_index_key(self.user_id, workspace)
-            if storage.exists(index_key):
-                index_content = storage.read(index_key)[:3000]
+            if s.exists(index_key):
+                index_content = s.read_text(index_key)[:3000]
         else:
             # 本地模式
             index_path = ws_dir / "index.md"
@@ -144,10 +145,11 @@ class ReportFlow:
 
         # 2a. 本地检索
         if USE_MINIO:
-            from core import storage
+            from core.storage import get_storage
             from core.path_resolver import minio_concepts_prefix
+            s = get_storage()
             prefix = minio_concepts_prefix(self.user_id, workspace)
-            all_keys = storage.list_keys(prefix)
+            all_keys = s.list_keys(prefix)
             concept_keys = [k for k in all_keys if k.endswith(".md") 
                            and not k.endswith("/index.md") 
                            and "/mocs/" not in k]
@@ -176,7 +178,7 @@ class ReportFlow:
                     if char_count >= MAX_CHARS:
                         break
                     try:
-                        content = storage.read(key)
+                        content = s.read_text(key)
                         if char_count + len(content) > MAX_CHARS:
                             content = content[:MAX_CHARS - char_count]
                         name = key.split("/")[-1].replace(".md", "")

@@ -4,17 +4,19 @@ import re
 import time
 import threading
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
 from agents.wiki_analyst import WikiAnalyst
 from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.document_parser import extract_text, chunk_text
-from tools.edit_tools import _resolve, set_context, USE_MINIO, _resolve_key
+from tools.edit_tools import _resolve, set_context, _resolve_key
+from core.storage import get_storage
+from core.path_resolver import USE_MINIO
 from core.path_resolver import minio_concepts_prefix, minio_index_key
 from core.ingest_control import (
-    is_terminate_requested, save_concept_checkpoint,
-    is_concept_done, save_file_checkpoint
+    is_terminate_requested, mark_concept_done,
+    is_concept_done, save_file_checkpoint, save_shuffle_result,
 )
 
 
@@ -42,11 +44,11 @@ class IngestFlow:
         """🔧 P0-1: 一次性构建概念文件索引，后续查找 O(1)"""
         index = {}
         if USE_MINIO:
-            from core import storage
+            s = get_storage()
             from tools.edit_tools import get_context
             ctx = get_context()
             prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
-            all_keys = storage.list_keys(prefix)
+            all_keys = get_storage().list_keys(prefix)
             for key in all_keys:
                 if key.endswith(".md"):
                     stem = key.split("/")[-1].replace(".md", "")
@@ -87,8 +89,7 @@ class IngestFlow:
         if key not in self._file_cache:
             if USE_MINIO and not isinstance(filepath, Path):
                 # MinIO 模式：filepath 是 MinIO key 字符串
-                from core import storage
-                self._file_cache[key] = storage.read(filepath)
+                self._file_cache[key] = get_storage().read_text(filepath)
             else:
                 # 本地模式：filepath 是 Path 对象
                 self._file_cache[key] = filepath.read_text(encoding="utf-8")
@@ -107,12 +108,12 @@ class IngestFlow:
         context_str = "\n"
 
         if USE_MINIO:
-            from core import storage
+            s = get_storage()
             from tools.edit_tools import get_context
             ctx = get_context()
             idx_key = minio_index_key(ctx["user_id"], ctx["kb_name"])
 
-            if storage.exists(idx_key):
+            if get_storage().exists(idx_key):
                 full = self._read_file_cached(idx_key)
                 if len(full) > 8000:
                     toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
@@ -180,6 +181,8 @@ class IngestFlow:
     def _map_extract(self, chunk, chunk_id):
         """Map 阶段的核心逻辑：只提取，不写盘"""
         try:
+            if hasattr(self, '_skip_map') and self._skip_map:
+                return 0, chunk, None, "resume-skip"
             print(f"  [Map 线程 {chunk_id}] 🕵️‍♂️ 提取中...")
             analysis_result = self.analyst.analyze(chunk)
             if not analysis_result.get("new_concepts"):
@@ -188,7 +191,7 @@ class IngestFlow:
         except Exception as e:
             return chunk_id, chunk, None, f"报错: {str(e)}"
 
-    def run(self, input_source: str, kb_name: str = "", user_id: str = "", doc_name: str = ""):
+    def run(self, input_source: str, kb_name: str = "", user_id: str = "", doc_name: str = "", pending_payloads: dict = None):
         """
         知识摄入入口。
         kb_name: 目标沙箱名称（通过参数传递，避免 os.environ 竞态）
@@ -204,6 +207,9 @@ class IngestFlow:
             return False  # 返回 False 表示被终止
         # 在调用任何 _resolve 前，设置线程安全上下文
         set_context(user_id=user_id, kb_name=kb_name or "default", sub_dir="")
+
+        # ── Resume 快速路径标记 ──
+        _pending = pending_payloads  # None = 正常模式，dict = resume 模式
 
         print("\n" + "=" * 60)
         print(f"🚀 [IngestFlow] 启动 Map-Reduce 引擎 | 沙箱: {kb_name} | 用户: {user_id}")
@@ -256,6 +262,7 @@ class IngestFlow:
         # 🟢 PHASE 1: MAP (无锁绝对并发)
         # ==========================================
         map_lock = threading.Lock()
+        self._skip_map = bool(_pending)  # resume skip
 
         print("\n" + "=" * 60)
         print("⚡ [Phase 1: MAP] 启动侦察兵并发提取 (释放全部线程)...")
@@ -329,6 +336,16 @@ class IngestFlow:
         if filtered:
             print(f"  🗑️ 过滤低频概念: {filtered} 个（仅 1 个 chunk 提及）")
 
+        # 保存 SHUFFLE 结果到检查点缓存（供 resume 跳过 MAP+SHUFFLE）
+        if user_id and kb_name and not _pending:
+            _fn = doc_name or (path.name if path.exists() else str(input_source))
+            save_shuffle_result(user_id, kb_name, _fn, concept_payloads)
+
+        # Resume 覆盖：如果有 pending_payloads，替换 SHUFFLE 的空结果
+        if _pending is not None:
+            concept_payloads = _pending
+            print(f"  📦 [RESUME] 使用缓存的 SHUFFLE 结果: {len(concept_payloads)} 个概念")
+
         # ==========================================
         # 🔴 PHASE 3: REDUCE (串行概念融合)
         # ==========================================
@@ -349,6 +366,7 @@ class IngestFlow:
         error_count = 0
         checkpoint_count = 0  # 从检查点跳过的概念数
         terminated = False
+        reduce_pool = ThreadPoolExecutor(max_workers=1)
 
         for seq, (norm_c, payload) in enumerate(concept_payloads.items(), 1):
             display_name = payload["display_name"]
@@ -379,23 +397,39 @@ class IngestFlow:
             combined_summary = "\n".join(payload["summaries"])
             existing_context = self._fetch_local_context([display_name])
 
-            try:
-                fresh_editor = WikiEditor()
-                report = fresh_editor.merge(
+            # ── 可中断的 LLM 调用 ──
+            _merge_uid, _merge_kb = user_id, kb_name
+            def _do_merge():
+                set_context(user_id=_merge_uid, kb_name=_merge_kb or "default", sub_dir="")
+                return WikiEditor().merge(
                     raw_text=combined_text,
                     analyst_summary=combined_summary,
                     existing_context=existing_context
                 )
+            try:
+                merge_future = reduce_pool.submit(_do_merge)
+                while not merge_future.done():
+                    if user_id and kb_name and is_terminate_requested(user_id, kb_name):
+                        terminated = True
+                        break
+                    try:
+                        merge_future.result(timeout=0.5)
+                    except FuturesTimeoutError:
+                        continue
+                if terminated:
+                    reduce_pool.shutdown(wait=False)
+                    break
+                report = merge_future.result()
 
                 if report and report.get("actions"):
                     self.writer.execute(report)
                 else:
-                    print(f"  -> ⏭️ 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
+                    print(f"  -> 🔔 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
                     skipped_count += 1
 
-                # ── 保存检查点（融合成功后立即记录）──
+                # ── 保存检查点（融合成功后立即记录，从待处理列表移除）──
                 if user_id and kb_name:
-                    save_concept_checkpoint(user_id, kb_name, norm_c)
+                    mark_concept_done(user_id, kb_name, norm_c)
 
                 elapsed = time.time() - t0
                 print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)")
@@ -404,8 +438,6 @@ class IngestFlow:
                 elapsed = time.time() - t0
                 error_count += 1
                 print(f"  -> ❌ 合并 [{display_name}] 时发生致命错误: {e}")
-                # 继续处理下一个概念，不中断整个流水线
-
         t_total = time.time() - t_reduce_start
         print("\n" + "=" * 60)
         stats_parts = [f"REDUCE 耗时: {t_total:.1f}s"]

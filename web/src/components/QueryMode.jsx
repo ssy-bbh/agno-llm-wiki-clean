@@ -59,6 +59,7 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
   const [messages, setMessages] = useState([])
   const [isTyping, setIsTyping] = useState(false)
   const [isLoadingHistory, setIsLoadingHistory] = useState(false)
+  const [webSearchEnabled, setWebSearchEnabled] = useState(null) // null=自动, true=强制联网, false=仅本地
   const messagesEndRef = useRef(null)
   const prevSessionIdRef = useRef(null)
 
@@ -144,7 +145,8 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
         body: JSON.stringify({
           query: currentInput,
           workspace: selectedSandbox || "",
-          history: chatHistory
+          history: chatHistory,
+          web_search_enabled: webSearchEnabled
         })
       })
 
@@ -313,6 +315,24 @@ export default function QueryMode({ selectedSandbox, sessionId }) {
 
       {/* 底部指令输入台 */}
       <div className="p-4 bg-slate-950/40 border-t border-slate-800/80 backdrop-blur-md">
+        {/* 联网搜索开关 */}
+        <div className="max-w-4xl mx-auto flex items-center gap-3 mb-2 px-1">
+          <span className="text-xs text-slate-500 font-mono">🌐 联网搜索</span>
+          <button
+            onClick={() => setWebSearchEnabled(prev => prev === null ? true : prev === true ? false : null)}
+            className={`px-3 py-1 rounded-md text-xs font-mono font-semibold transition-all duration-200 border ${
+              webSearchEnabled === true
+                ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300 shadow-[0_0_6px_rgba(34,211,238,0.15)]'
+                : webSearchEnabled === false
+                ? 'bg-slate-800/60 border-slate-700/50 text-slate-500'
+                : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+            }`}
+          >
+            {webSearchEnabled === true ? '强制联网' :
+             webSearchEnabled === false ? '仅本地' :
+             '自动决策'}
+          </button>
+        </div>
         <div className="max-w-4xl mx-auto flex gap-2 bg-slate-900 border border-slate-700/50 rounded-xl p-1.5 focus-within:border-cyan-500/50 transition-all duration-200 shadow-lg">
           <input
             type="text"

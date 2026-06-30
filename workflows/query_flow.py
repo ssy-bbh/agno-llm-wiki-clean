@@ -29,11 +29,12 @@ class QueryFlow:
 
     def _read_specific_map(self, workspace_name: str) -> str:
         if USE_MINIO:
-            from core import storage
+            from core.storage import get_storage
             from core.path_resolver import minio_index_key
+            s = get_storage()
             key = minio_index_key(self.user_id, workspace_name)
-            if storage.exists(key):
-                return storage.read(key)
+            if s.exists(key):
+                return s.read_text(key)
             return "该工作区暂无导航地图。"
         # 本地模式
         map_path = self.wiki_root / workspace_name / "index.md"
@@ -46,10 +47,11 @@ class QueryFlow:
         context = ""
 
         if USE_MINIO:
-            from core import storage
+            from core.storage import get_storage
             from core.path_resolver import minio_concepts_prefix
+            s = get_storage()
             prefix = minio_concepts_prefix(self.user_id, workspace_name)
-            all_keys = storage.list_keys(prefix)
+            all_keys = s.list_keys(prefix)
             concept_keys = [k for k in all_keys if k.endswith(".md") 
                            and not k.endswith("/index.md") 
                            and "/mocs/" not in k]
@@ -78,7 +80,7 @@ class QueryFlow:
                 if lower_name in alias_map:
                     match_key = alias_map[lower_name]
                     try:
-                        content = storage.read(match_key)
+                        content = s.read_text(match_key)
                         match_name = match_key.split("/")[-1]
                         context += f"【🚨本地知识 == {match_name} ==】\n{content}\n\n"
                         print(f"  -> 📂 提取: {match_name}")
@@ -93,7 +95,7 @@ class QueryFlow:
                     if part in alias_map:
                         part_key = alias_map[part]
                         try:
-                            content = storage.read(part_key)
+                            content = s.read_text(part_key)
                             part_name = part_key.split("/")[-1]
                             context += f"【🚨本地拆解 == {part_name} ==】\n{content}\n\n"
                             print(f"  -> 🔍 反向拆解命中: {part_name}")
@@ -109,7 +111,7 @@ class QueryFlow:
                 if close:
                     match_key = alias_map[close[0]]
                     try:
-                        content = storage.read(match_key)
+                        content = s.read_text(match_key)
                         match_name = match_key.split("/")[-1]
                         context += f"【🚨本地相似 == {match_name} ==】\n{content}\n\n"
                         print(f"  -> 🧲 相似纠错: {match_name}")
@@ -181,10 +183,11 @@ class QueryFlow:
             return ""
 
         if USE_MINIO:
-            from core import storage
+            from core.storage import get_storage
             from core.path_resolver import minio_wiki_prefix
+            s = get_storage()
             prefix = minio_wiki_prefix(self.user_id, workspace_name)
-            all_keys = storage.list_keys(prefix)
+            all_keys = s.list_keys(prefix)
             md_keys = [k for k in all_keys if k.endswith(".md")]
 
             context = ""
@@ -198,7 +201,7 @@ class QueryFlow:
                     if kw_lower in name and key not in found:
                         found.add(key)
                         try:
-                            content = storage.read(key)
+                            content = s.read_text(key)
                             display_name = key.split("/")[-1]
                             context += f"【🚨模糊命中 == {display_name} ==】\n{content}\n\n"
                         except Exception:
@@ -273,6 +276,7 @@ class QueryFlow:
         history: list = None,
         user_id: str = "",
         session_id: str = "",
+        web_search_enabled: bool = None,  # None=自动决策, True=强制联网, False=仅本地
     ):
         """Web 端流式生成器 (SSE)"""
         if history is None:
@@ -309,6 +313,12 @@ class QueryFlow:
                 needs_web = decision.get("needs_web_search", True)
                 search_query = decision.get("search_query", user_question)
 
+                # 前端强制覆盖路由器的自动决策
+                if web_search_enabled is not None:
+                    needs_web = web_search_enabled
+                    override_label = "强制联网" if web_search_enabled else "仅本地"
+                    yield log(f"⚙️ 用户手动覆盖联网策略: {override_label}")
+
                 yield log(f"🎯 寻路裁决完毕")
                 yield log(f"   🧩 识别本地概念: {local_concepts or '(无)'}")
                 yield log(f"   🔤 模糊关键词: {fuzzy_keywords or '(无)'}")
@@ -332,10 +342,11 @@ class QueryFlow:
                     # 检查是否真的命中了文件
                     matched = False
                     if USE_MINIO:
-                        from core import storage
+                        from core.storage import get_storage
                         from core.path_resolver import minio_concepts_prefix
+                        s = get_storage()
                         prefix = minio_concepts_prefix(self.user_id, target_workspace)
-                        all_keys = storage.list_keys(prefix)
+                        all_keys = s.list_keys(prefix)
                         c_clean = c.lower().replace(" ", "")
                         for key in all_keys:
                             if key.endswith(".md") and not key.endswith("/index.md"):

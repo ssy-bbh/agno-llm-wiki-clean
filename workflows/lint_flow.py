@@ -32,11 +32,12 @@ class LintFlow:
             # ═══════════════════════════════════════════
             # MinIO 模式
             # ═══════════════════════════════════════════
-            from core import storage
+            from core.storage import get_storage
             from core.path_resolver import minio_concepts_prefix
 
+            s = get_storage()
             prefix = minio_concepts_prefix(user_id, kb_name)
-            all_keys = storage.list_keys(prefix)
+            all_keys = s.list_keys(prefix)
             # 过滤出 .md 文件，排除 index.md 和 mocs/
             concept_keys = [k for k in all_keys if k.endswith(".md") 
                            and not k.endswith("/index.md") 
@@ -68,7 +69,7 @@ class LintFlow:
                     continue
 
                 try:
-                    content = storage.read(key)
+                    content = s.read_text(key)
                 except Exception as e:
                     yield format_log(f"⚠️ 读取失败: {key} - {e}")
                     continue
@@ -103,7 +104,7 @@ class LintFlow:
                     continue
 
                 try:
-                    content = storage.read(target_key)
+                    content = s.read_text(target_key)
                 except Exception:
                     dead_links.append(target_concept)
                     continue
@@ -121,7 +122,7 @@ class LintFlow:
                 new_content = content + "\n\n" + backlink_section
 
                 try:
-                    storage.write(target_key, new_content)
+                    s.write_text(target_key, new_content)
                     updated_count += 1
                     target_name = target_key.split("/")[-1]
                     yield format_log(f"  -> 🔗 成功重织反向链接节点: [{target_name}]")
