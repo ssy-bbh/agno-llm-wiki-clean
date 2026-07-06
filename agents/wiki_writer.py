@@ -20,6 +20,12 @@ class WikiWriter:
 
             def _get_aliases(text: str) -> set:
                 aliases = set()
+                # 0. 先清洗 LLM 可能注入的中文动作前缀/后缀
+                cleaned = re.sub(r'^(创建|新建|生成|制作)\s*', '', text)
+                cleaned = re.sub(r'\s*(概念页面|概念页|页面|条目|笔记)\s*$', '', cleaned).strip()
+                if cleaned != text:
+                    text = cleaned
+
                 # 1. 整体纯净版
                 clean_text = text.lower().replace("-", "").replace("_", "").replace(" ", "")
                 if clean_text: aliases.add(clean_text)
@@ -60,6 +66,13 @@ class WikiWriter:
 
             if act_type == "create":
                 title = (action.get("title") or target_path.stem).strip()
+                # ── 清洗 LLM 生成的中文动作描述 ──
+                import re as _re
+                title = _re.sub(r'^(创建|新建|生成|制作)\s*', '', title)
+                title = _re.sub(r'\s*(概念页面|概念页|页面|条目|笔记)\s*$', '', title)
+                title = title.strip()
+                if not title:
+                    title = target_path.stem
                 safe_title = title.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
 
                 # 🛡️ 拦截：禁止在 concepts/ 里创建 index.md（那是根目录的导航地图）
