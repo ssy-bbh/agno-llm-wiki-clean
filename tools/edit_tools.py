@@ -2,6 +2,7 @@
 edit_tools.py — 局部精准编辑工具 (线程安全·用户隔离版)
 """
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -31,6 +32,20 @@ def get_context() -> dict:
         "kb_name": getattr(_ctx, "kb_name", "default"),
         "sub_dir": getattr(_ctx, "sub_dir", ""),
         "doc_name": getattr(_ctx, "doc_name", ""),
+    }
+
+
+# ── OKF 上下文（线程安全，供 create_page 自动注入 frontmatter）──
+def set_okf_context(page_type: str = "", source: list = None):
+    """设置当前线程的 OKF 元数据（frontmatter 注入用）"""
+    _ctx.okf_page_type = page_type
+    _ctx.okf_source = source or []
+
+def get_okf_context() -> dict:
+    """获取当前线程的 OKF 元数据"""
+    return {
+        "page_type": getattr(_ctx, "okf_page_type", ""),
+        "source": getattr(_ctx, "okf_source", []),
     }
 
 
@@ -93,8 +108,21 @@ def _sanitize_filename(file_name: str) -> str:
 
     # 去 markdown 标记 (###, ##, #, -, *)
     base = re.sub(r"^[#\-*]+\s*", "", base)
-    # 去 create_ 前缀
+    # 先分离 .md 后缀，确保后缀清洗在纯名称上操作
+    _has_md = base.lower().endswith(".md")
+    if _has_md:
+        base = base[:-3]
+
+    # 去 create_ 前缀（英文）
     base = re.sub(r"^create_", "", base)
+    # 去中文动作前缀（创建/新建/生成/制作）
+    base = re.sub(r"^(创建|新建|生成|制作)\s*", "", base)
+    # 去中文后缀（概念页面/概念页/页面/条目/笔记）
+    base = re.sub(r"\s*(概念页面|概念页|页面|条目|笔记)\s*$", "", base)
+
+    # 还原 .md 后缀
+    if _has_md:
+        base = base + ".md"
     # 去 concepts_ 前缀（LLM 有时把目录名拼进文件名）
     base = re.sub(r"^concepts_", "", base)
     # 去双重扩展名 (.md.md → .md)
@@ -129,14 +157,35 @@ def _clean_tags(tags) -> list[str]:
     return clean_tags
 
 
-def _build_body(title: str, tags: list[str], abstract: str, content: str = "") -> str:
-    """生成标准页面模板（统一 MinIO/Local 两种模式的输出格式）"""
+def _build_body(title: str, tags: list[str], abstract: str, content: str = "",
+                page_type: str = "", source: list = None) -> str:
+    """生成标准页面模板（统一 MinIO/Local 两种模式的输出格式）
+    
+    Schema 启用时输出 OKF 兼容的 YAML frontmatter；
+    Schema 未启用时保持原有格式（向后兼容）。
+    """
     import datetime
     tag_str = " ".join(_clean_tags(tags))
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     abs_text = abstract.replace("\\n", "\n")
     details = (content or "（等待后续扩展）").replace("\\n", "\n")
-    return f"""# {title}
+
+    # ── OKF frontmatter（仅 Schema 启用时注入）──
+    from core.schema_engine import is_enabled as schema_enabled
+    frontmatter = ""
+    if schema_enabled():
+        import yaml
+        fm = {
+            "type": page_type or "concept",
+            "timestamp": now_iso,
+            "tags": _clean_tags(tags),
+        }
+        if source:
+            fm["source"] = source
+        frontmatter = "---\n" + yaml.dump(fm, allow_unicode=True, default_flow_style=False).strip() + "\n---\n\n"
+
+    body = f"""{frontmatter}# {title}
 
 > **Tags:** {tag_str}
 > **Created:** {date_str}
@@ -153,10 +202,12 @@ def _build_body(title: str, tags: list[str], abstract: str, content: str = "") -
 ## References
 - 
 """
+    return body
 
 
 # 💡 注意参数里多了 content
-def create_page(file_name: str, title: str, tags: list[str], abstract: str, content: str = "") -> str:
+def create_page(file_name: str, title: str, tags: list[str], abstract: str, content: str = "",
+                page_type: str = "", source: list = None) -> str:
     """严格按照 schema 模板创建新页面，包含模糊去重机制"""
     from pathlib import PurePosixPath
 
@@ -177,8 +228,14 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str, cont
             if clean_new == clean_exist:
                 return f"⚠️ 拦截重复：{k} 已存在，规避新建：{file_name}"
 
+    # OKF: 自动从线程上下文拉取 type/source（如果未显式传递）
+    if not page_type or not source:
+        okf = get_okf_context()
+        page_type = page_type or okf["page_type"]
+        source = source or okf["source"]
+
     # 生成标准页面内容（统一模板，消除两个分支的重复代码）
-    body = _build_body(title, tags, abstract, content)
+    body = _build_body(title, tags, abstract, content, page_type=page_type, source=source)
     s.write_text(key, body)
     return f"✅ 成功创建页面：{file_name}"
 
@@ -193,15 +250,64 @@ def str_replace(file_name: str, old_str: str, new_str: str) -> str:
 
     content = s.read_text(key)
 
+    # OKF: 从线程上下文获取来源，追加到 frontmatter
+    okf = get_okf_context()
+    okf_sources = okf.get("source", [])
+
     # 1. 尝试绝对精确匹配
     if old_str in content:
-        s.write_text(key, content.replace(old_str, new_str, 1))
+        new_content = content.replace(old_str, new_str, 1)
+        new_content = _refresh_timestamp(new_content)
+        for src in okf_sources:
+            new_content = _append_source(new_content, src)
+        s.write_text(key, new_content)
         return f"✅ 成功修改文件：{file_name}"
 
     # 2. 尝试宽容匹配 (去掉大模型首尾乱加的换行和空格)
     old_str_clean = old_str.strip()
     if old_str_clean and old_str_clean in content:
-        s.write_text(key, content.replace(old_str_clean, new_str, 1))
+        new_content = content.replace(old_str_clean, new_str, 1)
+        new_content = _refresh_timestamp(new_content)
+        for src in okf_sources:
+            new_content = _append_source(new_content, src)
+        s.write_text(key, new_content)
         return f"✅ 成功修改文件(启用宽容匹配)：{file_name}"
 
     return f"❌ 找不到旧文本，大模型可能产生了格式幻觉！\n寻找的: {repr(old_str)}"
+
+
+def _refresh_timestamp(content: str) -> str:
+    """更新 frontmatter 中的 timestamp 字段（OKF 兼容）。无 frontmatter 则不动。"""
+    import datetime
+    if not content.startswith("---"):
+        return content
+    try:
+        now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return re.sub(r'timestamp:\s*["\']?[^"\'\n]+["\']?', f'timestamp: {now_iso}', content, count=1)
+    except Exception:
+        return content
+
+
+def _append_source(content: str, new_source: str) -> str:
+    """向 frontmatter 的 source 列表追加来源（去重）。无 frontmatter 则不动。"""
+    if not content.startswith("---") or not new_source:
+        return content
+    try:
+        import re as _re
+        # 检查是否已有 source 字段
+        m = _re.search(r'source:\s*\[([^\]]*)\]', content)
+        if m:
+            existing = [s.strip().strip("'") for s in m.group(1).split(',') if s.strip()]
+            if new_source not in existing:
+                existing.append(new_source)
+                new_list = ', '.join(existing)
+                content = content[:m.start()] + f'source: [{new_list}]' + content[m.end():]
+        else:
+            # 没有 source 字段，在 frontmatter 末尾加
+            # 找到第二个 --- （frontmatter 结束标记）
+            first_end = content.find('\n---\n', 1)
+            if first_end > 0:
+                content = content[:first_end] + f'\nsource: [{new_source}]' + content[first_end:]
+    except Exception:
+        pass
+    return content

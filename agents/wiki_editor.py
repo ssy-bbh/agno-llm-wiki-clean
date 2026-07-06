@@ -7,6 +7,7 @@ from typing import List, Any, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from agno.agent import Agent
 from core.llm_factory import get_qwen_model
+from core.schema_engine import is_enabled, inject_entries_to_editor
 
 # 单次 LLM 调用超时（秒）——融合比提取更复杂，给更多时间
 LLM_TIMEOUT_SECONDS = 300
@@ -35,11 +36,13 @@ class Action(BaseModel):
             # action → type
             if 'action' in data and 'type' not in data:
                 data['type'] = data.pop('action')
-            # target / file_path / path → file
+            # target / file_path / file_name / path → file
             if 'target' in data and 'file' not in data:
                 data['file'] = data.pop('target')
             if 'file_path' in data and 'file' not in data:
                 data['file'] = data.pop('file_path')
+            if 'file_name' in data and 'file' not in data:
+                data['file'] = data.pop('file_name')
             if 'path' in data and 'file' not in data:
                 data['file'] = data.pop('path')
             # reason/reasoning → rationale
@@ -83,7 +86,11 @@ class WikiEditor:
 
         ⚠️ 核心执行协议：
         1. 【查重与去重】：如果新资料的内容在【本地已有文件】中已经存在，或者没有实质性的新信息，请直接忽略，不要生成任何动作！
-        2. 【全新创建】：如果这是一个全新的概念（本地没有它的文件），生成 'create' 动作。正文需包含详实的深度笔记，并大量使用 [[双链]]。随后，必须附带一个 'append_link' 动作，将其分类追加到 index.md。
+        2. 【全新创建】：如果这是一个全新的概念（本地没有它的文件），生成 'create' 动作。
+           - `file` 字段只写概念名称路径（如 `concepts/LOGOS.md`），绝对不要包含动作描述词（如"创建"、"概念页面"、"新建条目"）！
+           - `title` 字段只写概念名称（如 `LOGOS (基于大语言模型的扎根理论框架)`），不要写"创建XX页面"！
+           - 正文需包含详实的深度笔记，并大量使用 [[双链]]。
+           - 随后，必须附带一个 'append_link' 动作，将其分类追加到 index.md。
         3. 【精准融合 (edit)】：如果本地已经存在该概念的文件，且新资料提供了增量细节（如新公式、新应用场景）：
            - 必须生成 'edit' 动作。
            - `old_str`：必须从【本地已有文件内容】中一字不差地复制需要被替换/扩展的原有段落！
@@ -124,6 +131,8 @@ class WikiEditor:
                         act['file'] = act.pop('target')
                     if 'file_path' in act and 'file' not in act:
                         act['file'] = act.pop('file_path')
+                    if 'file_name' in act and 'file' not in act:
+                        act['file'] = act.pop('file_name')
                     if 'path' in act and 'file' not in act:
                         act['file'] = act.pop('path')
                     if 'reason' in act and 'rationale' not in act:
@@ -152,7 +161,8 @@ class WikiEditor:
         # response.content 已经是 Pydantic 对象（Agno 原生解析成功）
         return response.content.model_dump()
 
-    def merge(self, raw_text: str, analyst_summary: str, existing_context: str) -> dict:
+    def merge(self, raw_text: str, analyst_summary: str, existing_context: str,
+              entries: list = None, conflicts: list = None, gaps: list = None) -> dict:
         print("\n[WikiEditor] 🧠 主编正在比对新旧知识，生成精准融合指令...")
 
         user_prompt = f"""
@@ -168,6 +178,9 @@ class WikiEditor:
 
         请严格按 JSON 格式输出 actions。如果找不到原文字符串，绝对不要编造 old_str！
         """
+
+        # ── Schema 判断信息注入（可插拔）──
+        user_prompt = inject_entries_to_editor(user_prompt, entries, conflicts, gaps)
 
         # 自我验证循环：最多尝试 MAX_ATTEMPTS 次（首次 + 重试）
         self._last_error = "未知错误"

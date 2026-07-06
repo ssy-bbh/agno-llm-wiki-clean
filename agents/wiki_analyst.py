@@ -1,8 +1,9 @@
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from agno.agent import Agent
 from core.llm_factory import get_qwen_model
+from core.schema_engine import is_enabled, inject_schema_to_analyst
 
 # 单次 LLM 调用超时（秒）
 LLM_TIMEOUT_SECONDS = 90
@@ -10,13 +11,25 @@ LLM_TIMEOUT_SECONDS = 90
 
 # 💡 变化 1：把 Action 类彻底删除了！它不配拥有这个权力。
 # 💡 变化 2：AnalysisReport 里去掉了 actions，加上了一个 summary 备用。
+class ConceptEntry(BaseModel):
+    """带判断的知识条目（Schema 启用时使用）"""
+    name: str = Field(description="概念名称，双语格式")
+    importance: str = Field(default="背景知识", description="核心突破 / 关键支撑 / 背景知识 / 可忽略")
+    novelty: str = Field(default="已知重申", description="全新概念 / 增量补充 / 已知重申")
+
+
 class AnalysisReport(BaseModel):
     new_concepts: List[str] = Field(description="从新资料中提取出的核心概念列表（如算法、模型、架构、术语等）")
     summary: str = Field(description="新资料的核心内容摘要（约50-100字），用于后续提供上下文")
+    # ── Schema 扩展字段（可插拔，默认为空不影响现有链路）──
+    entries: Optional[List[ConceptEntry]] = Field(default=None, description="带判断的知识条目（Schema 启用时）")
+    conflicts: Optional[List[str]] = Field(default=None, description="与已有知识库具体页面/概念的矛盾（必须锚定来源）")
+    gaps: Optional[List[str]] = Field(default=None, description="具体知识缺口：已有X但缺少Y")
+    source: Optional[str] = Field(default=None, description="资料来源名称（论文名/文档名），用于 OKF 来源追溯")
 
 
 class WikiAnalyst:
-    def __init__(self):
+    def __init__(self, schema_content: str = ""):
         # 💡 变化 3：Prompt 彻底大换血，告诉它：你只是个看材料的，别管怎么存！
         self.instructions = """你是一个专业的知识图谱情报侦察兵。
                 你的【唯一任务】是阅读新摄入的资料，提取其中的核心技术概念，并写一段简短的内容摘要。
@@ -30,10 +43,13 @@ class WikiAnalyst:
                    ✅ 正确示范：`Self-Attention (自注意力机制)`, `YOLO (单阶段目标检测算法)`, `CNN (卷积神经网络)`
                    ❌ 错误示范：`Self-Attention`, `自注意力机制`, `Self-Attention（自注意力机制）等`
                 """
+        # ── Schema 注入（可插拔）──
+        effective_instructions = inject_schema_to_analyst(self.instructions, schema_content)
+        
         # 📉 分层模型：MAP 提取是简单任务，用轻量模型省 90% 费用
         self.agent = Agent(
             model=get_qwen_model(model_id="qwen-turbo"),
-            instructions=[self.instructions],
+            instructions=[effective_instructions],
             output_schema=AnalysisReport,
             stream=False
         )

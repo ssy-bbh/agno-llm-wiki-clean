@@ -18,6 +18,11 @@ from core.ingest_control import (
     is_terminate_requested, mark_concept_done,
     is_concept_done, save_file_checkpoint, save_shuffle_result,
 )
+# ── Schema 领域自适应（可插拔）──
+from core.schema_engine import (
+    is_enabled as schema_enabled,
+    build_phase0_prompt, build_log_entry, build_suggestion_prompt,
+)
 
 
 class IngestFlow:
@@ -34,6 +39,14 @@ class IngestFlow:
         self._file_cache = {}           # {filepath: content} 文件内容缓存
         self._context_cache = {}        # {concept_tuple: context_str} 上下文缓存
         self._concept_index = {}        # {normalized_name: Path} 概念文件索引
+
+        # ── Schema 领域自适应（可插拔）──
+        self._schema_content = ""       # 当前沙箱的 Schema 内容
+        self._all_entries = []          # MAP 阶段收集的带判断条目
+        self._all_conflicts = []        # MAP 阶段收集的矛盾信息（锚定已有知识）
+        self._all_gaps = []             # MAP 阶段收集的知识缺口（已有X但缺少Y）
+        self._all_sources = []          # OKF: 本轮 ingest 的来源名称列表
+        self._reduce_actions_log = []   # OKF: REDUCE 阶段的操作摘要（用于 log.md）
 
     def _normalize_name(self, text: str) -> str:
         if not text:
@@ -191,6 +204,234 @@ class IngestFlow:
         except Exception as e:
             return chunk_id, chunk, None, f"报错: {str(e)}"
 
+    # ═══════════════════════════════════════════
+    # Schema 领域自适应（可插拔，全部 try/except 兆底）
+    # ═══════════════════════════════════════════
+
+    def _load_or_infer_schema(self, user_id: str, kb_name: str, sample_chunks: list) -> str:
+        """加载已有 Schema 或首次嗅探生成。失败返回空字符串。"""
+        if not schema_enabled():
+            return ""
+        try:
+            from core.path_resolver import minio_schema_key, get_schema_path
+            s = get_storage()
+
+            # 1. 尝试读取已有 Schema
+            if USE_MINIO:
+                key = minio_schema_key(user_id, kb_name)
+                if s.exists(key):
+                    content = s.read_text(key)
+                    print(f"  📖 [Schema] 已加载领域编译指南 ({len(content)} 字符)")
+                    return content
+            else:
+                local_path = get_schema_path(user_id, kb_name)
+                if local_path.exists():
+                    content = local_path.read_text(encoding="utf-8")
+                    print(f"  📖 [Schema] 已加载领域编译指南 ({len(content)} 字符)")
+                    return content
+
+            # 2. 首次 ingest，触发 Phase 0 嗅探
+            print("  🔬 [Schema Phase 0] 首次摄入，推断领域编译约定...")
+            prompt = build_phase0_prompt(kb_name, sample_chunks)
+
+            # 用轻量模型调用
+            from core.llm_factory import get_qwen_model
+            from agno.agent import Agent
+            agent = Agent(
+                model=get_qwen_model(model_id="qwen-turbo"),
+                instructions=["你是一个领域知识分析专家。"],
+                stream=False,
+            )
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(agent.run, prompt)
+                response = future.result(timeout=30)
+
+            schema_text = response.content if hasattr(response, 'content') else str(response)
+            if schema_text and len(schema_text) > 100:
+                # 写入存储
+                if USE_MINIO:
+                    s.write_text(minio_schema_key(user_id, kb_name), schema_text)
+                else:
+                    local_path = get_schema_path(user_id, kb_name)
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_path.write_text(schema_text, encoding="utf-8")
+                print(f"  ✅ [Schema] 编译指南已生成 ({len(schema_text)} 字符)")
+                return schema_text
+            else:
+                print("  ⚠️ [Schema] 嗅探结果过短，跳过")
+                return ""
+
+        except Exception as e:
+            print(f"  ⚠️ [Schema] 加载/嗅探失败（不影响主流程）: {e}")
+            return ""
+
+    def _append_log(self, user_id: str, kb_name: str, doc_name: str,
+                    map_count: int, shuffle_count: int, reduce_count: int,
+                    skip_count: int, error_count: int,
+                    actions_log: list = None, conflicts: list = None):
+        """追加一条 log.md 记录（OKF 兼容格式）。失败静默。"""
+        if not schema_enabled():
+            return
+        try:
+            from core.path_resolver import minio_log_key, get_log_path
+            s = get_storage()
+
+            entry = build_log_entry("ingest", doc_name,
+                details={
+                    "MAP": f"{map_count} 块", "SHUFFLE": f"{shuffle_count} 概念",
+                    "REDUCE": f"{reduce_count} 个", "skip": f"{skip_count}",
+                    "error": f"{error_count}" if error_count else "0",
+                    "source": ', '.join(self._all_sources) if self._all_sources else "",
+                },
+                actions_summary=actions_log,
+                conflicts=conflicts,
+            )
+
+            if USE_MINIO:
+                key = minio_log_key(user_id, kb_name)
+                existing = s.read_text(key) if s.exists(key) else "# 活动日志\n"
+                s.write_text(key, existing + entry)
+            else:
+                local_path = get_log_path(user_id, kb_name)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                existing = local_path.read_text(encoding="utf-8") if local_path.exists() else "# 活动日志\n"
+                local_path.write_text(existing + entry, encoding="utf-8")
+
+            print(f"  📝 [log.md] 活动已记录")
+        except Exception as e:
+            print(f"  ⚠️ [log.md] 写入失败（不影响主流程）: {e}")
+
+    def _maybe_generate_suggestions(self, user_id: str, kb_name: str):
+        """REDUCE 后尝试生成 Schema 演化建议。失败静默。"""
+        if not schema_enabled():
+            return
+        try:
+            from core.path_resolver import minio_suggestions_key, minio_log_key, get_suggestions_path, get_log_path
+            from core.llm_factory import get_qwen_model
+            from agno.agent import Agent
+
+            s = get_storage()
+
+            # 读已有建议（避免重复）
+            if USE_MINIO:
+                sug_key = minio_suggestions_key(user_id, kb_name)
+                existing_sug = s.read_text(sug_key) if s.exists(sug_key) else ""
+                log_key = minio_log_key(user_id, kb_name)
+                recent_log = s.read_text(log_key) if s.exists(log_key) else ""
+            else:
+                sug_path = get_suggestions_path(user_id, kb_name)
+                existing_sug = sug_path.read_text(encoding="utf-8") if sug_path.exists() else ""
+                log_path = get_log_path(user_id, kb_name)
+                recent_log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+
+            if not recent_log.strip():
+                return
+
+            prompt = build_suggestion_prompt(existing_sug, recent_log)
+            agent = Agent(
+                model=get_qwen_model(model_id="qwen-turbo"),
+                instructions=["你是知识库的 Schema 演化顾问。"],
+                stream=False,
+            )
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(agent.run, prompt)
+                response = future.result(timeout=30)
+
+            result = response.content if hasattr(response, 'content') else str(response)
+            if "NO_NEW_SUGGESTIONS" in result:
+                return
+
+            # 追加到建议文件
+            new_entry = "\n---\n\n" + result
+            if USE_MINIO:
+                s.write_text(sug_key, existing_sug + new_entry)
+            else:
+                sug_path = get_suggestions_path(user_id, kb_name)
+                sug_path.parent.mkdir(parents=True, exist_ok=True)
+                sug_path.write_text(existing_sug + new_entry, encoding="utf-8")
+
+            print(f"  💡 [Schema] 已生成演化建议")
+        except Exception as e:
+            print(f"  ⚠️ [Schema] 建议生成失败（不影响主流程）: {e}")
+
+    def _update_index_summaries(self, user_id: str, kb_name: str):
+        """OKF: 为 index.md 中的链接添加一句话摘要。失败静默。"""
+        if not schema_enabled():
+            return
+        try:
+            s = get_storage()
+            if USE_MINIO:
+                from core.path_resolver import minio_index_key, minio_concepts_prefix
+                idx_key = minio_index_key(user_id, kb_name)
+                if not s.exists(idx_key):
+                    return
+                index_content = s.read_text(idx_key)
+                prefix = minio_concepts_prefix(user_id, kb_name)
+                concept_keys = s.list_keys(prefix)
+            else:
+                from tools.edit_tools import _resolve
+                idx_path = _resolve("index.md")
+                if not idx_path.exists():
+                    return
+                index_content = idx_path.read_text(encoding="utf-8")
+                concepts_dir = _resolve("concepts")
+                concept_keys = list(concepts_dir.glob("*.md")) if concepts_dir.exists() else []
+
+            # 为每个 [[链接]] 尝试从对应文件中提取一句话摘要
+            import re as _re
+            links = _re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', index_content)
+            if not links:
+                return
+
+            # 构建概念名 → 摘要的映射
+            summary_map = {}
+            for lk in links:
+                norm = self._normalize_name(lk)
+                # 查找对应文件
+                if USE_MINIO:
+                    for ck in concept_keys:
+                        stem = ck.split("/")[-1].replace(".md", "")
+                        if self._normalize_name(stem) == norm:
+                            content = get_storage().read_text(ck)
+                            abs_text = self._extract_abstract(content)
+                            # 取第一句作为摘要
+                            first_sentence = abs_text.split("。")[0].split("\n")[0][:80] if abs_text else ""
+                            if first_sentence:
+                                summary_map[lk] = first_sentence
+                            break
+                else:
+                    for cf in concept_keys:
+                        if self._normalize_name(cf.stem) == norm:
+                            content = cf.read_text(encoding="utf-8")
+                            abs_text = self._extract_abstract(content)
+                            first_sentence = abs_text.split("。")[0].split("\n")[0][:80] if abs_text else ""
+                            if first_sentence:
+                                summary_map[lk] = first_sentence
+                            break
+
+            if not summary_map:
+                return
+
+            # 更新 index.md：在链接后追加摘要
+            new_index = index_content
+            for lk, summ in summary_map.items():
+                # 只更新没有摘要的链接行
+                pattern = _re.compile(rf'^(\s*-\s*\[\[{re.escape(lk)}[^\]]*\]\])\s*$', _re.MULTILINE)
+                new_index = pattern.sub(rf'\1 — {summ}', new_index, count=1)
+
+            # 写回
+            if USE_MINIO:
+                s.write_text(idx_key, new_index)
+            else:
+                idx_path = _resolve("index.md")
+                idx_path.write_text(new_index, encoding="utf-8")
+
+            print(f"  📝 [OKF] index.md 已添加 {len(summary_map)} 条摘要")
+        except Exception as e:
+            print(f"  ⚠️ [OKF] index 摘要更新失败（不影响主流程）: {e}")
+
     def run(self, input_source: str, kb_name: str = "", user_id: str = "", doc_name: str = "", pending_payloads: dict = None):
         """
         知识摄入入口。
@@ -259,10 +500,29 @@ class IngestFlow:
             print(f"✂️ 原始文本切分为 {len(chunks)} 个知识块。")
 
         # ==========================================
+        # 🧬 PHASE 0: Schema 领域嗅探（可插拔）
+        # ==========================================
+        if schema_enabled() and chunks:
+            print("\n" + "=" * 60)
+            print("🧬 [Phase 0: Schema] 领域编译约定检查...")
+            self._schema_content = self._load_or_infer_schema(user_id, kb_name, chunks[:2])
+            if self._schema_content:
+                # 用带 Schema 的 instructions 重建 Analyst
+                self.analyst = WikiAnalyst(schema_content=self._schema_content)
+                print("  ✅ Analyst 已注入领域编译指南")
+            else:
+                print("  ⏭️ 无 Schema，使用默认提取逻辑")
+
+        # ==========================================
         # 🟢 PHASE 1: MAP (无锁绝对并发)
         # ==========================================
         map_lock = threading.Lock()
         self._skip_map = bool(_pending)  # resume skip
+        self._all_entries = []
+        self._all_conflicts = []
+        self._all_gaps = []
+        self._all_sources = []
+        self._reduce_actions_log = []
 
         print("\n" + "=" * 60)
         print("⚡ [Phase 1: MAP] 启动侦察兵并发提取 (释放全部线程)...")
@@ -279,6 +539,33 @@ class IngestFlow:
                     with map_lock:
                         map_results.append((chunk_text_val, res))
                     print(f"  -> ✅ 线程 {cid} 提取完毕: {res.get('new_concepts')}")
+
+        # ── Schema: 聚合 MAP 阶段的判断信息 + 来源追溯 ──
+        self._all_sources = []  # OKF: 收集本轮 ingest 的所有来源名称
+        if schema_enabled() and map_results:
+            for _, res in map_results:
+                if res:
+                    entries = res.get("entries")
+                    if entries:
+                        for e in entries:
+                            if isinstance(e, dict):
+                                self._all_entries.append(e)
+                            elif hasattr(e, 'model_dump'):
+                                self._all_entries.append(e.model_dump())
+                    conflicts = res.get("conflicts")
+                    if conflicts:
+                        self._all_conflicts.extend(conflicts)
+                    gaps = res.get("gaps")
+                    if gaps:
+                        self._all_gaps.extend(gaps)
+                    # OKF: 收集来源
+                    src = res.get("source")
+                    if src and src not in self._all_sources:
+                        self._all_sources.append(src)
+            if self._all_entries:
+                print(f"  🧠 [Schema] 聚合判断: {len(self._all_entries)} 条目, {len(self._all_conflicts)} 矛盾, {len(self._all_gaps)} 缺口")
+            if self._all_sources:
+                print(f"  📚 [OKF] 来源: {', '.join(self._all_sources)}")
 
         # ==========================================
         # 🟡 PHASE 2: SHUFFLE (内存级同义词聚类)
@@ -389,7 +676,7 @@ class IngestFlow:
             combined_text = "\n\n... (接上文补充资料) ...\n\n".join(payload["texts"])
 
             # Token 熔断保护
-            MAX_CHARS = 8000
+            MAX_CHARS = 20000
             if len(combined_text) > MAX_CHARS:
                 print(f"  -> ⚠️ [{display_name}] 过长 ({len(combined_text)} 字符)，已截断")
                 combined_text = combined_text[:MAX_CHARS] + "\n\n... [数据过长，出于系统上下文保护已截断，请基于以上核心信息进行融合] ..."
@@ -399,12 +686,22 @@ class IngestFlow:
 
             # ── 可中断的 LLM 调用 ──
             _merge_uid, _merge_kb = user_id, kb_name
+            _merge_entries = self._all_entries or None
+            _merge_conflicts = self._all_conflicts or None
+            _merge_gaps = self._all_gaps or None
+            _merge_sources = self._all_sources or []
             def _do_merge():
                 set_context(user_id=_merge_uid, kb_name=_merge_kb or "default", sub_dir="")
+                # OKF: 设置来源追溯上下文，供 create_page 自动注入 frontmatter
+                from tools.edit_tools import set_okf_context
+                set_okf_context(page_type="concept", source=_merge_sources)
                 return WikiEditor().merge(
                     raw_text=combined_text,
                     analyst_summary=combined_summary,
-                    existing_context=existing_context
+                    existing_context=existing_context,
+                    entries=_merge_entries,
+                    conflicts=_merge_conflicts,
+                    gaps=_merge_gaps,
                 )
             try:
                 merge_future = reduce_pool.submit(_do_merge)
@@ -423,6 +720,19 @@ class IngestFlow:
 
                 if report and report.get("actions"):
                     self.writer.execute(report)
+                    # OKF: 记录操作摘要供 log.md 使用
+                    if schema_enabled():
+                        for act in report["actions"]:
+                            act_type = act.get("type", "")
+                            act_file = act.get("file", "")
+                            if act_type == "create":
+                                self._reduce_actions_log.append(f"create: {act_file}")
+                            elif act_type == "edit":
+                                self._reduce_actions_log.append(f"edit: {act_file}")
+                            elif act_type == "append_link":
+                                pass  # index 更新不记入
+                            elif act_type == "extract_moc":
+                                self._reduce_actions_log.append(f"extract_moc: {act_file}")
                 else:
                     print(f"  -> 🔔 主编裁定: [{display_name}] 无实质增量信息，跳过写盘。")
                     skipped_count += 1
@@ -450,6 +760,23 @@ class IngestFlow:
         if terminated:
             stats_parts.append("⚠️ 用户终止")
         print(f"✅ [IngestFlow] 摄入完毕 | {' | '.join(stats_parts)} | 知识图谱已延展！")
+
+        # ── Schema: 完成后追加 log.md + 生成建议 + index 摘要（可插拔）──
+        if schema_enabled() and not terminated:
+            _doc = doc_name or (path.stem if path.exists() else str(input_source))
+            map_count = len(map_results)
+            self._append_log(
+                user_id, kb_name, _doc,
+                map_count=map_count,
+                shuffle_count=total_concepts,
+                reduce_count=total_concepts - skipped_count - error_count,
+                skip_count=skipped_count,
+                error_count=error_count,
+                actions_log=self._reduce_actions_log,
+                conflicts=self._all_conflicts if self._all_conflicts else None,
+            )
+            self._update_index_summaries(user_id, kb_name)
+            self._maybe_generate_suggestions(user_id, kb_name)
 
         # 返回是否被终止（供外层循环判断）
         return not terminated

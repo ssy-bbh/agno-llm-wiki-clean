@@ -119,3 +119,31 @@ def minio_index_key(user_id: str, workspace: str) -> str:
 
 def minio_concept_key(user_id: str, workspace: str, file_name: str) -> str:
     return minio_wiki_prefix(user_id, workspace) + "concepts/" + file_name
+
+# ═══════════════════════════════════════════
+# Schema 层（领域自适应，可插拔）
+# ═══════════════════════════════════════════
+
+def minio_schema_key(user_id: str, workspace: str) -> str:
+    """领域编译指南 (Schema) 的 MinIO key"""
+    return minio_wiki_prefix(user_id, workspace) + "schema.md"
+
+def minio_log_key(user_id: str, workspace: str) -> str:
+    """活动日志 (log.md) 的 MinIO key"""
+    return minio_wiki_prefix(user_id, workspace) + "log.md"
+
+def minio_suggestions_key(user_id: str, workspace: str) -> str:
+    """Schema 演化建议 (schema_suggestions.md) 的 MinIO key"""
+    return minio_wiki_prefix(user_id, workspace) + "schema_suggestions.md"
+
+def get_schema_path(user_id: str, workspace: str) -> Path:
+    """Schema 本地路径"""
+    return get_wiki_root(user_id) / workspace / "schema.md"
+
+def get_log_path(user_id: str, workspace: str) -> Path:
+    """活动日志本地路径"""
+    return get_wiki_root(user_id) / workspace / "log.md"
+
+def get_suggestions_path(user_id: str, workspace: str) -> Path:
+    """Schema 建议本地路径"""
+    return get_wiki_root(user_id) / workspace / "schema_suggestions.md"

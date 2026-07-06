@@ -138,6 +138,10 @@ class LintFlow:
                 yield format_log(f"⚠️ 核心警告：全库发现 {len(dead_links)} 个【幽灵死链】(有提及但在库中无文件): {dead_str}")
                 await asyncio.sleep(0.01)
 
+            # ═══ OKF: Staleness 检测 + 矛盾积压告警 ═══
+            async for msg in self._okf_health_check_minio(s, concept_keys, format_log):
+                yield msg
+
             yield format_log(f"🕸️ [LintFlow] [{kb_name}] 织网完成，沙箱局部知识拓扑已彻底闭环！")
             return
 
@@ -239,7 +243,120 @@ class LintFlow:
             yield format_log(f"⚠️ 核心警告：全库发现 {len(dead_links)} 个【幽灵死链】(有提及但在库中无文件): {dead_str}")
             await asyncio.sleep(0.01)
 
+        # ═══ OKF: Staleness 检测 + 矛盾积压告警 ═══
+        async for msg in self._okf_health_check_local(all_md_files, format_log):
+            yield msg
+
         yield format_log(f"🕸️ [LintFlow] [{kb_name}] 织网完成，沙箱局部知识拓扑已彻底闭环！")
+
+    # ═══════════════════════════════════════════
+    # OKF: 知识库健康检查（staleness + 矛盾积压）
+    # ═══════════════════════════════════════════
+
+    async def _parse_frontmatter_timestamp(self, content: str):
+        """从 OKF frontmatter 中提取 timestamp，返回 None 或 ISO 字符串"""
+        if not content.startswith("---"):
+            return None
+        m = re.search(r'timestamp:\s*["\']?([^"\'\n]+)["\']?', content)
+        return m.group(1).strip() if m else None
+
+    async def _okf_health_check_minio(self, s, concept_keys, format_log):
+        """MinIO 模式的健康检查"""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_90 = []
+        stale_180 = []
+        conflict_pages = []
+        total_conflicts = 0
+
+        for key in concept_keys:
+            try:
+                content = s.read_text(key)
+            except Exception:
+                continue
+            name = key.split("/")[-1]
+
+            ts = await self._parse_frontmatter_timestamp(content)
+            if ts:
+                try:
+                    dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    days = (now - dt).days
+                    if days > 180:
+                        stale_180.append(f"{name} ({days}天)")
+                    elif days > 90:
+                        stale_90.append(f"{name} ({days}天)")
+                except Exception:
+                    pass
+
+            conflict_count = content.count("## ⚠️ 矛盾待解决")
+            if conflict_count:
+                conflict_pages.append(f"{name} ({conflict_count}个)")
+                total_conflicts += conflict_count
+
+        async for msg in self._yield_health_results(stale_90, stale_180, conflict_pages, total_conflicts, format_log):
+            yield msg
+
+    async def _okf_health_check_local(self, md_files, format_log):
+        """本地模式的健康检查"""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_90 = []
+        stale_180 = []
+        conflict_pages = []
+        total_conflicts = 0
+
+        for fp in md_files:
+            if fp.name in ["index.md", "log.md", "schema.md"]:
+                continue
+            try:
+                content = fp.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            name = fp.name
+
+            ts = await self._parse_frontmatter_timestamp(content)
+            if ts:
+                try:
+                    dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    days = (now - dt).days
+                    if days > 180:
+                        stale_180.append(f"{name} ({days}天)")
+                    elif days > 90:
+                        stale_90.append(f"{name} ({days}天)")
+                except Exception:
+                    pass
+
+            conflict_count = content.count("## ⚠️ 矛盾待解决")
+            if conflict_count:
+                conflict_pages.append(f"{name} ({conflict_count}个)")
+                total_conflicts += conflict_count
+
+        async for msg in self._yield_health_results(stale_90, stale_180, conflict_pages, total_conflicts, format_log):
+            yield msg
+
+    async def _yield_health_results(self, stale_90, stale_180, conflict_pages, total_conflicts, format_log):
+        """统一输出健康检查结果"""
+        await asyncio.sleep(0.01)
+        yield format_log("")
+        yield format_log("═══ OKF 知识库健康报告 ═══")
+
+        if stale_180:
+            yield format_log(f"🔴 严重过期 (>180天): {', '.join(stale_180[:5])}")
+            await asyncio.sleep(0.01)
+        if stale_90:
+            yield format_log(f"⚠️ 可能过期 (>90天): {', '.join(stale_90[:5])}")
+            await asyncio.sleep(0.01)
+        if not stale_90 and not stale_180:
+            yield format_log("✅ 所有页面时效正常")
+            await asyncio.sleep(0.01)
+
+        if total_conflicts > 10:
+            yield format_log(f"🔴 矛盾积压过多: 全库 {total_conflicts} 个未解决矛盾")
+            await asyncio.sleep(0.01)
+        elif conflict_pages:
+            yield format_log(f"⚠️ 矛盾待解决: {', '.join(conflict_pages[:5])}")
+            await asyncio.sleep(0.01)
+        else:
+            yield format_log("✅ 无积压矛盾")
+            await asyncio.sleep(0.01)
 
     def _select_sandbox(self) -> Path:
         """保留单机 CLI 运行时的交互式终端菜单"""
