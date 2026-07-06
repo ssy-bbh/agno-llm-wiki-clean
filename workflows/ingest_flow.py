@@ -145,6 +145,8 @@ class IngestFlow:
 
             if get_storage().exists(idx_key):
                 full = self._read_file_cached(idx_key)
+                # 过滤占位符文本，防止 Editor 将其用作 old_str
+                full = re.sub(r'等待知识摄入\.\.\.', '', full).strip()
                 if len(full) > 8000:
                     toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
                     toc = '\n'.join(toc_lines[:200]) if toc_lines else full[:3000]
@@ -171,6 +173,8 @@ class IngestFlow:
 
             if index_path.exists():
                 full = self._read_file_cached(index_path)
+                # 过滤占位符文本，防止 Editor 将其用作 old_str
+                full = re.sub(r'等待知识摄入\.\.\.', '', full).strip()
                 if len(full) > 8000:
                     toc_lines = [l for l in full.split('\n') if l.strip().startswith('#') or (l.strip().startswith('-') and '[[' in l)]
                     toc = '\n'.join(toc_lines[:200]) if toc_lines else full[:3000]
@@ -748,7 +752,7 @@ class IngestFlow:
                     gaps=_merge_gaps,
                 )
             # 硬超时：单个概念融合最多 MERGE_HARD_TIMEOUT 秒（含 Editor 内部重试）
-            MERGE_HARD_TIMEOUT = 360
+            MERGE_HARD_TIMEOUT = 480
             try:
                 merge_future = reduce_pool.submit(_do_merge)
                 merge_start = time.time()

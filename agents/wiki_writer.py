@@ -16,7 +16,13 @@ class WikiWriter:
         seen_actions = set()
 
         def _is_same_concept(name1, name2):
-            """聪明且克制的集合交集防撞雷达"""
+            """加强版防撞雷达：防止子概念被父概念吞掉
+            
+            规则：
+            1. 完全同名（normalized）→ 同一概念
+            2. ≥2 个别名重叠 → 同一概念（双语匹配）
+            3. 仅 1 个别名重叠 → 不是同一概念（防止 LOGOS 黑洞）
+            """
 
             def _get_aliases(text: str) -> set:
                 aliases = set()
@@ -39,8 +45,17 @@ class WikiWriter:
                     if part2: aliases.add(part2)
                 return aliases
 
-            # 只有两个名字的别名集合有交集，才算是同一个概念
-            return bool(_get_aliases(name1) & _get_aliases(name2))
+            a1 = _get_aliases(name1)
+            a2 = _get_aliases(name2)
+            overlap = a1 & a2
+            if not overlap:
+                return False
+            if len(overlap) >= 2:
+                return True  # 双语匹配，确定是同一概念
+            # 仅 1 个别名重叠：只有完全同名才算（防止 LOGOS 吞子概念）
+            n1 = name1.lower().replace("-", "").replace("_", "").replace(" ", "")
+            n2 = name2.lower().replace("-", "").replace("_", "").replace(" ", "")
+            return n1 == n2
 
         for action in actions:
             act_type = action.get("type")

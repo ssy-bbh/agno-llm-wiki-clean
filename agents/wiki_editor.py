@@ -10,7 +10,7 @@ from core.llm_factory import get_qwen_model
 from core.schema_engine import is_enabled, inject_entries_to_editor
 
 # 单次 LLM 调用超时（秒）——融合比提取更复杂，给更多时间
-LLM_TIMEOUT_SECONDS = 180
+LLM_TIMEOUT_SECONDS = 240
 
 # 🔄 自我验证循环最大尝试次数
 MAX_ATTEMPTS = 2
