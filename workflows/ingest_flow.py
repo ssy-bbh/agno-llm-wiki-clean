@@ -199,6 +199,7 @@ class IngestFlow:
             print(f"  [Map 线程 {chunk_id}] 🕵️‍♂️ 提取中...")
             analysis_result = self.analyst.analyze(chunk)
             if not analysis_result.get("new_concepts"):
+                print(f"  -> ⚠️ 线程 {chunk_id} 无核心概念（摘要: {analysis_result.get('summary', '')[:50]}）")
                 return chunk_id, chunk, None, "无核心概念"
             return chunk_id, chunk, analysis_result, "成功"
         except Exception as e:
@@ -540,6 +541,13 @@ class IngestFlow:
                         map_results.append((chunk_text_val, res))
                     print(f"  -> ✅ 线程 {cid} 提取完毕: {res.get('new_concepts')}")
 
+        # ── MAP 结果统计 ──
+        timeout_skips = sum(1 for _, res in map_results if res and res.get("summary", "").startswith("(LLM 超时"))
+        total_concepts_raw = sum(len(res.get("new_concepts", [])) for _, res in map_results if res)
+        print(f"  📊 MAP 完成: {len(map_results)}/{len(chunks)} 块成功, 提取 {total_concepts_raw} 个概念, {len(chunks) - len(map_results)} 块空/超时/失败")
+        if timeout_skips:
+            print(f"  ⚠️ 其中 {timeout_skips} 块因 LLM 超时被跳过")
+
         # ── Schema: 聚合 MAP 阶段的判断信息 + 来源追溯 ──
         self._all_sources = []  # OKF: 收集本轮 ingest 的所有来源名称
         if schema_enabled() and map_results:
@@ -573,6 +581,11 @@ class IngestFlow:
         print("\n" + "=" * 60)
         print("🔀 [Phase 2: SHUFFLE] 正在将碎片知识按概念重新洗牌聚类 (启动双语解构引擎)...")
 
+        # 空词黑名单：纯中文单独出现时大概率是泛化概念（"意义""背景"等）
+        ZH_STOPWORDS = {"意义", "影响", "作用", "价值", "背景", "历史", "发展",
+                        "反思", "动机", "投资", "合作", "素养", "民主化", "采用",
+                        "学习", "整合", "协作", "伦理", "责任", "导师", "职业"}
+
         concept_payloads = {}
         for chunk_text_val, res in map_results:
             concepts = res.get("new_concepts", [])
@@ -594,6 +607,10 @@ class IngestFlow:
                 if len(en_key.split()) > 4 or len(en_key) > 25:
                     continue
 
+                # 空词黑名单：纯中文且命中停用词 → 丢弃
+                if not match and en_key in ZH_STOPWORDS:
+                    continue
+
                 norm_c = self._normalize_name(en_key)
                 if not norm_c or len(norm_c) < 2:
                     continue
@@ -613,15 +630,21 @@ class IngestFlow:
                 concept_payloads[norm_c]["texts"].append(chunk_text_val)
                 concept_payloads[norm_c]["summaries"].append(summary)
 
-        # 📉 SHUFFLE 低频过滤：只在 1 个 chunk 中出现的概念大概率是噪音
+        # 📉 SHUFFLE 过滤：≥1 即可通过（质量关已由 MAP 负责），保留所有概念
+        #    极端安全阀：超过上限时按频次截断（正常情况不会触发）
+        MAX_CONCEPTS_PER_INGEST = 60
         before_filter = len(concept_payloads)
-        concept_payloads = {
-            k: v for k, v in concept_payloads.items()
-            if len(v["texts"]) >= 2
-        }
-        filtered = before_filter - len(concept_payloads)
-        if filtered:
-            print(f"  🗑️ 过滤低频概念: {filtered} 个（仅 1 个 chunk 提及）")
+        if before_filter > MAX_CONCEPTS_PER_INGEST:
+            sorted_concepts = sorted(
+                concept_payloads.items(),
+                key=lambda x: len(x[1]["texts"]),
+                reverse=True
+            )
+            concept_payloads = dict(sorted_concepts[:MAX_CONCEPTS_PER_INGEST])
+            capped = before_filter - len(concept_payloads)
+            print(f"  🗑️ 安全阀截断: {capped} 个（超过 {MAX_CONCEPTS_PER_INGEST} 上限）")
+        else:
+            print(f"  ✅ SHUFFLE 通过: {before_filter} 个概念进入 REDUCE")
 
         # 保存 SHUFFLE 结果到检查点缓存（供 resume 跳过 MAP+SHUFFLE）
         if user_id and kb_name and not _pending:
@@ -703,11 +726,18 @@ class IngestFlow:
                     conflicts=_merge_conflicts,
                     gaps=_merge_gaps,
                 )
+            # 硬超时：单个概念融合最多 MERGE_HARD_TIMEOUT 秒（含 Editor 内部重试）
+            MERGE_HARD_TIMEOUT = 360
             try:
                 merge_future = reduce_pool.submit(_do_merge)
+                merge_start = time.time()
+                merge_timed_out = False
                 while not merge_future.done():
                     if user_id and kb_name and is_terminate_requested(user_id, kb_name):
                         terminated = True
+                        break
+                    if time.time() - merge_start > MERGE_HARD_TIMEOUT:
+                        merge_timed_out = True
                         break
                     try:
                         merge_future.result(timeout=0.5)
@@ -716,6 +746,12 @@ class IngestFlow:
                 if terminated:
                     reduce_pool.shutdown(wait=False)
                     break
+                if merge_timed_out:
+                    print(f"  -> ⏰ [{display_name}] 外层硬超时 ({MERGE_HARD_TIMEOUT}s)，跳过")
+                    error_count += 1
+                    if user_id and kb_name:
+                        mark_concept_done(user_id, kb_name, norm_c)
+                    continue
                 report = merge_future.result()
 
                 if report and report.get("actions"):
