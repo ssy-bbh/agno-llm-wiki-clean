@@ -53,6 +53,23 @@ class IngestFlow:
             return ""
         return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
+    @staticmethod
+    def _adaptive_chunk_params(text_len: int) -> tuple[int, int]:
+        """根据文档长度自适应选择 chunk_size 和 overlap。
+        目标：每个 chunk 有足够上下文让 Analyst 提取 3-5 个概念，
+        同时避免碎片化导致概念频次=1。
+        """
+        if text_len < 3000:
+            # 短文档不切分，整块给 Analyst
+            return max(text_len, 1), 0
+        elif text_len < 8000:
+            return 3000, 300
+        elif text_len < 20000:
+            return 4000, 400
+        else:
+            # 大文档：保持合理 chunk 数（~4-8 个）
+            return 5000, 500
+
     def _build_concept_index(self):
         """🔧 P0-1: 一次性构建概念文件索引，后续查找 O(1)"""
         index = {}
@@ -471,8 +488,9 @@ class IngestFlow:
             print(f"📝 提取文本: {len(raw_text)} 字符", flush=True)
             if not raw_text.strip():
                 print("⚠️ 警告：提取出的文本为空！PDF 可能是扫描图片（需要 OCR）或文件损坏。", flush=True)
-            chunks = chunk_text(raw_text, chunk_size=1500, overlap=200)
-            print(f"✂️ 物理切分为 {len(chunks)} 个知识块。", flush=True)
+            chunk_size, overlap = self._adaptive_chunk_params(len(raw_text))
+            chunks = chunk_text(raw_text, chunk_size=chunk_size, overlap=overlap)
+            print(f"✂️ 自适应切片: chunk_size={chunk_size}, overlap={overlap} → {len(chunks)} 个知识块", flush=True)
         elif path.exists() and path.is_dir():
             # ── 目录模式：遍历所有文件，合并文本后切块 ──
             SUPPORTED_EXT = {".pdf", ".docx", ".md", ".txt"}
@@ -493,12 +511,14 @@ class IngestFlow:
                 chunks = []
             else:
                 print(f"📚 共读取 {file_count} 个文件 ({len(all_text)} 字符)")
-                chunks = chunk_text(all_text, chunk_size=1500, overlap=200)
-                print(f"✂️ 物理切分为 {len(chunks)} 个知识块。")
+                chunk_size, overlap = self._adaptive_chunk_params(len(all_text))
+                chunks = chunk_text(all_text, chunk_size=chunk_size, overlap=overlap)
+                print(f"✂️ 自适应切片: chunk_size={chunk_size}, overlap={overlap} → {len(chunks)} 个知识块")
         else:
             # 兜底：把 input_source 当原始文本
-            chunks = chunk_text(input_source, chunk_size=1500, overlap=200)
-            print(f"✂️ 原始文本切分为 {len(chunks)} 个知识块。")
+            chunk_size, overlap = self._adaptive_chunk_params(len(input_source))
+            chunks = chunk_text(input_source, chunk_size=chunk_size, overlap=overlap)
+            print(f"✂️ 自适应切片: chunk_size={chunk_size}, overlap={overlap} → {len(chunks)} 个知识块")
 
         # ==========================================
         # 🧬 PHASE 0: Schema 领域嗅探（可插拔）
@@ -529,8 +549,9 @@ class IngestFlow:
         print("⚡ [Phase 1: MAP] 启动侦察兵并发提取 (释放全部线程)...")
 
         map_results = []
-        # 使用 12 个并发线程进行提取
-        with ThreadPoolExecutor(max_workers=12) as executor:
+        max_map_workers = min(len(chunks), 6) if chunks else 1
+        print(f"  🔧 MAP 线程池: {max_map_workers} workers")
+        with ThreadPoolExecutor(max_workers=max_map_workers) as executor:
             futures = {executor.submit(self._map_extract, chunk, i + 1): i for i, chunk in enumerate(chunks)}
 
             for future in as_completed(futures):

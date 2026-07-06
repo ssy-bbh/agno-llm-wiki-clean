@@ -1398,7 +1398,7 @@ async def upload_batch_endpoint(
     if ".." in workspace or "/" in workspace or "\\" in workspace:
         raise HTTPException(status_code=400, detail="沙箱名包含非法字符")
     # 允许中文、英文、数字、下划线、连字符、空格
-    if not re.match(r'^[\w\u4e00-\u9fa5\s\-]+$', workspace):
+    if not re.match(r'^[\w\u4e00-\u9fa5\s\-.]+$', workspace):
         raise HTTPException(status_code=400, detail=f"沙箱名 '{workspace}' 包含特殊字符，只允许中英文、数字、下划线、连字符和空格")
 
     # 文件名校验：清理危险字符
