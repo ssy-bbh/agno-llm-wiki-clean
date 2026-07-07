@@ -254,6 +254,17 @@ class IngestFlow:
                 return 0, chunk, None, "resume-skip"
             print(f"  [Map 线程 {chunk_id}] 🕵️‍♂️ 提取中...")
             analysis_result = self.analyst.analyze(chunk)
+            # ── entries 回退：LLM 有时把概念全放进 entries 而留空 new_concepts ──
+            if not analysis_result.get("new_concepts") and analysis_result.get("entries"):
+                fallback_names = []
+                for e in analysis_result["entries"]:
+                    name = e.get("name") if isinstance(e, dict) else getattr(e, "name", None)
+                    imp = e.get("importance") if isinstance(e, dict) else getattr(e, "importance", "")
+                    if name and imp != "可忽略":
+                        fallback_names.append(name)
+                if fallback_names:
+                    analysis_result["new_concepts"] = fallback_names
+                    print(f"  -> 🔄 线程 {chunk_id} entries 回退: {len(fallback_names)} 个概念", flush=True)
             if not analysis_result.get("new_concepts"):
                 print(f"  -> ⚠️ 线程 {chunk_id} 无核心概念（摘要: {analysis_result.get('summary', '')[:50]}）")
                 return chunk_id, chunk, None, "无核心概念"
