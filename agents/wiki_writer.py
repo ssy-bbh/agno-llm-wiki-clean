@@ -73,6 +73,18 @@ class WikiWriter:
                 perfect_raw_file = f"concepts/{safe_title}.md"
                 perfect_target_path = _resolve(perfect_raw_file)
 
+                # 🚫 垃圾文件名拦截（防止 LLM 幻觉生成无意义概念）
+                GARBAGE_PATTERNS = [
+                    '无法执行', '不能执行', '抱歉', '对不起', 'i cannot', 'i can\'t',
+                    '作为ai', '作为 ai', 'as an ai', 'create', 'edit', 'delete',
+                ]
+                title_lower = safe_title.lower().strip()
+                if len(title_lower) < 2 or any(p in title_lower for p in GARBAGE_PATTERNS):
+                    msg = f"  -> 🚫 拦截垃圾文件名：[{safe_title}] 疑似 LLM 幻觉，已丢弃。"
+                    print(msg)
+                    results.append(msg)
+                    continue
+
                 # 🛡️ 物理拦截雷达启动（统一存储接口，消除 MinIO/Local 分支）
                 s = get_storage()
                 ctx = get_context()
@@ -125,10 +137,20 @@ class WikiWriter:
                                 break
 
                 if not _edit_found:
-                    msg = f"  -> ❌ 严格模式拦截：找不到编辑目标 ({raw_file})，已丢弃动作。"
-                    print(msg)
-                    results.append(msg)
-                    continue
+                    # 🔄 降级为创建：编辑目标不存在（可能是续传场景，首次 reduce 被终止导致文件未创建）
+                    _fallback_title = raw_file.replace("concepts/", "").replace(".md", "").strip()
+                    _fallback_content = (action.get("content") or "").replace("\\n", "\n")
+                    if _fallback_title and _fallback_content:
+                        print(f"  -> 🔄 编辑目标不存在，降级为创建：[{_fallback_title}]")
+                        res = create_page(raw_file, _fallback_title, action.get("tags", []), action.get("abstract", ""), _fallback_content)
+                        print(f"  -> {res}")
+                        results.append(res)
+                        continue
+                    else:
+                        msg = f"  -> ❌ 严格模式拦截：找不到编辑目标 ({raw_file})，且无足够内容降级创建，已丢弃动作。"
+                        print(msg)
+                        results.append(msg)
+                        continue
 
                 res = str_replace(raw_file, (action.get("old_str") or "").replace("\\n", "\n"), (action.get("content") or "").replace("\\n", "\n"))
                 print(f"  -> {res}")

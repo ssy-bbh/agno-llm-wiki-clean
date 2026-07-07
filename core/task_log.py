@@ -263,6 +263,10 @@ class _TeeWriter(io.TextIOBase):
     def _update_progress(self, line: str):
         """Parse a stdout line and update structured progress if it matches a pattern."""
 
+        # ── Generation check: stale thread must not overwrite progress ──
+        if self._gen is not None and self._gen_fn and self._gen_fn() != self._gen:
+            return  # Old thread superseded (terminate + new resume), skip all updates
+
         # ── File-level progress: [1/3] 提取: xxx.pdf -> workspace ──
         m = self._RE_FILE_PROGRESS.search(line)
         if m:
