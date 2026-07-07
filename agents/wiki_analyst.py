@@ -79,6 +79,7 @@ class WikiAnalyst:
             print(f"\n⏰ [WikiAnalyst] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此块")
             pool.shutdown(wait=False, cancel_futures=True)  # 不等待，让后台自行结束
             return {"new_concepts": [], "summary": "(LLM 超时，未提取)"}
+        pool.shutdown(wait=False)
 
         if isinstance(response.content, str):
             print("\n🚨 Pydantic 解析失败！原始字符串是：\n", response.content)

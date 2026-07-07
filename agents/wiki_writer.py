@@ -96,6 +96,7 @@ class WikiWriter:
                 safe_title = title.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
 
                 # 🏛️ Canonical Registry 验证 + 翻译变体智能查找
+                _title_norm = _normalize(title)
                 registry_match = _find_registry_match(title)
                 s = get_storage()
                 ctx = get_context()
@@ -107,8 +108,8 @@ class WikiWriter:
                     print(msg)
                     results.append(msg)
                     continue
-                elif registry_match != title:
-                    # 找到了翻译变体/同义词 → 追加到已有页面
+                elif canonical_registry and _title_norm not in canonical_registry:
+                    # normalized 不是精确 key，但模糊命中了 → 翻译变体 → 追加到已有页面
                     _existing_stem = registry_match.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
                     _existing_key = None
                     for _k in s.list_keys(concepts_prefix):
@@ -176,17 +177,19 @@ class WikiWriter:
                     _e_target_stem = raw_file.replace("concepts/", "").replace(".md", "")
 
                     # 🏛️ Canonical Registry 验证 + 翻译变体查找
+                    _e_norm = _normalize(_e_target_stem)
                     _e_registry_match = _find_registry_match(_e_target_stem)
                     if not _e_registry_match:
                         msg = f"  -> 🏛️ 拒绝编辑：[{_e_target_stem}] 不在 Canonical Registry 中"
                         print(msg)
                         results.append(msg)
                         continue
-                    elif _e_registry_match != _e_target_stem:
-                        # 翻译变体 → 重定向到注册表中的正确名字
-                        _e_target_stem = _e_registry_match
-                        raw_file = f"concepts/{_e_target_stem}.md"
-                        print(f"  -> 🔄 编辑重定向：[{_e_target_stem}] → [{_e_registry_match}]")
+                    elif canonical_registry and _e_norm not in canonical_registry:
+                        # 模糊命中（翻译变体）→ 重定向到注册表中的正确名字
+                        _e_canonical = _e_registry_match.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+                        raw_file = f"concepts/{_e_canonical}.md"
+                        _e_target_stem = _e_canonical
+                        print(f"  -> 🔄 编辑重定向：[{_e_target_stem}] → [{_e_canonical}]")
 
                     for _e_k in _e_keys:
                         if _e_k.endswith(".md"):
