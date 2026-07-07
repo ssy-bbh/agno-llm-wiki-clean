@@ -20,19 +20,47 @@ class WikiWriter:
             return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
 
         def _is_same_concept(name1, name2):
-            """Canonical Registry 时代的精确匹配
-            
-            Editor 已被约束为只输出注册表内的名字，
-            Writer 只需做 normalized 精确比较，不再需要模糊匹配。
-            """
+            """精确匹配（Canonical Registry 约束下的主力）"""
             return _normalize(name1) == _normalize(name2)
 
-        def _in_registry(name: str) -> bool:
-            """检查概念名是否在 Canonical Registry 中"""
+        def _find_registry_match(name: str) -> str | None:
+            """查找概念名在注册表中的对应条目（用于翻译变体/同义词）
+            
+            策略：
+            1. 精确 normalized 匹配
+            2. 括号双语解构（如 "LOGOS (框架)" → 匹配 "logos"）
+            3. 模糊包含（仅当一方长度 >3 且完全包含另一方时）
+            """
             if not canonical_registry:
-                return True  # 无注册表时不做拦截（兑容旧调用）
+                return None
+            
             norm = _normalize(name)
-            return norm in canonical_registry
+            
+            # 1. 精确命中
+            if norm in canonical_registry:
+                return canonical_registry[norm]
+            
+            # 2. 括号双语解构
+            match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', name)
+            if match:
+                part1 = _normalize(match.group(1))
+                part2 = _normalize(match.group(2))
+                for reg_norm, reg_display in canonical_registry.items():
+                    if reg_norm == part1 or reg_norm == part2:
+                        return reg_display
+            
+            # 3. 模糊包含（谨慎使用，仅当长度差距合理时）
+            if len(norm) > 3:
+                for reg_norm, reg_display in canonical_registry.items():
+                    if len(reg_norm) > 3:
+                        # 双向包含检查
+                        if norm in reg_norm or reg_norm in norm:
+                            # 防止过度匹配：长度比不超过 1.5x
+                            ratio = max(len(norm), len(reg_norm)) / min(len(norm), len(reg_norm))
+                            if ratio <= 1.5:
+                                return reg_display
+            
+            return None
 
         for action in actions:
             act_type = action.get("type")
@@ -67,12 +95,34 @@ class WikiWriter:
                     title = target_path.stem
                 safe_title = title.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
 
-                # 🏛️ Canonical Registry 验证：不在注册表里的概念名 → 拒绝建页
-                if not _in_registry(title):
+                # 🏛️ Canonical Registry 验证 + 翻译变体智能查找
+                registry_match = _find_registry_match(title)
+                s = get_storage()
+                ctx = get_context()
+                concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
+                
+                if not registry_match:
+                    # 不在注册表中，也没有模糊匹配 → 拒绝建页
                     msg = f"  -> 🏛️ 拒绝创建：[{title}] 不在 Canonical Registry 中（防止 LLM 发明子概念页面）"
                     print(msg)
                     results.append(msg)
                     continue
+                elif registry_match != title:
+                    # 找到了翻译变体/同义词 → 追加到已有页面
+                    _existing_stem = registry_match.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+                    _existing_key = None
+                    for _k in s.list_keys(concepts_prefix):
+                        if _k.endswith(".md") and _k.split("/")[-1].replace(".md", "") == _existing_stem:
+                            _existing_key = _k
+                            break
+                    
+                    if _existing_key:
+                        print(f"  -> 🔄 翻译变体识别：[{title}] → 追加到 [{_existing_stem}]")
+                        safe_new_content = action.get("content", "").replace("\\n", "\n")
+                        updated_content = s.read_text(_existing_key) + f"\n\n---\n### 🧠 增量融合视角 ({title})\n{safe_new_content}\n"
+                        s.write_text(_existing_key, updated_content)
+                        results.append(f"成功合并至: {_existing_stem}")
+                        continue
 
                 # 🛡️ 拦截：禁止在 concepts/ 里创建 index.md（那是根目录的导航地图）
                 if raw_file.endswith("concepts/index.md") or safe_title.lower() == "index":
@@ -86,9 +136,6 @@ class WikiWriter:
                 perfect_target_path = _resolve(perfect_raw_file)
 
                 # 🛡️ 物理拦截雷达启动（统一存储接口，消除 MinIO/Local 分支）
-                s = get_storage()
-                ctx = get_context()
-                concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
                 found_existing_key = None
                 all_concept_keys = s.list_keys(concepts_prefix)
                 for _w_k in all_concept_keys:
@@ -128,12 +175,18 @@ class WikiWriter:
                     _e_keys = s.list_keys(concepts_prefix)
                     _e_target_stem = raw_file.replace("concepts/", "").replace(".md", "")
 
-                    # 🏛️ Canonical Registry 验证：不在注册表里的概念名 → 拒绝编辑
-                    if not _in_registry(_e_target_stem):
+                    # 🏛️ Canonical Registry 验证 + 翻译变体查找
+                    _e_registry_match = _find_registry_match(_e_target_stem)
+                    if not _e_registry_match:
                         msg = f"  -> 🏛️ 拒绝编辑：[{_e_target_stem}] 不在 Canonical Registry 中"
                         print(msg)
                         results.append(msg)
                         continue
+                    elif _e_registry_match != _e_target_stem:
+                        # 翻译变体 → 重定向到注册表中的正确名字
+                        _e_target_stem = _e_registry_match
+                        raw_file = f"concepts/{_e_target_stem}.md"
+                        print(f"  -> 🔄 编辑重定向：[{_e_target_stem}] → [{_e_registry_match}]")
 
                     for _e_k in _e_keys:
                         if _e_k.endswith(".md"):
