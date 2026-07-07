@@ -183,8 +183,9 @@ class WikiEditor:
             user_prompt += f"""
         ---
         🎯 【当前融合目标】: {target_concept}
-        你正在处理这一个概念的融合任务。你只能为这个概念生成 create/edit actions。
+        你正在处理这一个概念的融合任务。你只能为这个概念生成 create/edit/append_link actions。
         ⚠️ 绝对禁止为其他概念创建新页面！资料中涉及的其他概念内容，作为当前概念的正文写入。
+        ✅ 但你仍然必须为该概念生成 append_link action，将其分类追加到 index.md 导航地图中。
         """
 
         # 🏛️ Canonical Registry 约束：Editor 只能用注册表里的名字
