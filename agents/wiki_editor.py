@@ -162,7 +162,8 @@ class WikiEditor:
         return response.content.model_dump()
 
     def merge(self, raw_text: str, analyst_summary: str, existing_context: str,
-              entries: list = None, conflicts: list = None, gaps: list = None) -> dict:
+              entries: list = None, conflicts: list = None, gaps: list = None,
+              canonical_names: list = None) -> dict:
         print("\n[WikiEditor] 🧠 主编正在比对新旧知识，生成精准融合指令...")
 
         user_prompt = f"""
@@ -175,7 +176,24 @@ class WikiEditor:
         ---
         【本地已有文件内容】(供查重、对比和提取 old_str 参考):
         {existing_context}
+        """
 
+        # 🏛️ Canonical Registry 约束：Editor 只能用注册表里的名字
+        if canonical_names:
+            names_list = '\n'.join(f'  - {n}' for n in canonical_names)
+            user_prompt += f"""
+        ---
+        🏛️ 【合法概念注册表】（最高优先级约束）:
+        以下是本批次所有合法概念名称，你只能对这些名字做 create 或 edit：
+        {names_list}
+
+        ⚠️ 强制规则：
+        - 每个 create/edit action 的 file 和 title 必须与上表中的某个名字 EXACT 匹配
+        - 禁止自行发明注册表中不存在的概念名（包括子概念、翻译变体、缩写等）
+        - 如果资料涉及注册表外的概念，作为当前概念的正文内容写入，不要单独建页
+        """
+
+        user_prompt += """
         请严格按 JSON 格式输出 actions。如果找不到原文字符串，绝对不要编造 old_str！
         """
 

@@ -95,6 +95,41 @@ class IngestFlow:
         self._concept_index = index
         print(f"  📇 概念索引已构建: {len(index)} 个文件")
 
+    def _build_canonical_registry(self, concept_payloads: dict) -> dict:
+        """🏛️ Canonical Registry：本批次所有合法概念名的权威全集
+
+        来源：
+        1. SHUFFLE 产出的概念（display_name + aliases）
+        2. KB 已有文件（file stem）
+
+        Editor 只能对这些名字做 create/edit，不允许自行发明新名字。
+        Writer 用此注册表做精确验证，彻底消除字符串模糊匹配的不确定性。
+
+        Returns:
+            dict: {normalized_name: canonical_display_name}
+        """
+        registry = {}
+
+        # 1. 当前批次的所有概念（display_name + aliases）
+        for norm_key, payload in concept_payloads.items():
+            display = payload["display_name"]
+            registry[self._normalize_name(display)] = display
+            for alias in payload.get("aliases", set()):
+                norm_alias = self._normalize_name(alias)
+                if norm_alias:
+                    registry[norm_alias] = display
+
+        # 2. KB 已有文件
+        for norm_name, file_ref in self._concept_index.items():
+            if norm_name not in registry:
+                if isinstance(file_ref, Path):
+                    registry[norm_name] = file_ref.stem
+                else:  # MinIO key string
+                    registry[norm_name] = file_ref.split("/")[-1].replace(".md", "")
+
+        print(f"  🏛️ Canonical Registry: {len(registry)} 个合法名称")
+        return registry
+
     def _find_existing_file(self, concept: str) -> Path:
         """同义词嗅探器：基于预构建索引 O(1) 查找，回退模糊匹配"""
         norm_c = self._normalize_name(concept)
@@ -691,6 +726,9 @@ class IngestFlow:
         # 🔧 P0-1: 预构建概念索引（O(N) 一次性扫描，后续查找 O(1)）
         self._build_concept_index()
 
+        # 🏛️ 构建 Canonical Registry（SHUFFLE 概念 + KB 已有文件 = 权威全集）
+        self._canonical_registry = self._build_canonical_registry(concept_payloads)
+
         # 🔧 P0-2: 清空缓存（新批次，防止旧数据干扰）
         self._file_cache.clear()
         self._context_cache.clear()
@@ -750,6 +788,7 @@ class IngestFlow:
                     entries=_merge_entries,
                     conflicts=_merge_conflicts,
                     gaps=_merge_gaps,
+                    canonical_names=list(self._canonical_registry.values()),
                 )
             # 硬超时：单个概念融合最多 MERGE_HARD_TIMEOUT 秒（含 Editor 内部重试）
             MERGE_HARD_TIMEOUT = 480
@@ -780,7 +819,7 @@ class IngestFlow:
                 report = merge_future.result()
 
                 if report and report.get("actions"):
-                    self.writer.execute(report)
+                    self.writer.execute(report, canonical_registry=self._canonical_registry)
                     # OKF: 记录操作摘要供 log.md 使用
                     if schema_enabled():
                         for act in report["actions"]:

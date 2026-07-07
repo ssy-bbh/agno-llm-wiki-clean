@@ -7,7 +7,7 @@ from core.storage import get_storage
 from core.path_resolver import minio_wiki_prefix, minio_concepts_prefix
 
 class WikiWriter:
-    def execute(self, report: dict) -> list[str]:
+    def execute(self, report: dict, canonical_registry: dict = None) -> list[str]:
         print("\n[WikiWriter] 拿到分析报告，开始物理写盘...")
         actions = report.get("actions", [])
         results = []
@@ -15,47 +15,24 @@ class WikiWriter:
         # 🔄 循环检测：防止重复执行相同的操作
         seen_actions = set()
 
+        def _normalize(text: str) -> str:
+            """与 IngestFlow._normalize_name 保持一致"""
+            return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
+
         def _is_same_concept(name1, name2):
-            """加强版防撞雷达：防止子概念被父概念吞掉
+            """Canonical Registry 时代的精确匹配
             
-            规则：
-            1. 完全同名（normalized）→ 同一概念
-            2. ≥2 个别名重叠 → 同一概念（双语匹配）
-            3. 仅 1 个别名重叠 → 不是同一概念（防止 LOGOS 黑洞）
+            Editor 已被约束为只输出注册表内的名字，
+            Writer 只需做 normalized 精确比较，不再需要模糊匹配。
             """
+            return _normalize(name1) == _normalize(name2)
 
-            def _get_aliases(text: str) -> set:
-                aliases = set()
-                # 0. 先清洗 LLM 可能注入的中文动作前缀/后缀
-                cleaned = re.sub(r'^(创建|新建|生成|制作)\s*', '', text)
-                cleaned = re.sub(r'\s*(概念页面|概念页|页面|条目|笔记)\s*$', '', cleaned).strip()
-                if cleaned != text:
-                    text = cleaned
-
-                # 1. 整体纯净版
-                clean_text = text.lower().replace("-", "").replace("_", "").replace(" ", "")
-                if clean_text: aliases.add(clean_text)
-
-                # 2. 括号双语解构版
-                match = re.match(r'^(.*?)\s*[\(（](.*?)[\)）]', text)
-                if match:
-                    part1 = match.group(1).lower().replace("-", "").replace("_", "").replace(" ", "")
-                    part2 = match.group(2).lower().replace("-", "").replace("_", "").replace(" ", "")
-                    if part1: aliases.add(part1)
-                    if part2: aliases.add(part2)
-                return aliases
-
-            a1 = _get_aliases(name1)
-            a2 = _get_aliases(name2)
-            overlap = a1 & a2
-            if not overlap:
-                return False
-            if len(overlap) >= 2:
-                return True  # 双语匹配，确定是同一概念
-            # 仅 1 个别名重叠：只有完全同名才算（防止 LOGOS 吞子概念）
-            n1 = name1.lower().replace("-", "").replace("_", "").replace(" ", "")
-            n2 = name2.lower().replace("-", "").replace("_", "").replace(" ", "")
-            return n1 == n2
+        def _in_registry(name: str) -> bool:
+            """检查概念名是否在 Canonical Registry 中"""
+            if not canonical_registry:
+                return True  # 无注册表时不做拦截（兑容旧调用）
+            norm = _normalize(name)
+            return norm in canonical_registry
 
         for action in actions:
             act_type = action.get("type")
@@ -89,6 +66,13 @@ class WikiWriter:
                 if not title:
                     title = target_path.stem
                 safe_title = title.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+
+                # 🏛️ Canonical Registry 验证：不在注册表里的概念名 → 拒绝建页
+                if not _in_registry(title):
+                    msg = f"  -> 🏛️ 拒绝创建：[{title}] 不在 Canonical Registry 中（防止 LLM 发明子概念页面）"
+                    print(msg)
+                    results.append(msg)
+                    continue
 
                 # 🛡️ 拦截：禁止在 concepts/ 里创建 index.md（那是根目录的导航地图）
                 if raw_file.endswith("concepts/index.md") or safe_title.lower() == "index":
@@ -143,6 +127,14 @@ class WikiWriter:
                     concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
                     _e_keys = s.list_keys(concepts_prefix)
                     _e_target_stem = raw_file.replace("concepts/", "").replace(".md", "")
+
+                    # 🏛️ Canonical Registry 验证：不在注册表里的概念名 → 拒绝编辑
+                    if not _in_registry(_e_target_stem):
+                        msg = f"  -> 🏛️ 拒绝编辑：[{_e_target_stem}] 不在 Canonical Registry 中"
+                        print(msg)
+                        results.append(msg)
+                        continue
+
                     for _e_k in _e_keys:
                         if _e_k.endswith(".md"):
                             _e_stem = _e_k.split("/")[-1].replace(".md", "")
