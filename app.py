@@ -55,7 +55,7 @@ from core.auth import (
 )
 from core.ingest_control import (
     request_terminate, clear_terminate, is_terminate_requested,
-    get_checkpoint, clear_checkpoint, mark_terminated, save_file_checkpoint,
+    get_checkpoint, clear_checkpoint, clear_shuffle_cache, mark_terminated, save_file_checkpoint,
     load_shuffle_cache, get_pending_concepts, mark_concept_done,
 )
 from core.llm_factory import set_user_context
@@ -745,14 +745,21 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
         for entry in history:
             yield f"data: {json.dumps(entry)}\n\n"
             last_ts = max(last_ts, entry.get("timestamp", 0))
-        # 发当前进度快照
-        prog = task_log.get_progress(user_id, workspace)
-        if prog.get("phase", "idle") != "idle":
-            yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
-            last_progress_ts = prog.get("updated", 0)
+        # 发当前进度快照（仅当摄入真正在进行时才发送，防止 SSE 重连时回放残留的 done/stopping 快照）
+        cur_status_init = _read_ingest_status(user_id, workspace)
+        if cur_status_init.get("status") == "ingesting":
+            prog = task_log.get_progress(user_id, workspace)
+            if prog.get("phase", "idle") not in ("idle",):
+                yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
+                last_progress_ts = prog.get("updated", 0)
+        else:
+            # 摄入未进行中：发送 idle 状态 + 真实进度（前端需要看到 phase=done 来显示完成卡片）
+            prog = task_log.get_progress(user_id, workspace)
+            yield f"data: {json.dumps({'type': 'progress', 'status': 'idle', **prog})}\n\n"
         yield f"data: {json.dumps({'time': '', 'message': '── 实时推送中 ──', 'level': 'info'})}\n\n"
 
         try:
+            last_status = cur_status_init.get("status", "idle")
             while True:
                 await asyncio.sleep(0.5)
                 new_logs = task_log.get_logs(user_id=user_id, workspace=workspace, limit=50, since=last_ts)
@@ -763,11 +770,24 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
                         last_ts = ts
                 # 进度变化时也推送（但仅在摄入中时，避免终止后推送残留旧进度）
                 cur_status = _read_ingest_status(user_id, workspace)
+                cur_st = cur_status.get("status", "idle")
                 prog = task_log.get_progress(user_id, workspace)
                 prog_ts = prog.get("updated", 0)
-                if prog_ts > last_progress_ts and cur_status.get("status") == "ingesting":
+                if prog_ts > last_progress_ts and cur_st == "ingesting":
                     yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
                     last_progress_ts = prog_ts
+                # 状态变更时发送信号（特别是 ingesting → stopping/idle 的转换）
+                if cur_st != last_status:
+                    if cur_st == "ingesting":
+                        yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
+                        last_progress_ts = prog_ts
+                    else:
+                        # stopping / idle: 发送信号让前端知道后台已停，但保留实际进度 phase
+                        # 这样前端能看到 phase="done" 并显示完成卡片
+                        _evt = {'type': 'progress', 'status': cur_st, **prog}
+                        print(f"🔔 [SSE] status={last_status}→{cur_st} phase={prog.get('phase')} total_concepts={prog.get('total_concepts')} reduce_done={prog.get('reduce_done')}", flush=True)
+                        yield f"data: {json.dumps(_evt)}\n\n"
+                    last_status = cur_st
         except (asyncio.CancelledError, GeneratorExit):
             pass
 
@@ -1458,7 +1478,7 @@ async def upload_batch_endpoint(
         my_gen = _next_ingest_gen(user_id, workspace)
 
         def run_background_batch():
-            # 新摄入开始：清除旧的终止标记（保留检查点以支持 Resume）
+            # 新摄入开始：清除终止标记和旧检查点（新上传 = 全新开始）
             clear_terminate(user_id, workspace)
             clear_checkpoint(user_id, workspace)  # New ingest: clear old checkpoint
 
@@ -1545,13 +1565,11 @@ async def upload_batch_endpoint(
                 if _current_ingest_gen(user_id, workspace) == my_gen:
                     if terminated:
                         mark_terminated(user_id, workspace)
-                        # 终止时：重置进度为 idle（清除残留的 phase）
-                        task_log.set_progress(
-                            user_id, workspace,
-                            phase="idle", current_file=0, total_files=0,
-                            current_file_name="", total_chunks=0, map_done=0,
-                            total_concepts=0, reduce_done=0, started=0,
-                        )
+                        # 终止时：仅将 phase 改为 idle，保留进度数据（不归零）
+                        task_log.set_progress(user_id, workspace, phase="idle")
+                    else:
+                        # 正常完成：保留 done_files/done_concepts（防止重复处理），仅清除 SHUFFLE 缓存
+                        clear_shuffle_cache(user_id, workspace)
                     # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
                     _write_ingest_status(user_id, workspace, "idle", gen=my_gen)
 
@@ -1709,12 +1727,11 @@ async def resume_ingest(
                 if _current_ingest_gen(user_id, workspace) == resume_gen:
                     if terminated:
                         mark_terminated(user_id, workspace)
-                        task_log.set_progress(
-                            user_id, workspace,
-                            phase="idle", current_file=0, total_files=0,
-                            current_file_name="", total_chunks=0, map_done=0,
-                            total_concepts=0, reduce_done=0, started=0,
-                        )
+                        # 终止时：仅将 phase 改为 idle，保留进度数据（不归零）
+                        task_log.set_progress(user_id, workspace, phase="idle")
+                    else:
+                        # 正常完成：保留 done_files/done_concepts，仅清除 SHUFFLE 缓存
+                        clear_shuffle_cache(user_id, workspace)
                     _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
 
         threading.Thread(target=run_resume_batch, daemon=True).start()
@@ -1759,6 +1776,7 @@ async def resume_ingest(
         current_file_name="", total_chunks=0, map_done=0,
         total_concepts=done_concepts + pending_total_local, reduce_done=done_concepts,
         started=time.time(),
+        updated=time.time() + 99999,
     )
 
     # 启动后台线程重新处理（只处理未完成文件）
@@ -1806,13 +1824,11 @@ async def resume_ingest(
             if _current_ingest_gen(user_id, workspace) == resume_gen:
                 if terminated:
                     mark_terminated(user_id, workspace)
-                    # 终止时：重置进度为 idle（清除残留的 phase）
-                    task_log.set_progress(
-                        user_id, workspace,
-                        phase="idle", current_file=0, total_files=0,
-                        current_file_name="", total_chunks=0, map_done=0,
-                        total_concepts=0, reduce_done=0, started=0,
-                    )
+                    # 终止时：仅将 phase 改为 idle，保留进度数据（不归零）
+                    task_log.set_progress(user_id, workspace, phase="idle")
+                else:
+                    # 正常完成：保留 done_files/done_concepts，仅清除 SHUFFLE 缓存
+                    clear_shuffle_cache(user_id, workspace)
                 # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
                 _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
 
@@ -1844,7 +1860,7 @@ async def get_ingest_checkpoint(
         "pending_concepts": pending,
         "files_done": len(cp.get("files_done", [])),
         "terminated_at": cp.get("terminated_at"),
-        "has_checkpoint": done > 0 or pending > 0,
+        "has_checkpoint": pending > 0 or cp.get("terminated_at") is not None,
         "has_shuffle_cache": pending > 0,
     }
 

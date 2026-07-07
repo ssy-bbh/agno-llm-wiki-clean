@@ -826,6 +826,18 @@ class IngestFlow:
                     except FuturesTimeoutError:
                         continue
                 if terminated:
+                    # ── 优雅终止：如果当前融合已完成，先保存结果再退出 ──
+                    if merge_future.done():
+                        try:
+                            report = merge_future.result(timeout=0)
+                            if report and report.get("actions"):
+                                self.writer.execute(report)
+                                if user_id and kb_name:
+                                    mark_concept_done(user_id, kb_name, norm_c)
+                                elapsed = time.time() - t0
+                                print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)（终止前抢救完成）")
+                        except Exception as e:
+                            print(f"  -> ⚠️ [{display_name}] 终止时保存结果失败: {e}")
                     reduce_pool.shutdown(wait=False)
                     break
                 if merge_timed_out:

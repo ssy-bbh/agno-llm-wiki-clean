@@ -66,8 +66,10 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   const optimisticUntilRef = useRef(0)
   // Ref to track current ingestStatus for SSE callback (closure captures stale state)
   const ingestStatusRef = useRef('idle')
-  // Keep ref in sync with state
+  const progressRef = useRef(null)
+  // Keep refs in sync with state (for use inside setInterval closures that capture stale state)
   useEffect(() => { ingestStatusRef.current = ingestStatus }, [ingestStatus])
+  useEffect(() => { progressRef.current = progress }, [progress])
 
   // ── 切换沙箱时清空所有状态，防止跨沙箱数据串扰 ──
   const switchedRef = useRef(false)
@@ -84,6 +86,10 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     setCheckpoint(null)
     setIsForging(false)
     optimisticUntilRef.current = 0
+    doneDismissedRef.current = false  // 新沙箱允许重新展示 done 卡片
+    completedRef.current = false
+    setCompletedFlag(false)  // 新沙箱重置完成标记
+    setCompletedInfo(null)
     switchedRef.current = true  // 标记：下次 poll 是切换后的首次
   }, [selectedSandbox])
 
@@ -91,6 +97,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   useEffect(() => {
     if (!selectedSandbox) return
     let alive = true
+    let pollSeenDone = false  // 闭包局部变量：追踪是否见过 phase=done
 
     const poll = async () => {
       try {
@@ -98,48 +105,78 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         if (!alive) return
         const data = await res.json()
 
+        // 记录 phase=done（可能在某次 poll 中看到，但下次 poll 时被 idle 覆盖）
+        if (data.progress?.phase === 'done') pollSeenDone = true
+
         const curStatus = ingestStatusRef.current
 
-        // ⚠️ 切换沙箱后首次 poll：服务端说空闲就彻底重置，不管残留进度
+        // ⚠️ 切换沙箱后首次 poll：服务端说空闲就重置，但保留 phase=done 以显示完成卡片
         if (switchedRef.current) {
           switchedRef.current = false
           if (data.status !== 'ingesting') {
             setIngestStatus('idle')
-            setProgress(null)
-            setElapsed(0)
+            if (data.progress?.phase === 'done') {
+              setProgress(data.progress)  // 保留完成状态
+            } else {
+              setProgress(null)
+              setElapsed(0)
+            }
             return
           }
         }
 
-        // Stopping state: always accept idle transitions (bypass optimistic window)
+        // Stopping state: only accept idle transitions, ignore 'ingesting' from server
+        // (thread may still be running — don't let poll revert our 'stopping' UI back to 'ingesting')
         if (curStatus === 'stopping') {
           if (data.status === 'idle') {
             setIngestStatus('idle')
+            setTerminating(false)
             setProgress(null)
+            setSseKey(k => k + 1)  // 重连 SSE + checkpoint polling
+            setForgeLogs(prev => [...prev, { text: '✅ 后台任务已完全停止，检查点已保存', level: 'info' }])
           }
-          return
+          return  // 阻止其他更新（包括 'ingesting'）
         }
 
         // Don't let server overwrite optimistic status within the lock window
         if (Date.now() < optimisticUntilRef.current) return
 
-        // ⚠️ 服务端 idle 但前端仍是 ingesting → 立即清除
+        // ⚠️ 服务端 idle 但前端仍是 ingesting → 切换到 idle
         if (data.status === 'idle' && curStatus === 'ingesting') {
           setIngestStatus('idle')
-          setProgress(null)
           setTerminating(false)
-          setElapsed(0)
+          // 关键修复：保留 phase=done，防止后端 finally 块将 phase 覆写为 idle
+          // 三层防护：1) 后端返回 phase=done  2) pollSeenDone  3) progressRef 当前是 done
+          const curPhase = progressRef.current?.phase
+          if (data.progress?.phase === 'done' || pollSeenDone || curPhase === 'done') {
+            // 保留完成状态，让完成卡片能正确显示
+            if (data.progress?.phase === 'done') {
+              setProgress(data.progress)
+            }
+            // 否则保持现有 progress 不变（前端已有 phase=done）
+          } else {
+            setProgress(null)
+            setElapsed(0)
+          }
+          pollSeenDone = false  // 重置
           return
         }
 
         setIngestStatus(data.status)
         if (data.progress) {
-          setProgress(data.progress)
-          if (data.progress.started) {
-            setElapsed(Math.floor(Date.now() / 1000 - data.progress.started))
+          if (data.status === 'ingesting') {
+            // 摄入进行中：正常更新 progress
+            setProgress(data.progress)
+            if (data.progress.started != null) {
+              setElapsed(Math.floor(Date.now() / 1000 - data.progress.started))
+            }
+          } else if (data.progress.phase === 'done') {
+            // 摄入已完成：保留 phase=done，让完成卡片能正确显示
+            setProgress(data.progress)
           }
+          // 其他情况（idle + phase=idle）：不更新 progress，避免残留旧数据
         }
-        if (data.status !== 'ingesting') {
+        if (data.status !== 'ingesting' && data.progress?.phase !== 'done') {
           setElapsed(0)
         }
       } catch {}
@@ -228,12 +265,21 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
           setForgeLogs(prev => [...prev, { text: `⏳ 仍在等待后台任务结束（已等待 ${attempt * 15}s）...`, level: 'info' }])
         }
       }
+      // 超时兆底：强制解除终止锁定，避免按钮永久卡死
+      if (ingestStatusRef.current === 'stopping') {
+        setIngestStatus('idle')
+        setTerminating(false)
+        setSseKey(k => k + 1)
+        setForgeLogs(prev => [...prev, { text: '⚠️ 等待超时，已强制解除终止锁定。请刷新页面确认后台状态。', level: 'warning' }])
+      }
     })()
   }
 
-  // ── Resume ingest (simple: server is already idle when this is clickable) ──
+  // ── Resume ingest (only allowed when fully idle — not during stopping) ──
   const handleResume = async () => {
     if (!selectedSandbox || resuming) return
+    // 守卫：只有在完全停止（idle）状态才能继续，stopping/ingesting 期间禁止
+    if (ingestStatusRef.current !== 'idle') return
     setResuming(true)
     try {
       const formData = new FormData()
@@ -279,6 +325,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
 
   // ── Done card: 只在 phase 首次变为 done 时显示，3s 后自动消失 ──
   const doneShownRef = useRef(false)
+  const doneDismissedRef = useRef(false)  // 永久标记：done 卡片已展示并消失，防止 poll 重新注入
   const prevPhaseRef = useRef(null)
 
   // phase 变为 done 时标记为已展示（仅首次转换触发）
@@ -293,21 +340,38 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   // 新摄入开始或切换沙箱时重置
   useEffect(() => {
     if (ingestStatus === 'ingesting') {
+      console.log('[RESET] ingestStatus=ingesting → resetting completion state')
       doneShownRef.current = false
+      doneDismissedRef.current = false  // 新摄入允许重新展示
+      completedRef.current = false
       prevPhaseRef.current = null
+      setCompletedFlag(false)  // 新摄入重置完成标记
+      setCompletedInfo(null)
+      if (doneTimerRef.current) { clearTimeout(doneTimerRef.current); doneTimerRef.current = null }
     }
   }, [ingestStatus])
 
-  // 3s 后自动隐藏 done 卡片
+  // done 卡片不再自动隐藏，保持显示直到切换沙箱或新摄入开始
+
+  // ── 判断是否处于「已完成」状态（phase=done 后显示完成卡片，8 秒后自动消失） ──
+  const completedRef = useRef(false)
+  const [completedFlag, setCompletedFlag] = useState(false)
+  const [completedInfo, setCompletedInfo] = useState(null)  // { total_concepts, elapsed }
+  const doneTimerRef = useRef(null)
   useEffect(() => {
-    if (ingestStatus === 'idle' && progress?.phase === 'done' && doneShownRef.current) {
-      const timer = setTimeout(() => {
-        setProgress(null)
-        doneShownRef.current = false
-      }, 3000)
-      return () => clearTimeout(timer)
+    if (progress?.phase === 'done' && !completedRef.current) {
+      console.log('[COMPLETION] phase=done detected! concepts:', progress.total_concepts, 'elapsed:', elapsed)
+      completedRef.current = true
+      setCompletedInfo({ total_concepts: progress.total_concepts || 0, elapsed })
+      setCompletedFlag(true)
+      // 8 秒后自动隐藏完成卡片，让检查点卡片有机会接管
+      if (doneTimerRef.current) clearTimeout(doneTimerRef.current)
+      doneTimerRef.current = setTimeout(() => {
+        setCompletedFlag(false)
+        doneTimerRef.current = null
+      }, 8000)
     }
-  }, [ingestStatus, progress?.phase])
+  }, [progress?.phase, progress?.total_concepts, elapsed])
 
   // ── SSE: real-time log + progress events ──
   useEffect(() => {
@@ -322,6 +386,10 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
     const fullUrl = url.startsWith('http') ? url : `${window.location.origin}${url}`
     const es = new EventSource(fullUrl)
     sseRef.current = es
+    // ── 关键修复：用闭包局部变量追踪 phase=done ──
+    // React 18 批处理下 progressRef.current 可能未及时更新，
+    // 所以在 SSE handler 内用局部变量记录是否见过 phase=done
+    let seenDoneThisSession = false
 
     es.onmessage = (e) => {
       try {
@@ -341,16 +409,33 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
             }
             return  // 阻止其他进度更新
           }
+          // 记录 phase=done 事件（_RE_COMPLETE 写入的完成信号）
+          if (data.phase === 'done') {
+            seenDoneThisSession = true
+          }
           // ⚠️ 防止空闲卡住：服务端已 idle 但前端仍是 ingesting → 接受 idle 信号
+          // 关键修复：如果本轮 SSE 曾收到 phase=done，保留它！
+          // React 18 会将两个事件批处理，导致 phase=done 被 phase=idle 覆盖
           if (data.status === 'idle' && ingestStatusRef.current === 'ingesting') {
+            const newProgress = (seenDoneThisSession && data.phase !== 'done')
+              ? { ...data, phase: 'done' }  // 保留 done，防止 finally 覆盖
+              : { ...data }
+            console.log('[SSE] idle+ingesting → seenDone:', seenDoneThisSession, 'dataPhase:', data.phase, '→ final:', newProgress.phase)
             setIngestStatus('idle')
-            setProgress(null)
+            setProgress(newProgress)
             setTerminating(false)
             optimisticUntilRef.current = 0
+            seenDoneThisSession = false  // 重置
             return
           }
+          // ⚠️ 前端已 idle 时忽略非 done 的残留进度快照（SSE 重连时可能回放旧进度）
+          // 但允许 phase=done 通过（用于页面刷新后重建完成卡片）
+          if (ingestStatusRef.current === 'idle' && data.phase !== 'idle' && data.phase !== 'done') {
+            return
+          }
+          if (data.phase === 'done') console.log('[SSE] fallthrough setProgress phase=done, status:', ingestStatusRef.current)
           setProgress({ ...data })
-          if (data.started) setElapsed(Math.floor(Date.now() / 1000 - data.started))
+          if (data.started != null) setElapsed(Math.floor(Date.now() / 1000 - data.started))
           return
         }
 
@@ -382,6 +467,11 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   const uploadFiles = async (files) => {
     if (!selectedSandbox) {
       setForgeLogs(prev => [...prev, { text: "❌ 请先在左侧选择或新建一个目标沙箱！" }])
+      return
+    }
+    // 终止中/摄入中/有未完成检查点禁止上传
+    if (terminating || ingestStatusRef.current === 'stopping' || ingestStatusRef.current === 'ingesting') {
+      setForgeLogs(prev => [...prev, { text: "⏳ 当前任务进行中，请等待完成或终止后再上传" }])
       return
     }
 
@@ -511,6 +601,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
   }
 
   const isIng = ingestStatus === 'ingesting'
+  const isBusy = isIng || terminating || ingestStatus === 'stopping' || !!checkpoint?.has_checkpoint  // 摄入中/终止中/有未完成检查点均禁止操作
   const phase = progress?.phase || (isIng ? 'parsing' : 'idle')
   const phaseInfo = PHASES[phase] || PHASES.idle
   const percent = calcPercent(progress)
@@ -656,23 +747,23 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         </div>
       )}
 
-      {/* ── 完成状态卡片（有 checkpoint 时不显示，避免打架）── */}
-      {ingestStatus === 'idle' && progress?.phase === 'done' && !checkpoint?.has_checkpoint && (
+      {/* ── 完成状态卡片（全部概念融合完毕时显示）── */}
+      {ingestStatus === 'idle' && completedFlag && !terminating && (
         <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-lg p-3">
           <div className="flex items-center gap-2">
             <span className="text-lg">✅</span>
             <div className="flex-1">
               <div className="text-xs font-bold text-emerald-400">提炼完成</div>
               <div className="text-[10px] text-emerald-300/60 font-mono">
-                {progress.total_concepts} 个概念已落盘 · 耗时 {formatTime(elapsed)}
+                {completedInfo?.total_concepts ?? progress?.total_concepts ?? '?'} 个概念已落盘 · 耗时 {formatTime(completedInfo?.elapsed ?? elapsed)}
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* ── 检查点继续摄入卡片（概念级断点）── */}
-      {ingestStatus === 'idle' && checkpoint?.has_checkpoint && (
+      {/* ── 检查点继续摄入卡片（概念级断点）── 只在完全 idle 且未完成时显示 */}
+      {ingestStatus === 'idle' && !terminating && !completedFlag && checkpoint?.has_checkpoint && (
         <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-3">
           <div className="flex items-center gap-2 mb-2">
             <span className="text-lg">📌</span>
@@ -686,15 +777,15 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
           <div className="flex gap-2">
             <button
               onClick={handleResume}
-              disabled={resuming}
+              disabled={resuming || ingestStatus !== 'idle' || terminating}
               className={`flex-1 py-1.5 rounded-lg border text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-all duration-200 ${
-                resuming
+                resuming || ingestStatus !== 'idle'
                   ? 'bg-emerald-900/30 border-emerald-800/50 text-emerald-500/60 cursor-wait'
                   : 'bg-emerald-950/40 border-emerald-700/40 text-emerald-400 hover:bg-emerald-900/40 hover:border-emerald-600/60'
               }`}
             >
               {resuming ? (
-                <><span className="animate-spin">⏳</span> 等待停止中...</>
+                <><span className="animate-spin">⏳</span> 等待启动中...</>
               ) : (
                 <><span>▶</span> 继续摄入</>
               )}
@@ -735,7 +826,7 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
           dragOver
             ? 'border-cyan-400 bg-cyan-500/10 shadow-[0_0_12px_rgba(34,211,238,0.15)]'
             : 'border-slate-800 hover:border-slate-700 bg-slate-950/20'
-        } ${isIng ? 'opacity-50 pointer-events-none' : ''}`}
+        } ${isBusy ? 'opacity-50 pointer-events-none' : ''}`}
       >
         <input
           type="file"
@@ -770,9 +861,9 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
       <div className="grid grid-cols-2 gap-2">
         <button
           onClick={() => handleForgeAction('reweave')}
-          disabled={isForging || uploading || isIng}
+          disabled={isForging || uploading || isBusy}
           className={`py-2 px-2 rounded-lg border text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-all duration-200 ${
-            isForging || isIng ? 'bg-slate-900 border-slate-800 text-slate-600 cursor-wait' : 'bg-slate-800/40 border-slate-800 text-slate-300 hover:border-red-500/40 hover:text-red-400 shadow-sm'
+            isForging || isBusy ? 'bg-slate-900 border-slate-800 text-slate-600 cursor-wait' : 'bg-slate-800/40 border-slate-800 text-slate-300 hover:border-red-500/40 hover:text-red-400 shadow-sm'
           }`}
         >
           <span>🕷️</span>
@@ -780,9 +871,9 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
         </button>
         <button
           onClick={() => handleForgeAction('fill_blackhole')}
-          disabled={isForging || uploading || isIng}
+          disabled={isForging || uploading || isBusy}
           className={`py-2 px-2 rounded-lg border text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-all duration-200 ${
-            isForging || isIng ? 'bg-slate-900 border-slate-800 text-slate-600 cursor-wait' : 'bg-slate-800/40 border-slate-800 text-slate-300 hover:border-purple-500/40 hover:text-purple-400 shadow-sm'
+            isForging || isBusy ? 'bg-slate-900 border-slate-800 text-slate-600 cursor-wait' : 'bg-slate-800/40 border-slate-800 text-slate-300 hover:border-purple-500/40 hover:text-purple-400 shadow-sm'
           }`}
         >
           <span>🪄</span>

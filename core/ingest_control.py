@@ -10,6 +10,7 @@ core/ingest_control.py — 摄入流水线控制（终止 / 继续 / SHUFFLE 缓
 - resume 时直接从 pending 继续，不需要重跑 MAP+SHUFFLE
 """
 import json
+import re
 import time
 from pathlib import Path
 
@@ -144,21 +145,21 @@ def save_file_checkpoint(user_id: str, workspace: str, filename: str):
 
 
 def is_concept_done(user_id: str, workspace: str, concept_key: str) -> bool:
-    """检查某概念是否已融合"""
-    cp = _read_checkpoint(user_id, workspace)
-    return concept_key in cp.get("done_concepts", [])
+    """检查某概念是否已融合（支持归一化匹配，防止 LLM 命名不一致导致重复处理）"""
+    return _find_done_key(user_id, workspace, concept_key) is not None
 
 
 def get_pending_concepts(user_id: str, workspace: str) -> int:
-    """统计所有文件中待处理的概念总数"""
+    """统计所有文件中待处理的概念总数（支持归一化匹配）"""
     cache = load_shuffle_cache(user_id, workspace)
     if not cache:
         return 0
-    done = set(_read_checkpoint(user_id, workspace).get("done_concepts", []))
+    done_raw = _read_checkpoint(user_id, workspace).get("done_concepts", [])
+    done_norm = {_normalize_key(k) for k in done_raw}
     total = 0
     for payloads in cache.values():
         for k in payloads:
-            if k not in done:
+            if _normalize_key(k) not in done_norm:
                 total += 1
     return total
 
@@ -173,6 +174,50 @@ def clear_checkpoint(user_id: str, workspace: str):
     cp = _checkpoint_path(user_id, workspace)
     if cp.exists():
         cp.unlink()
+
+
+def clear_shuffle_cache(user_id: str, workspace: str):
+    """清除 SHUFFLE 缓存（concept_payloads），保留 done_files 和 done_concepts。
+    用于摄入完成后清理，防止下次 SHUFFLE 使用旧缓存，同时保留已完成记录。
+    """
+    cp_path = _checkpoint_path(user_id, workspace)
+    if not cp_path.exists():
+        return
+    cp = _read_checkpoint(user_id, workspace)
+    cp["concept_payloads"] = {}
+    cp["terminated_at"] = None
+    cp_path.write_text(json.dumps(cp, ensure_ascii=False), encoding="utf-8")
+
+
+# ── 概念名称归一化（防止 LLM 命名不一致导致重复） ──
+
+def _normalize_key(key: str) -> str:
+    """归一化概念 key：去空格、统一括号、转小写。
+    例：'LoRA（低秩适配）' 和 'LoRA (低秩适配)' 归一化后相同。
+    """
+    if not key:
+        return key
+    s = key.strip().lower()
+    # 全角括号 → 半角
+    s = s.replace('\uff08', '(').replace('\uff09', ')')
+    # 去掉括号内的空格
+    s = re.sub(r'\(\s*', '(', s)
+    s = re.sub(r'\s*\)', ')', s)
+    # 去掉所有空格
+    s = re.sub(r'\s+', '', s)
+    return s
+
+
+def _find_done_key(user_id: str, workspace: str, concept_key: str) -> str | None:
+    """在 done_concepts 中查找与 concept_key 归一化匹配的已存储 key。
+    返回已存储的原始 key（用于保持命名一致性），未找到返回 None。
+    """
+    cp = _read_checkpoint(user_id, workspace)
+    norm = _normalize_key(concept_key)
+    for stored_key in cp.get("done_concepts", []):
+        if _normalize_key(stored_key) == norm:
+            return stored_key
+    return None
 
 
 def mark_terminated(user_id: str, workspace: str):
