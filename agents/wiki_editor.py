@@ -216,14 +216,16 @@ class WikiEditor:
 """
                 print(f"  🔄 [WikiEditor] 第 {attempt+1} 次尝试（追加格式修正提示）...")
 
-            # 超时保护：防止单个概念融合卡住导致整个流水线停滞
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(self.agent.run, prompt)
-                try:
-                    response = future.result(timeout=LLM_TIMEOUT_SECONDS)
-                except FuturesTimeoutError:
-                    print(f"\n⏰ [WikiEditor] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此概念")
-                    return {"actions": []}
+            # 超时保护：不用 with 语句（with 退出时会 shutdown(wait=True) 卡死）
+            pool = ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(self.agent.run, prompt)
+            try:
+                response = future.result(timeout=LLM_TIMEOUT_SECONDS)
+            except FuturesTimeoutError:
+                print(f"\n⏰ [WikiEditor] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此概念")
+                pool.shutdown(wait=False, cancel_futures=True)
+                return {"actions": []}
+            pool.shutdown(wait=False)
 
             result = self._parse_response(response)
             if result is not None:

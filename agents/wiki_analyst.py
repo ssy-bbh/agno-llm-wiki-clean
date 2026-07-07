@@ -69,13 +69,16 @@ class WikiAnalyst:
         请提取核心概念并生成摘要。
         """
         # 超时保护：防止 LLM 卡住导致整个流水线停滞
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(self.agent.run, user_prompt)
-            try:
-                response = future.result(timeout=LLM_TIMEOUT_SECONDS)
-            except FuturesTimeoutError:
-                print(f"\n⏰ [WikiAnalyst] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此块")
-                return {"new_concepts": [], "summary": "(LLM 超时，未提取)"}
+        # ⚠️ 不用 with 语句，因为 with 退出时会 shutdown(wait=True)
+        # 即使 timeout 了也会等底层 HTTP 请求真正结束，卡死后续线程
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(self.agent.run, user_prompt)
+        try:
+            response = future.result(timeout=LLM_TIMEOUT_SECONDS)
+        except FuturesTimeoutError:
+            print(f"\n⏰ [WikiAnalyst] LLM 调用超时 ({LLM_TIMEOUT_SECONDS}s)，跳过此块")
+            pool.shutdown(wait=False, cancel_futures=True)  # 不等待，让后台自行结束
+            return {"new_concepts": [], "summary": "(LLM 超时，未提取)"}
 
         if isinstance(response.content, str):
             print("\n🚨 Pydantic 解析失败！原始字符串是：\n", response.content)

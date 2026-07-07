@@ -300,9 +300,15 @@ class IngestFlow:
                 stream=False,
             )
             from concurrent.futures import ThreadPoolExecutor, TimeoutError
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(agent.run, prompt)
+            pool = ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(agent.run, prompt)
+            try:
                 response = future.result(timeout=30)
+            except FuturesTimeoutError:
+                print("  ⏰ [Schema] Phase 0 超时，跳过")
+                pool.shutdown(wait=False, cancel_futures=True)
+                return ""
+            pool.shutdown(wait=False)
 
             schema_text = response.content if hasattr(response, 'content') else str(response)
             if schema_text and len(schema_text) > 100:
@@ -392,9 +398,15 @@ class IngestFlow:
                 stream=False,
             )
             from concurrent.futures import ThreadPoolExecutor, TimeoutError
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(agent.run, prompt)
+            pool = ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(agent.run, prompt)
+            try:
                 response = future.result(timeout=30)
+            except FuturesTimeoutError:
+                print("  ⏰ [Schema] 建议生成超时，跳过")
+                pool.shutdown(wait=False, cancel_futures=True)
+                return
+            pool.shutdown(wait=False)
 
             result = response.content if hasattr(response, 'content') else str(response)
             if "NO_NEW_SUGGESTIONS" in result:
@@ -589,25 +601,13 @@ class IngestFlow:
 
         map_results = []
         max_map_workers = min(len(chunks), 6) if chunks else 1
-        # 全局超时 = chunks 数量 × 每个平均耗时上限，最少 120s
-        MAP_GLOBAL_TIMEOUT = max(120, len(chunks) * 40)
-        MAP_CHUNK_TIMEOUT = 200  # 外层硬超时（略大于 analyst 内部 180s）
-        print(f"  🔧 MAP 线程池: {max_map_workers} workers, 全局超时 {MAP_GLOBAL_TIMEOUT}s")
-        map_start = time.time()
+        print(f"  🔧 MAP 线程池: {max_map_workers} workers")
         with ThreadPoolExecutor(max_workers=max_map_workers) as executor:
             futures = {executor.submit(self._map_extract, chunk, i + 1): i for i, chunk in enumerate(chunks)}
-            remaining_timeout = MAP_GLOBAL_TIMEOUT
 
             for future in as_completed(futures):
-                elapsed = time.time() - map_start
-                remaining_timeout = MAP_GLOBAL_TIMEOUT - elapsed
-                if remaining_timeout <= 0:
-                    cancelled = sum(1 for f in futures if not f.done())
-                    print(f"  ⏰ MAP 全局超时 ({MAP_GLOBAL_TIMEOUT}s)，跳过剩余 {cancelled} 块")
-                    break
-
                 try:
-                    cid, chunk_text_val, res, status = future.result(timeout=min(MAP_CHUNK_TIMEOUT, remaining_timeout))
+                    cid, chunk_text_val, res, status = future.result(timeout=210)
                 except FuturesTimeoutError:
                     cid = futures.get(future, "?")
                     print(f"  ⏰ 线程 {cid} 外层超时，跳过")
