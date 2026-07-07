@@ -589,14 +589,31 @@ class IngestFlow:
 
         map_results = []
         max_map_workers = min(len(chunks), 6) if chunks else 1
-        print(f"  🔧 MAP 线程池: {max_map_workers} workers")
+        # 全局超时 = chunks 数量 × 每个平均耗时上限，最少 120s
+        MAP_GLOBAL_TIMEOUT = max(120, len(chunks) * 40)
+        MAP_CHUNK_TIMEOUT = 200  # 外层硬超时（略大于 analyst 内部 180s）
+        print(f"  🔧 MAP 线程池: {max_map_workers} workers, 全局超时 {MAP_GLOBAL_TIMEOUT}s")
+        map_start = time.time()
         with ThreadPoolExecutor(max_workers=max_map_workers) as executor:
             futures = {executor.submit(self._map_extract, chunk, i + 1): i for i, chunk in enumerate(chunks)}
+            remaining_timeout = MAP_GLOBAL_TIMEOUT
 
             for future in as_completed(futures):
-                cid, chunk_text_val, res, status = future.result()
+                elapsed = time.time() - map_start
+                remaining_timeout = MAP_GLOBAL_TIMEOUT - elapsed
+                if remaining_timeout <= 0:
+                    cancelled = sum(1 for f in futures if not f.done())
+                    print(f"  ⏰ MAP 全局超时 ({MAP_GLOBAL_TIMEOUT}s)，跳过剩余 {cancelled} 块")
+                    break
+
+                try:
+                    cid, chunk_text_val, res, status = future.result(timeout=min(MAP_CHUNK_TIMEOUT, remaining_timeout))
+                except FuturesTimeoutError:
+                    cid = futures.get(future, "?")
+                    print(f"  ⏰ 线程 {cid} 外层超时，跳过")
+                    continue
+
                 if res:
-                    # 进入临界区，安全写入内存
                     with map_lock:
                         map_results.append((chunk_text_val, res))
                     print(f"  -> ✅ 线程 {cid} 提取完毕: {res.get('new_concepts')}")
