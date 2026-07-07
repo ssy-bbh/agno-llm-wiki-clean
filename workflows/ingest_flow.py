@@ -436,6 +436,178 @@ class IngestFlow:
         except Exception as e:
             print(f"  ⚠️ [Schema] 建议生成失败（不影响主流程）: {e}")
 
+    def _categorize_into_index(self, concept_name: str, user_id: str, kb_name: str):
+        """系统级 index.md 分类保障：基于关键词匹配将概念归入最佳分类。
+        
+        不依赖 LLM 的 append_link 动作。幂等：已在 index 中的概念自动跳过。
+        保留分类结构（### headers），支持渐进式披露。
+        """
+        _ZH_STOP = {'的','和','与','或','在','是','了','不','有','也','就','都','而','及',
+                    '对','以','到','等','为','被','把','从','向','让','给','着','过','个'}
+        _EN_STOP = {'the','a','an','is','are','was','were','be','been','and','or','but','in',
+                    'on','at','to','for','of','with','by','as','it','its','this','that','from'}
+        
+        def _kw(text: str) -> set:
+            """提取关键词（中文按字、英文按词）"""
+            text = re.sub(r'[\(（].*?[\)）]', '', text)  # 去括号
+            words = set()
+            for w in re.findall(r'[a-zA-Z]{3,}|[\u4e00-\u9fa5]', text):
+                wl = w.lower()
+                if wl not in _ZH_STOP and wl not in _EN_STOP and len(wl) >= 2:
+                    words.add(wl)
+            return words
+        
+        try:
+            s = get_storage()
+            if USE_MINIO:
+                from core.path_resolver import minio_index_key, minio_concepts_prefix
+                idx_key = minio_index_key(user_id, kb_name)
+                if not s.exists(idx_key):
+                    return
+                index_content = s.read_text(idx_key)
+                prefix = minio_concepts_prefix(user_id, kb_name)
+                concept_keys = s.list_keys(prefix)
+            else:
+                from tools.edit_tools import _resolve
+                idx_path = _resolve("index.md")
+                if not idx_path.exists():
+                    return
+                index_content = idx_path.read_text(encoding="utf-8")
+                concepts_dir = _resolve("concepts")
+                concept_keys = [f for f in concepts_dir.glob("*.md")] if concepts_dir.exists() else []
+            
+            # ── 幂等检查：已在 index 中则跳过 ──
+            norm_concept = self._normalize_name(concept_name)
+            existing_links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', index_content)
+            for link in existing_links:
+                if self._normalize_name(link) == norm_concept:
+                    return  # 已在 index 中
+            
+            # ── 从概念文件提取关键词 ──
+            concept_keywords = _kw(concept_name)
+            for ck in concept_keys:
+                if USE_MINIO:
+                    stem = ck.split("/")[-1].replace(".md", "")
+                else:
+                    stem = ck.stem
+                if self._normalize_name(stem) == norm_concept:
+                    content = s.read_text(ck) if USE_MINIO else ck.read_text(encoding="utf-8")
+                    abstract = self._extract_abstract(content)
+                    concept_keywords |= _kw(abstract)
+                    # 从 tags 提取
+                    tags_match = re.search(r'Tags?:\*\*\s*(.+)', content)
+                    if tags_match:
+                        concept_keywords |= _kw(tags_match.group(1))
+                    break
+            
+            if not concept_keywords:
+                return
+            
+            # ── 解析 index.md 分类结构 ──
+            lines = index_content.split('\n')
+            categories = []  # [(header_text, keywords, line_index)]
+            for i, line in enumerate(lines):
+                m = re.match(r'^(#{2,4})\s+(.+)$', line.strip())
+                if m:
+                    header = m.group(2).strip()
+                    # 跳过导航标题和 MOC
+                    if '导航' in header or '知识地图' in header or header.endswith('MOC'):
+                        continue
+                    categories.append((header, _kw(header), i))
+            
+            # ── 关键词 overlap 打分 ──
+            best_cat = None
+            best_score = 0
+            for cat_header, cat_kw, cat_line in categories:
+                score = len(concept_keywords & cat_kw)
+                if score > best_score:
+                    best_score = score
+                    best_cat = (cat_header, cat_line)
+            
+            # ── 提取一句话摘要 ──
+            summary = ""
+            for ck in concept_keys:
+                if USE_MINIO:
+                    stem = ck.split("/")[-1].replace(".md", "")
+                else:
+                    stem = ck.stem
+                if self._normalize_name(stem) == norm_concept:
+                    content = s.read_text(ck) if USE_MINIO else ck.read_text(encoding="utf-8")
+                    abstract = self._extract_abstract(content)
+                    if abstract:
+                        # 取第一句（中文句号或英文句号或换行）
+                        summary = re.split(r'[。\.\n]', abstract)[0][:80].strip()
+                    break
+            
+            link_line = f"- [[{concept_name}]]"
+            if summary:
+                link_line += f" — {summary}"
+            
+            # ── 插入逻辑 ──
+            MIN_SCORE = 1  # 至少 1 个关键词匹配
+            
+            if not categories or best_score < MIN_SCORE:
+                # 无分类或无匹配 → 占位符替换 / 新建分类
+                if '等待知识摄入' in index_content:
+                    # 首次摄入：替换占位符
+                    cat_name = self._infer_category(concept_name, concept_keywords)
+                    new_content = index_content.replace(
+                        '等待知识摄入...',
+                        f'## 概念\n\n### {cat_name}\n{link_line}'
+                    )
+                else:
+                    # 追加新分类
+                    cat_name = self._infer_category(concept_name, concept_keywords)
+                    new_content = index_content.rstrip() + f'\n\n### {cat_name}\n{link_line}\n'
+            else:
+                # 在最佳分类下插入
+                cat_header, cat_line_idx = best_cat
+                # 找分类末尾（下一个同级或更高级 header 之前）
+                cat_level = len(re.match(r'^(#+)', lines[cat_line_idx]).group(1))
+                insert_at = len(lines)
+                for i in range(cat_line_idx + 1, len(lines)):
+                    m = re.match(r'^(#+)\s', lines[i])
+                    if m and len(m.group(1)) <= cat_level:
+                        insert_at = i
+                        break
+                
+                # 在 insert_at 之前找最后一个非空行，插入链接
+                # 但要先跳过空行
+                pos = insert_at
+                while pos > cat_line_idx + 1 and lines[pos - 1].strip() == '':
+                    pos -= 1
+                
+                lines.insert(pos, link_line)
+                new_content = '\n'.join(lines)
+            
+            # ── 写回 ──
+            if USE_MINIO:
+                s.write_text(idx_key, new_content)
+            else:
+                idx_path = _resolve("index.md")
+                idx_path.write_text(new_content, encoding="utf-8")
+            
+            if best_score >= MIN_SCORE:
+                print(f"  🗺️ [{concept_name}] → 归入分类 [{best_cat[0]}]")
+            else:
+                print(f"  🗺️ [{concept_name}] → 新建分类")
+        except Exception as e:
+            print(f"  ⚠️ index 分类插入失败（不影响主流程）: {e}")
+
+    def _infer_category(self, concept_name: str, keywords: set) -> str:
+        """从概念名推断新分类名（简短，2-6字）"""
+        # 提取中文部分
+        zh_parts = re.findall(r'[\u4e00-\u9fa5]{2,}', concept_name)
+        if zh_parts:
+            # 取最长的中文部分，截断到6字
+            best = max(zh_parts, key=len)
+            return best[:6] if len(best) > 6 else best
+        # 英文：取第一个有意义的词
+        en_parts = re.findall(r'[A-Z][a-z]+', concept_name)
+        if en_parts:
+            return en_parts[0]
+        return concept_name[:8]
+
     def _update_index_summaries(self, user_id: str, kb_name: str):
         """OKF: 为 index.md 中的链接添加一句话摘要。失败静默。"""
         if not schema_enabled():
@@ -881,6 +1053,10 @@ class IngestFlow:
                 # ── 保存检查点（融合成功后立即记录，从待处理列表移除）──
                 if user_id and kb_name:
                     mark_concept_done(user_id, kb_name, norm_c)
+
+                # ── 系统级 index.md 分类保障（幂等，不依赖 LLM append_link）──
+                if user_id and kb_name:
+                    self._categorize_into_index(display_name, user_id, kb_name)
 
                 elapsed = time.time() - t0
                 print(f"  -> ✅ [{display_name}] 融合完毕 ({elapsed:.1f}s)")

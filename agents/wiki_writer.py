@@ -198,17 +198,17 @@ class WikiWriter:
                 res = create_page(perfect_raw_file, title, action.get("tags", []), action.get("abstract", ""), action.get("content", ""))
                 print(f"  -> {res}")
                 results.append(res)
-
             elif act_type == "edit":
                 s = get_storage()
                 ctx = get_context()
                 _edit_found = False
 
-                # index.md 在根目录，直接放行
+                # 🛡️ 禁止 edit action 修改 index.md（只允许 append_link）
                 if raw_file == "index.md":
-                    _e_idx_key = _resolve_key("index.md")
-                    if s.exists(_e_idx_key):
-                        _edit_found = True
+                    msg = f"  -> 🛡️ 拦截非法编辑：index.md 只允许 append_link，edit 已丢弃"
+                    print(msg)
+                    results.append(msg)
+                    continue
 
                 if not _edit_found:
                     concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
@@ -265,8 +265,6 @@ class WikiWriter:
                 res = str_replace(raw_file, (action.get("old_str") or "").replace("\\n", "\n"), (action.get("content") or "").replace("\\n", "\n"))
                 print(f"  -> {res}")
                 results.append(res)
-
-
             elif act_type == "extract_moc":
 
                 # 1. 兼容大模型输出的多行文本和转义换行符
