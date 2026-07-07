@@ -7,7 +7,7 @@ from core.storage import get_storage
 from core.path_resolver import minio_wiki_prefix, minio_concepts_prefix
 
 class WikiWriter:
-    def execute(self, report: dict, canonical_registry: dict = None) -> list[str]:
+    def execute(self, report: dict, canonical_registry: dict = None, target_concept: str = None) -> list[str]:
         print("\n[WikiWriter] 拿到分析报告，开始物理写盘...")
         actions = report.get("actions", [])
         results = []
@@ -18,6 +18,26 @@ class WikiWriter:
         def _normalize(text: str) -> str:
             """与 IngestFlow._normalize_name 保持一致"""
             return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', text).lower()
+
+        def _is_target(name: str) -> bool:
+            """检查 action 是否指向当前融合目标概念
+            
+            通过 Canonical Registry 解析别名：
+            Editor 输出 'Reusability'，target 是 'Reusability (可复用性)'
+            → registry 里两者都指向同一个 canonical → 匹配成功
+            """
+            if not target_concept:
+                return True  # 无约束时放行
+            norm_name = _normalize(name)
+            norm_target = _normalize(target_concept)
+            if norm_name == norm_target:
+                return True
+            # 通过 registry 解析：两者是否指向同一个 canonical
+            if canonical_registry:
+                resolved_name = canonical_registry.get(norm_name, norm_name)
+                resolved_target = canonical_registry.get(norm_target, norm_target)
+                return resolved_name == resolved_target
+            return False
 
         def _is_same_concept(name1, name2):
             """精确匹配（Canonical Registry 约束下的主力）"""
@@ -94,6 +114,13 @@ class WikiWriter:
                 if not title:
                     title = target_path.stem
                 safe_title = title.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+
+                # 🎯 目标概念约束：create 只能创建当前融合目标
+                if not _is_target(title):
+                    msg = f"  -> 🎯 拒绝越权创建：[{title}] 不是当前目标 [{target_concept}]"
+                    print(msg)
+                    results.append(msg)
+                    continue
 
                 # 🏛️ Canonical Registry 验证 + 翻译变体智能查找
                 _title_norm = _normalize(title)
@@ -175,6 +202,13 @@ class WikiWriter:
                     concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
                     _e_keys = s.list_keys(concepts_prefix)
                     _e_target_stem = raw_file.replace("concepts/", "").replace(".md", "")
+
+                    # 🎯 目标概念约束：edit 只能编辑当前融合目标
+                    if not _is_target(_e_target_stem):
+                        msg = f"  -> 🎯 拒绝越权编辑：[{_e_target_stem}] 不是当前目标 [{target_concept}]"
+                        print(msg)
+                        results.append(msg)
+                        continue
 
                     # 🏛️ Canonical Registry 验证 + 翻译变体查找
                     _e_norm = _normalize(_e_target_stem)

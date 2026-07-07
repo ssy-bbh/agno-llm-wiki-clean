@@ -806,6 +806,7 @@ class IngestFlow:
                     conflicts=_merge_conflicts,
                     gaps=_merge_gaps,
                     canonical_names=list(self._canonical_registry.values()),
+                    target_concept=display_name,
                 )
             # 硬超时：单个概念融合最多 MERGE_HARD_TIMEOUT 秒（含 Editor 内部重试）
             MERGE_HARD_TIMEOUT = 480
@@ -836,7 +837,7 @@ class IngestFlow:
                 report = merge_future.result()
 
                 if report and report.get("actions"):
-                    self.writer.execute(report, canonical_registry=self._canonical_registry)
+                    self.writer.execute(report, canonical_registry=self._canonical_registry, target_concept=display_name)
                     # OKF: 记录操作摘要供 log.md 使用
                     if schema_enabled():
                         for act in report["actions"]:

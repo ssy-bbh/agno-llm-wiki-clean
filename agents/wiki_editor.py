@@ -163,7 +163,7 @@ class WikiEditor:
 
     def merge(self, raw_text: str, analyst_summary: str, existing_context: str,
               entries: list = None, conflicts: list = None, gaps: list = None,
-              canonical_names: list = None) -> dict:
+              canonical_names: list = None, target_concept: str = None) -> dict:
         print("\n[WikiEditor] 🧠 主编正在比对新旧知识，生成精准融合指令...")
 
         user_prompt = f"""
@@ -176,6 +176,15 @@ class WikiEditor:
         ---
         【本地已有文件内容】(供查重、对比和提取 old_str 参考):
         {existing_context}
+        """
+
+        # 🎯 当前概念锚定：Editor 只能为这一个概念生成 actions
+        if target_concept:
+            user_prompt += f"""
+        ---
+        🎯 【当前融合目标】: {target_concept}
+        你正在处理这一个概念的融合任务。你只能为这个概念生成 create/edit actions。
+        ⚠️ 绝对禁止为其他概念创建新页面！资料中涉及的其他概念内容，作为当前概念的正文写入。
         """
 
         # 🏛️ Canonical Registry 约束：Editor 只能用注册表里的名字
