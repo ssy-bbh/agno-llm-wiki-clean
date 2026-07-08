@@ -306,7 +306,7 @@ class IngestFlow:
             from core.llm_factory import get_qwen_model
             from agno.agent import Agent
             agent = Agent(
-                model=get_qwen_model(model_id="qwen-turbo"),
+                model=get_qwen_model(model_id="qwen-plus"),
                 instructions=["你是一个领域知识分析专家。"],
                 stream=False,
             )
@@ -404,7 +404,7 @@ class IngestFlow:
 
             prompt = build_suggestion_prompt(existing_sug, recent_log)
             agent = Agent(
-                model=get_qwen_model(model_id="qwen-turbo"),
+                model=get_qwen_model(model_id="qwen-plus"),
                 instructions=["你是知识库的 Schema 演化顾问。"],
                 stream=False,
             )
