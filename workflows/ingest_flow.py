@@ -335,26 +335,41 @@ class IngestFlow:
             print("  🔬 [Schema Phase 0] 首次摄入，推断领域编译约定...")
             prompt = build_phase0_prompt(kb_name, sample_chunks)
 
-            # 用轻量模型调用
+            # Schema 是全局唯一的编译指南，用最聪明的模型 + 重试
             from core.llm_factory import get_qwen_model
             from agno.agent import Agent
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+            _schema_model_id = os.environ.get("SCHEMA_MODEL_ID", "deepseek-v4-pro")
             agent = Agent(
-                model=get_qwen_model(model_id="qwen-plus"),
+                model=get_qwen_model(model_id=_schema_model_id),
                 instructions=["你是一个领域知识分析专家。"],
                 stream=False,
             )
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError
-            pool = ThreadPoolExecutor(max_workers=1)
-            future = pool.submit(agent.run, prompt)
-            try:
-                response = future.result(timeout=30)
-            except FuturesTimeoutError:
-                print("  ⏰ [Schema] Phase 0 超时，跳过")
-                pool.shutdown(wait=False, cancel_futures=True)
-                return ""
-            pool.shutdown(wait=False)
 
-            schema_text = response.content if hasattr(response, 'content') else str(response)
+            _SCHEMA_TIMEOUT = 60  # Schema 重要，给更多时间
+            schema_text = None
+            for _attempt in range(2):  # 最多重试 1 次
+                pool = ThreadPoolExecutor(max_workers=1)
+                future = pool.submit(agent.run, prompt)
+                try:
+                    response = future.result(timeout=_SCHEMA_TIMEOUT)
+                    schema_text = response.content if hasattr(response, 'content') else str(response)
+                    pool.shutdown(wait=False)
+                    if schema_text and len(schema_text) > 100:
+                        break  # 成功
+                    else:
+                        print(f"  ⚠️ [Schema] 第 {_attempt+1} 次尝试结果过短，重试...")
+                        schema_text = None
+                except FuturesTimeoutError:
+                    print(f"  ⏰ [Schema] 第 {_attempt+1} 次尝试超时 ({_SCHEMA_TIMEOUT}s)")
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    schema_text = None
+                except Exception as _e:
+                    print(f"  ⚠️ [Schema] 第 {_attempt+1} 次尝试异常: {_e}")
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    schema_text = None
+
             if schema_text and len(schema_text) > 100:
                 # 写入存储
                 if USE_MINIO:
@@ -366,7 +381,7 @@ class IngestFlow:
                 print(f"  ✅ [Schema] 编译指南已生成 ({len(schema_text)} 字符)")
                 return schema_text
             else:
-                print("  ⚠️ [Schema] 嗅探结果过短，跳过")
+                print("  ⚠️ [Schema] 2 次尝试均失败，跳过")
                 return ""
 
         except Exception as e:
@@ -445,9 +460,13 @@ class IngestFlow:
             pool = ThreadPoolExecutor(max_workers=1)
             future = pool.submit(agent.run, prompt)
             try:
-                response = future.result(timeout=30)
+                response = future.result(timeout=60)
             except FuturesTimeoutError:
                 print("  ⏰ [Schema] 建议生成超时，跳过")
+                pool.shutdown(wait=False, cancel_futures=True)
+                return
+            except Exception as _e:
+                print(f"  ⚠️ [Schema] 建议生成异常: {_e}")
                 pool.shutdown(wait=False, cancel_futures=True)
                 return
             pool.shutdown(wait=False)
