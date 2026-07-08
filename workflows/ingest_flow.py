@@ -235,17 +235,49 @@ class IngestFlow:
         return context_str
 
     @staticmethod
+    @staticmethod
     def _extract_abstract(content: str) -> str:
-        """从概念页中提取 Abstract 段摘要（~300字），避免传全文给 LLM"""
+        """从概念页中提取 Abstract 段摘要（~300字），避免传全文给 LLM。
+        
+        会过滤掉动作描述（"创建...概念页面"等），回退到 Details 首句。
+        """
+        import re as _re
+        _ACTION_PAT = _re.compile(
+            r'^(create|edit|创建|新建|生成|制作|为.{1,15}创建|为.{1,15}生成)',
+            _re.IGNORECASE
+        )
+        
+        abstract = ""
         # 优先提取 ## Abstract 到下一个 ## 之间的内容
         if "## Abstract" in content:
             after = content.split("## Abstract", 1)[1]
-            # 截断到下一个 ## 标题
             if "\n## " in after:
                 after = after.split("\n## ", 1)[0]
-            return after.strip()[:500]
-        # 回退：取前 300 字
-        return content[:300]
+            abstract = after.strip()[:500]
+        
+        # 检查 abstract 是否是动作描述 → 如果是，回退到 Details 首句
+        if abstract and _ACTION_PAT.match(abstract):
+            abstract = ""  # 标记为无效
+        
+        # 回退：从 Details 段取首句
+        if not abstract and "## Details" in content:
+            details = content.split("## Details", 1)[1]
+            if "\n## " in details:
+                details = details.split("\n## ", 1)[0]
+            first_line = ""
+            for line in details.strip().split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and len(line) > 10:
+                    first_line = line
+                    break
+            if first_line and not _ACTION_PAT.match(first_line):
+                abstract = first_line[:200]
+        
+        # 最终回退：取前 300 字（跳过 frontmatter）
+        if not abstract:
+            body = content.split("---\n")[-1] if "---" in content else content
+            return body[:300]
+        return abstract
 
     def _map_extract(self, chunk, chunk_id):
         """Map 阶段的核心逻辑：只提取，不写盘"""
@@ -550,7 +582,13 @@ class IngestFlow:
                     abstract = self._extract_abstract(content)
                     if abstract:
                         # 取第一句（中文句号或英文句号或换行）
-                        summary = re.split(r'[。\.\n]', abstract)[0][:80].strip()
+                        _first = re.split(r'[。\.\n]', abstract)[0][:80].strip()
+                        # 过滤动作描述泄漏
+                        if _first and not re.match(
+                            r'^(create|edit|创建|新建|生成|制作|为.{1,15}(创建|生成))',
+                            _first, re.IGNORECASE
+                        ):
+                            summary = _first
                     break
             
             link_line = f"- [[{concept_name}]]"

@@ -400,6 +400,16 @@ class WikiWriter:
                     print(f"  -> ✂️ [精细截断] index.md 导航地图已优雅折叠至 [[{moc_title}]] (已保留上下文描述)")
 
             elif act_type == "append_link":
+                # 🚫 Schema 模式下跳过 Editor 的 append_link：
+                # _categorize_into_index 是系统级 index 管理器，
+                # Editor 的 append_link 是冗余且不可靠的（会泄漏动作描述）
+                from core.schema_engine import is_enabled as _schema_on
+                if _schema_on() and raw_file in ("index.md", "index"):
+                    msg = f"  -> ⏭️ Schema 模式：跳过 Editor 的 append_link（由 _categorize_into_index 系统级管理）"
+                    print(msg)
+                    results.append(msg)
+                    continue
+
                 old_str = action.get("old_str")
                 raw_link_to = str(action.get("link_to", ""))
 
