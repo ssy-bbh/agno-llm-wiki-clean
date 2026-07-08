@@ -104,8 +104,12 @@ class WikiEditor:
            - `title`：新子地图的名称（如 "YOLO系列演进 MOC"）。
            - `content`：新子地图的完整正文（包含领域摘要、分类标题以及所有的具体链接）。
         """
+        # 🎯 模型分层：REDUCE 融合+建页是复杂任务，必须用强模型
+        # MAP/Schema 等简单阶段用 qwen-plus/turbo，这里用 deepseek-v4-pro
+        import os
+        _editor_model_id = os.getenv("EDITOR_MODEL_ID", "deepseek-v4-pro")
         self.agent = Agent(
-            model=get_qwen_model(),
+            model=get_qwen_model(model_id=_editor_model_id),
             instructions=[self.instructions],
             output_schema=EditorReport,
             stream=False
