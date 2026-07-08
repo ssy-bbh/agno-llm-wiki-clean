@@ -585,7 +585,7 @@ class IngestFlow:
                         _first = re.split(r'[。\.\n]', abstract)[0][:80].strip()
                         # 过滤动作描述泄漏（宽匹配任何任务动词）
                         _INDEX_ACTION_RE = re.compile(
-                            r'^(create|edit|append|创建|新建|生成|制作|融合|阐述|补充|添加|为)',
+                            r'^(create|edit|append|创建|新建|生成|制作|融合|阐述|补充|添加|结合.{0,10}(创建|生成|融合|新建|资料)|为)',
                             re.IGNORECASE
                         )
                         if _first and not _INDEX_ACTION_RE.match(_first):
@@ -603,17 +603,39 @@ class IngestFlow:
             MIN_SCORE = 1  # 至少 1 个关键词匹配
             
             if not categories or best_score < MIN_SCORE:
-                # 无分类或无匹配 → 占位符替换 / 新建分类
-                if '等待知识摄入' in index_content:
+                cat_name = self._infer_category(concept_name, concept_keywords, user_id, kb_name)
+                
+                # 检查是否已有同名分类（防止 _infer_category 返回重复名）
+                _existing_cat = None
+                for cat_header, cat_kw, cat_line in categories:
+                    if cat_header.strip() == cat_name.strip():
+                        _existing_cat = (cat_header, cat_line)
+                        break
+                
+                if _existing_cat:
+                    # 同名分类已存在 → 追加到该分类下
+                    cat_header, cat_line_idx = _existing_cat
+                    cat_level = len(re.match(r'^(#+)', lines[cat_line_idx]).group(1))
+                    insert_at = len(lines)
+                    for i in range(cat_line_idx + 1, len(lines)):
+                        m = re.match(r'^(#+)\s', lines[i])
+                        if m and len(m.group(1)) <= cat_level:
+                            insert_at = i
+                            break
+                    pos = insert_at
+                    while pos > cat_line_idx + 1 and lines[pos - 1].strip() == '':
+                        pos -= 1
+                    lines.insert(pos, link_line)
+                    new_content = '\n'.join(lines)
+                    best_cat = _existing_cat  # for logging
+                elif '等待知识摄入' in index_content:
                     # 首次摄入：替换占位符
-                    cat_name = self._infer_category(concept_name, concept_keywords, user_id, kb_name)
                     new_content = index_content.replace(
                         '等待知识摄入...',
                         f'## 概念\n\n### {cat_name}\n{link_line}'
                     )
                 else:
                     # 追加新分类
-                    cat_name = self._infer_category(concept_name, concept_keywords, user_id, kb_name)
                     new_content = index_content.rstrip() + f'\n\n### {cat_name}\n{link_line}\n'
             else:
                 # 在最佳分类下插入

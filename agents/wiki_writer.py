@@ -183,11 +183,11 @@ class WikiWriter:
                     print(msg)
                     results.append(msg)
                     continue
-                # 检查内容是否只是动作描述（"create"、"创建XX概念页面" 等）
-                # 宽匹配：任何以任务动词开头的短文本（<300字符）都视为空壳
-                _ACTION_VERBS = r'^(create|edit|delete|append|创建|新建|生成|制作|融合|阐述|补充|添加|为.{0,20}(创建|生成|融合|新建))'
+                # 检查内容是否只是动作描述（"create"、"创建XX概念页面"、"结合新资料" 等）
+                # 宽匹配：任何以任务动词开头的短文本（<500字符）都视为空壳
+                _ACTION_VERBS = r'^(create|edit|delete|append|创建|新建|生成|制作|融合|阐述|补充|添加|结合.{0,10}(创建|生成|融合|新建|资料)|为.{0,20}(创建|生成|融合|新建))'
                 _action_pattern = _re.compile(_ACTION_VERBS, _re.IGNORECASE)
-                if _action_pattern.match(_raw_content) and len(_raw_content) < 300:
+                if _action_pattern.match(_raw_content) and len(_raw_content) < 500:
                     msg = f"  -> 🚫 拦截空壳创建：[{safe_title}] 内容仅是动作描述（{len(_raw_content)}字符: \"{_raw_content[:60]}...\"），已丢弃。"
                     print(msg)
                     results.append(msg)
@@ -205,8 +205,12 @@ class WikiWriter:
                     continue
 
                 # ── 摘要清洗（剥离动作描述）──
+                _ABSTRACT_ACTION_RE = _re.compile(
+                    r'^(create|edit|append|创建|新建|生成|制作|融合|阐述|补充|添加|结合.{0,10}(创建|生成|融合|新建|资料)|为.{0,20}(创建|生成|融合|新建))',
+                    _re.IGNORECASE
+                )
                 _raw_abstract = (action.get("abstract") or "").strip()
-                if _raw_abstract and _action_pattern.match(_raw_abstract):
+                if _raw_abstract and _ABSTRACT_ACTION_RE.match(_raw_abstract):
                     _raw_abstract = ""  # 摘要是动作描述 → 清空，让系统自动生成
 
                 # 🛡️ 物理拦截雷达启动（统一存储接口，消除 MinIO/Local 分支）
