@@ -482,6 +482,20 @@ class IngestFlow:
             for link in existing_links:
                 if self._normalize_name(link) == norm_concept:
                     return  # 已在 index 中
+
+            # ── 文件存在性检查：概念文件必须真实存在，否则不写 index（防止空壳/被拒绝的概念进导航）──
+            _file_exists = False
+            for ck in concept_keys:
+                if USE_MINIO:
+                    stem = ck.split("/")[-1].replace(".md", "")
+                else:
+                    stem = ck.stem
+                if self._normalize_name(stem) == norm_concept:
+                    _file_exists = True
+                    break
+            if not _file_exists:
+                print(f"  ⏭️ [{concept_name}] 概念文件不存在，跳过 index 分类")
+                return
             
             # ── 从概念文件提取关键词 ──
             concept_keywords = _kw(concept_name)
@@ -550,14 +564,14 @@ class IngestFlow:
                 # 无分类或无匹配 → 占位符替换 / 新建分类
                 if '等待知识摄入' in index_content:
                     # 首次摄入：替换占位符
-                    cat_name = self._infer_category(concept_name, concept_keywords)
+                    cat_name = self._infer_category(concept_name, concept_keywords, user_id, kb_name)
                     new_content = index_content.replace(
                         '等待知识摄入...',
                         f'## 概念\n\n### {cat_name}\n{link_line}'
                     )
                 else:
                     # 追加新分类
-                    cat_name = self._infer_category(concept_name, concept_keywords)
+                    cat_name = self._infer_category(concept_name, concept_keywords, user_id, kb_name)
                     new_content = index_content.rstrip() + f'\n\n### {cat_name}\n{link_line}\n'
             else:
                 # 在最佳分类下插入
@@ -594,19 +608,91 @@ class IngestFlow:
         except Exception as e:
             print(f"  ⚠️ index 分类插入失败（不影响主流程）: {e}")
 
-    def _infer_category(self, concept_name: str, keywords: set) -> str:
-        """从概念名推断新分类名（简短，2-6字）"""
-        # 提取中文部分
+    def _infer_category(self, concept_name: str, keywords: set, user_id: str = "", kb_name: str = "") -> str:
+        """从 schema.md 的领域维度推断分类名（简短，2-8字）。
+        
+        优先从 schema.md 的"核心维度"/"什么算重要"中提取分类候选，
+        用关键词 overlap 匹配最佳分类。无 schema 或无匹配时回退到通用分类。
+        """
+        schema_categories = []
+        
+        # ── 尝试从 schema.md 提取分类候选 ──
+        try:
+            if user_id and kb_name:
+                s = get_storage()
+                if USE_MINIO:
+                    from core.path_resolver import minio_schema_key
+                    schema_key = minio_schema_key(user_id, kb_name)
+                    if s.exists(schema_key):
+                        schema_text = s.read_text(schema_key)
+                else:
+                    from core.path_resolver import get_schema_path
+                    schema_path = get_schema_path(user_id, kb_name)
+                    if schema_path.exists():
+                        schema_text = schema_path.read_text(encoding="utf-8")
+                    else:
+                        schema_text = ""
+                
+                if schema_text:
+                    # 提取 "核心维度" 段落的第一句作为领域标签
+                    dim_match = re.search(r'##\s*核心维度\s*\n+(.+?)(?=\n##|\Z)', schema_text, re.DOTALL)
+                    if dim_match:
+                        dim_text = dim_match.group(1).strip()
+                        # 取第一句话（到句号或换行）
+                        first_sentence = re.split(r'[。\n]', dim_text)[0][:40]
+                        if first_sentence:
+                            schema_categories.append(first_sentence)
+                    
+                    # 提取 "什么算重要" 中的子标题（核心突破/关键支撑/背景知识）
+                    important_match = re.search(r'##\s*什么算重要\s*\n+(.+?)(?=\n##|\Z)', schema_text, re.DOTALL)
+                    if important_match:
+                        imp_text = important_match.group(1)
+                        for m in re.finditer(r'\*\*(.+?)\*\*[：:]\s*(.+?)(?=\n-|\n\*\*|\Z)', imp_text, re.DOTALL):
+                            cat_label = m.group(1).strip()  # 如"核心突破"
+                            cat_desc = m.group(2).strip()[:40]
+                            schema_categories.append((cat_label, cat_desc))
+        except Exception:
+            pass  # schema 读取失败不影响主流程
+        
+        # ── 关键词 overlap 匹配 schema 分类 ──
+        if schema_categories:
+            best_label = None
+            best_score = 0
+            for item in schema_categories:
+                if isinstance(item, tuple):
+                    label, desc = item
+                    score = len(keywords & self._kw_set(desc))
+                else:
+                    label = item
+                    score = len(keywords & self._kw_set(label))
+                if score > best_score:
+                    best_score = score
+                    best_label = label
+            
+            if best_score >= 1 and best_label:
+                return best_label[:8]
+        
+        # ── 回退：从概念名提取 ──
         zh_parts = re.findall(r'[\u4e00-\u9fa5]{2,}', concept_name)
         if zh_parts:
-            # 取最长的中文部分，截断到6字
             best = max(zh_parts, key=len)
             return best[:6] if len(best) > 6 else best
-        # 英文：取第一个有意义的词
         en_parts = re.findall(r'[A-Z][a-z]+', concept_name)
         if en_parts:
             return en_parts[0]
-        return concept_name[:8]
+        return "核心概念"
+
+    @staticmethod
+    def _kw_set(text: str) -> set:
+        """从文本提取关键词集合"""
+        _stop = {'的','和','与','或','在','是','了','不','有','也','就','都','而','及',
+                 '对','以','到','等','为','the','a','an','is','are','and','or','of','to','for'}
+        words = set()
+        for w in re.findall(r'[a-zA-Z]{3,}|[\u4e00-\u9fa5]', text):
+            wl = w.lower()
+            if wl not in _stop and len(wl) >= 2:
+                words.add(wl)
+        return words
 
     def _update_index_summaries(self, user_id: str, kb_name: str):
         """OKF: 为 index.md 中的链接添加一句话摘要。失败静默。"""

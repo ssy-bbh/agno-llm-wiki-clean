@@ -175,6 +175,41 @@ class WikiWriter:
                     results.append(msg)
                     continue
 
+                # ── 内容实质性检查（防止 LLM 输出空壳）──
+                _raw_content = (action.get("content") or "").replace("\\n", "\n").strip()
+                _MIN_CONTENT_LEN = 80  # 概念页面正文至少 80 字符
+                if len(_raw_content) < _MIN_CONTENT_LEN:
+                    msg = f"  -> 🚫 拦截空壳创建：[{safe_title}] 内容仅 {len(_raw_content)} 字符（最低 {_MIN_CONTENT_LEN}），疑似 LLM 丢失输出，已丢弃。"
+                    print(msg)
+                    results.append(msg)
+                    continue
+                # 检查内容是否只是动作描述（"create"、"create BPE 概念页面" 等）
+                _action_pattern = _re.compile(
+                    r'^(create|edit|创建|新建|生成|制作|为.{1,10}创建.{0,20}(概念|页面|条目))[^。\n]{0,50}$',
+                    _re.IGNORECASE
+                )
+                if _action_pattern.match(_raw_content):
+                    msg = f"  -> 🚫 拦截空壳创建：[{safe_title}] 内容仅是动作描述（\"{_raw_content[:60]}\"），已丢弃。"
+                    print(msg)
+                    results.append(msg)
+                    continue
+
+                # ── 文件名合理性检查（防止 instructions 泄漏）──
+                _FN_BLACKLIST = [
+                    '你是一个', '你是一个严谨', '你的核心任务', '核心执行协议',
+                    '请严格按', '严禁盲猜', '本地已有文件',
+                ]
+                if any(p in safe_title for p in _FN_BLACKLIST) or len(safe_title) > 50:
+                    msg = f"  -> 🚫 拦截异常文件名：[{safe_title[:40]}...] 疑似 instructions 泄漏，已丢弃。"
+                    print(msg)
+                    results.append(msg)
+                    continue
+
+                # ── 摘要清洗（剥离动作描述）──
+                _raw_abstract = (action.get("abstract") or "").strip()
+                if _raw_abstract and _action_pattern.match(_raw_abstract):
+                    _raw_abstract = ""  # 摘要是动作描述 → 清空，让系统自动生成
+
                 # 🛡️ 物理拦截雷达启动（统一存储接口，消除 MinIO/Local 分支）
                 found_existing_key = None
                 all_concept_keys = s.list_keys(concepts_prefix)
@@ -195,7 +230,7 @@ class WikiWriter:
                     continue
 
                 # 工具层依然接收相对的 perfect_raw_file 即可，里面会再次 _resolve
-                res = create_page(perfect_raw_file, title, action.get("tags", []), action.get("abstract", ""), action.get("content", ""))
+                res = create_page(perfect_raw_file, title, action.get("tags", []), _raw_abstract, _raw_content)
                 print(f"  -> {res}")
                 results.append(res)
             elif act_type == "edit":
@@ -376,8 +411,12 @@ class WikiWriter:
                         if clean_name and clean_name.lower() != "none":
                             links = [f"[[{clean_name}]]"]
                     # 过滤无效链接：去掉 [[None]]、[[index.md]]、[[concepts/]] 等非概念名
+                    # 同时过滤 markdown 语法泄漏（## header、句子等）
                     links = [l for l in links if re.search(r'\[\[(?!None\]\]).+?\]\]', l)
-                             and '/' not in l and '.md' not in l]
+                             and '/' not in l and '.md' not in l
+                             and '#' not in l
+                             and len(l) < 60
+                             and not re.search(r'[。！？,，;；]', l)]
 
                     s = get_storage()
                     _al_key = _resolve_key(raw_file)
