@@ -14,6 +14,7 @@ from tools.edit_tools import _resolve, set_context, _resolve_key
 from core.storage import get_storage
 from core.path_resolver import USE_MINIO
 from core.path_resolver import minio_concepts_prefix, minio_index_key
+from core.content_validator import validate_abstract
 from core.ingest_control import (
     is_terminate_requested, mark_concept_done,
     is_concept_done, save_file_checkpoint, save_shuffle_result,
@@ -583,12 +584,9 @@ class IngestFlow:
                     if abstract:
                         # 取第一句（中文句号或英文句号或换行）
                         _first = re.split(r'[。\.\n]', abstract)[0][:80].strip()
-                        # 过滤动作描述泄漏（宽匹配任何任务动词）
-                        _INDEX_ACTION_RE = re.compile(
-                            r'^(create|edit|append|创建|新建|生成|制作|融合|阐述|补充|添加|结合.{0,10}(创建|生成|融合|新建|资料)|为)',
-                            re.IGNORECASE
-                        )
-                        if _first and not _INDEX_ACTION_RE.match(_first):
+                        # 正向知识信号检测（无信号 = 动作描述 → 清空）
+                        _first = validate_abstract(_first)
+                        if _first:
                             summary = _first
                     break
             

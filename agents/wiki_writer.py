@@ -5,6 +5,7 @@ import re
 from tools.edit_tools import _resolve, create_page, str_replace, _resolve_key, get_context
 from core.storage import get_storage
 from core.path_resolver import minio_wiki_prefix, minio_concepts_prefix
+from core.content_validator import is_substantive_content, validate_abstract
 
 class WikiWriter:
     def execute(self, report: dict, canonical_registry: dict = None, target_concept: str = None) -> list[str]:
@@ -175,20 +176,11 @@ class WikiWriter:
                     results.append(msg)
                     continue
 
-                # ── 内容实质性检查（防止 LLM 输出空壳）──
+                # ── 内容实质性检查（正向知识信号检测，不维护黑名单）──
                 _raw_content = (action.get("content") or "").replace("\\n", "\n").strip()
-                _MIN_CONTENT_LEN = 80  # 概念页面正文至少 80 字符
-                if len(_raw_content) < _MIN_CONTENT_LEN:
-                    msg = f"  -> 🚫 拦截空壳创建：[{safe_title}] 内容仅 {len(_raw_content)} 字符（最低 {_MIN_CONTENT_LEN}），疑似 LLM 丢失输出，已丢弃。"
-                    print(msg)
-                    results.append(msg)
-                    continue
-                # 检查内容是否只是动作描述（"create"、"创建XX概念页面"、"结合新资料" 等）
-                # 宽匹配：任何以任务动词开头的短文本（<500字符）都视为空壳
-                _ACTION_VERBS = r'^(create|edit|delete|append|创建|新建|生成|制作|融合|阐述|补充|添加|结合.{0,10}(创建|生成|融合|新建|资料)|为.{0,20}(创建|生成|融合|新建))'
-                _action_pattern = _re.compile(_ACTION_VERBS, _re.IGNORECASE)
-                if _action_pattern.match(_raw_content) and len(_raw_content) < 500:
-                    msg = f"  -> 🚫 拦截空壳创建：[{safe_title}] 内容仅是动作描述（{len(_raw_content)}字符: \"{_raw_content[:60]}...\"），已丢弃。"
+                _ok, _reason = is_substantive_content(_raw_content, concept_name=safe_title)
+                if not _ok:
+                    msg = f"  -> 🚫 拦截空壳创建：[{safe_title}] {_reason}"
                     print(msg)
                     results.append(msg)
                     continue
@@ -204,14 +196,8 @@ class WikiWriter:
                     results.append(msg)
                     continue
 
-                # ── 摘要清洗（剥离动作描述）──
-                _ABSTRACT_ACTION_RE = _re.compile(
-                    r'^(create|edit|append|创建|新建|生成|制作|融合|阐述|补充|添加|结合.{0,10}(创建|生成|融合|新建|资料)|为.{0,20}(创建|生成|融合|新建))',
-                    _re.IGNORECASE
-                )
-                _raw_abstract = (action.get("abstract") or "").strip()
-                if _raw_abstract and _ABSTRACT_ACTION_RE.match(_raw_abstract):
-                    _raw_abstract = ""  # 摘要是动作描述 → 清空，让系统自动生成
+                # ── 摘要清洗（正向检测，无知识信号则清空）──
+                _raw_abstract = validate_abstract((action.get("abstract") or "").strip())
 
                 # 🛡️ 物理拦截雷达启动（统一存储接口，消除 MinIO/Local 分支）
                 found_existing_key = None
