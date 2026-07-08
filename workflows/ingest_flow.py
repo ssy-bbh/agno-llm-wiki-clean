@@ -244,7 +244,7 @@ class IngestFlow:
         """
         import re as _re
         _ACTION_PAT = _re.compile(
-            r'^(create|edit|append|创建|新建|生成|制作|融合|阐述|补充|添加|为)',
+            r'^(create|edit|append|action\s*=|创建|新建|生成|制作|融合|阐述|补充|添加|为)',
             _re.IGNORECASE
         )
         
@@ -715,14 +715,12 @@ class IngestFlow:
                         schema_text = ""
                 
                 if schema_text:
-                    # 提取 "核心维度" 段落的第一句作为领域标签
+                    # 核心维度只用作兜底分类（固定标签，不用原文）
+                    _has_schema_dim = False
                     dim_match = re.search(r'##\s*核心维度\s*\n+(.+?)(?=\n##|\Z)', schema_text, re.DOTALL)
                     if dim_match:
-                        dim_text = dim_match.group(1).strip()
-                        # 取第一句话（到句号或换行）
-                        first_sentence = re.split(r'[。\n]', dim_text)[0][:40]
-                        if first_sentence:
-                            schema_categories.append(first_sentence)
+                        _has_schema_dim = True
+                        # 核心维度是宏观描述，不适合当分类名，只标记 schema 可用
                     
                     # 提取 "什么算重要" 中的子标题（核心突破/关键支撑/背景知识）
                     important_match = re.search(r'##\s*什么算重要\s*\n+(.+?)(?=\n##|\Z)', schema_text, re.DOTALL)

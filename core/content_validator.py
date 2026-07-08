@@ -28,7 +28,10 @@ _KNOWLEDGE_SIGNALS = [
     r'(?:例如|比如|如[：:]|典型[的地])',
     r'(?:第一|首先|其一|一方面)',
     # 公式/数学
-    r'[=≈≥≤∑∏∫∂]', r'log[_₂]', r'[a-zA-Z]\s*=\s*[a-zA-Z0-9]',
+    r'[≈≥≤∑∏∫∂]', r'log[_₂]',
+    r'(?<![a-zA-Z_])[a-zA-Z](?:_[a-zA-Z0-9])?\s*=\s*[a-zA-Z0-9(]',  # x = ..., f(x) = ..., θ_1 = ...
+    r'\$.*?\$',  # LaTeX inline math
+    r'\$\$.*?\$\$',  # LaTeX block math
     # 过程/机制
     r'(?:通过|利用|基于|采用).{4,}(?:来|进行|实现)',
     r'(?:步骤|阶段|过程|流程)',
@@ -47,7 +50,8 @@ _SELF_REF = re.compile(
     r'wikilink|双链|内部链接|'
     r'知识(?:库|图谱|系统)|'
     r'index\.md|导航地图|'
-    r'新资料|已有文件|本地已有',
+    r'新资料|已有文件|本地已有|'
+    r'^action\s*=|action\s*=\s*(?:create|edit|append)',  # Editor JSON 泄漏
     re.IGNORECASE
 )
 
