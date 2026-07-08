@@ -275,8 +275,16 @@ class WikiWriter:
                     _fallback_title = raw_file.replace("concepts/", "").replace(".md", "").strip()
                     _fallback_content = (action.get("content") or "").replace("\\n", "\n")
                     if _fallback_title and _fallback_content:
+                        # ⚠️ 降级创建也要过内容验证（防止 edit content 泄漏 index.md 等垃圾）
+                        _fb_ok, _fb_reason = is_substantive_content(_fallback_content, concept_name=_fallback_title)
+                        if not _fb_ok:
+                            msg = f"  -> 🚫 拦截降级创建：[{_fallback_title}] {_fb_reason}"
+                            print(msg)
+                            results.append(msg)
+                            continue
+                        _fb_abstract = validate_abstract((action.get("abstract") or "").strip())
                         print(f"  -> 🔄 编辑目标不存在，降级为创建：[{_fallback_title}]")
-                        res = create_page(raw_file, _fallback_title, action.get("tags", []), action.get("abstract", ""), _fallback_content)
+                        res = create_page(raw_file, _fallback_title, action.get("tags", []), _fb_abstract, _fallback_content)
                         print(f"  -> {res}")
                         results.append(res)
                         continue
