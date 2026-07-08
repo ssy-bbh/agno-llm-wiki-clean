@@ -8,12 +8,13 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from agno.agent import Agent
 from core.llm_factory import get_qwen_model
 from core.schema_engine import is_enabled, inject_entries_to_editor
+from core.content_validator import is_substantive_content, validate_abstract
 
 # 单次 LLM 调用超时（秒）——融合比提取更复杂，给更多时间
 LLM_TIMEOUT_SECONDS = 240
 
-# 🔄 自我验证循环最大尝试次数
-MAX_ATTEMPTS = 2
+# 🔄 自我验证循环最大尝试次数（格式错误 + 内容质量各 1 次重试）
+MAX_ATTEMPTS = 3
 
 
 # 💡 我们把 Action 的定义移交给了主编，因为只有它才有权下达动作指令
@@ -97,7 +98,12 @@ class WikiEditor:
            - `content`：写入融合了新旧知识的全新段落。
         4. 【强制双链】：所有技术术语、模型名称必须用 [[ ]] 包裹。
         5.【专注原则】：在当前的决策中，你只被允许修改你在【本地已有文件内容】中亲眼看到的文件（如 index.md 和当前的目标概念文件）。绝对、绝对不允许尝试去 edit 任何未在此上下文中展示的旧文件！
-        6. 【渐进式披露 (extract_moc)】（最高警戒）：在修改 `index.md` 时，必须时刻监控信息密度！
+        6. 【内容自检】（最高优先级）：在输出每个 create/edit 的 content 前，自检：
+           - content 是否在讲**领域知识**（定义、原理、公式、对比、举例）？
+           - 还是在讲**操作指令**（"创建XX页面""融合XX内容""补充到导航"）？
+           - ❌ 操作指令不是知识！如果你的 content 读起来像任务描述，必须重写为实际知识内容。
+           - ✅ 检验标准：如果遮住概念名，单看 content 能学到东西吗？不能就是废内容。
+        7. 【渐进式披露 (extract_moc)】（最高警戒）：在修改 `index.md` 时，必须时刻监控信息密度！
            - ⚡ 触发条件：当你准备向 `index.md` 的某个 `### 标题` 下追加链接时，如果发现该标题下现有的 `[[具体知识点]]` 链接数量达到或超过 7 个，你绝对不能继续使用 'append_link'！
            - 🛠️ 强制动作：你必须改为输出 'extract_moc' 动作，将该标题下的所有旧链接与你的新链接，一起打包提取为一个独立的 MOC (导航地图) 文件。
            - `old_str`：必须包含该标题和下方所有的旧链接（用于底层的雷达精确锁定与折叠）。
@@ -219,7 +225,21 @@ class WikiEditor:
         for attempt in range(MAX_ATTEMPTS):
             prompt = user_prompt
             if attempt > 0:
-                prompt += f"""
+                # 区分错误类型：内容质量 vs 格式
+                if "内容质量" in self._last_error:
+                    prompt += f"""
+
+⚠️⚠️⚠️ 上一次输出的内容质量不合格，已被拒绝！
+{self._last_error}
+
+请重新生成 create/edit 的 content 字段，确保：
+1. content 是实际的领域知识（定义、原理、公式、对比、举例），而不是任务描述
+2. ❌ 禁止写"创建XX页面""融合XX内容""补充到导航"——这些是操作指令，不是知识
+3. ✅ 检验标准：遮住概念名，单看 content 能学到东西吗？
+"""
+                    print(f"  🔄 [WikiEditor] 第 {attempt+1} 次尝试（内容质量修正）...")
+                else:
+                    prompt += f"""
 
 ⚠️⚠️⚠️ 上一次输出格式有误，已被拒绝！请严格遵守以下字段名规则：
 - 每个 action 必须使用 "type" 字段（不是 "action"）
@@ -228,7 +248,7 @@ class WikiEditor:
 - type 只能是 create / edit / append_link / extract_moc 四选一
 上次错误：{self._last_error}
 """
-                print(f"  🔄 [WikiEditor] 第 {attempt+1} 次尝试（追加格式修正提示）...")
+                    print(f"  🔄 [WikiEditor] 第 {attempt+1} 次尝试（格式修正）...")
 
             # 超时保护：不用 with 语句（with 退出时会 shutdown(wait=True) 卡死）
             pool = ThreadPoolExecutor(max_workers=1)
@@ -243,6 +263,32 @@ class WikiEditor:
 
             result = self._parse_response(response)
             if result is not None:
+                # ── 内容质量验证：检查每个 create/edit 的 content 是否含实质知识 ──
+                _content_errors = []
+                for act in result.get("actions", []):
+                    if act.get("type") in ("create", "edit"):
+                        _content = (act.get("content") or "").strip()
+                        _title = act.get("title") or act.get("file", "")
+                        _ok, _reason = is_substantive_content(_content, concept_name=_title, min_score=2)
+                        if not _ok:
+                            _content_errors.append(f"  - [{act['type']}] {_title}: {_reason}")
+                        # 摘要也检查
+                        if act.get("type") == "create" and act.get("abstract"):
+                            cleaned = validate_abstract(act["abstract"])
+                            if not cleaned:
+                                act["abstract"] = ""  # 清空无效摘要
+                
+                if _content_errors:
+                    self._last_error = "内容质量不合格:\n" + "\n".join(_content_errors)
+                    print(f"  ⚠️ 第 {attempt+1} 次尝试内容质量不合格:")
+                    for e in _content_errors:
+                        print(f"    {e}")
+                    if attempt < MAX_ATTEMPTS - 1:
+                        continue  # 重试
+                    else:
+                        print(f"  ⚠️ 达到最大重试次数，丢弃不合格的 actions")
+                        return {"actions": []}  # 质量不达标，宁可不出
+                
                 if attempt > 0:
                     print(f"  ✅ 重试成功！")
                 return result
