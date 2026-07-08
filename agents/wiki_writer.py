@@ -7,11 +7,28 @@ from core.storage import get_storage
 from core.path_resolver import minio_wiki_prefix, minio_concepts_prefix
 from core.content_validator import is_substantive_content, validate_abstract
 
+# 把 LLM 错误生成的 markdown 链接转回 [[wikilink]]
+_MD_LINK_RE = re.compile(
+    r'\[([^\]]+)\]\((?:#wiki:)?[^)]*\)'  # [text](...) 或 [text](#wiki:...)
+)
+def _fix_links(text: str) -> str:
+    """将 [text](url) / [text](#wiki:xxx) 统一转为 [[text]]"""
+    def _repl(m):
+        inner = m.group(1).strip()
+        # 已经是 [[...]] 的不处理（正则不会匹配 [[ ）
+        return f'[[{inner}]]'
+    return _MD_LINK_RE.sub(_repl, text)
+
 class WikiWriter:
     def execute(self, report: dict, canonical_registry: dict = None, target_concept: str = None) -> list[str]:
         print("\n[WikiWriter] 拿到分析报告，开始物理写盘...")
         actions = report.get("actions", [])
         results = []
+
+        # 🔧 统一清洗：把 LLM 错误生成的 markdown 链接转回 [[wikilink]]
+        for _a in actions:
+            if _a.get("content"):
+                _a["content"] = _fix_links(_a["content"])
 
         # 🔄 循环检测：防止重复执行相同的操作
         seen_actions = set()
