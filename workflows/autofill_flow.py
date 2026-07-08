@@ -182,15 +182,38 @@ class AutoFillFlow:
                     )
 
                     if report and report.get("actions"):
-                        self.writer.execute(report)
-
+                        # 快照：填补前的概念文件列表
+                        _before_keys = set(k for k in s.list_keys(prefix) if k.endswith(".md"))
+                        
+                        writer_results = self.writer.execute(report)
+                        
+                        # 快照：填补后找出新建的文件
+                        _after_keys = set(k for k in s.list_keys(prefix) if k.endswith(".md"))
+                        _new_keys = _after_keys - _before_keys
+                        
+                        # 如果快照没捕捉到（名字相同但内容重建），回退到 node.md
+                        if not _new_keys:
+                            fallback_key = minio_concept_key(user_id, kb_name, f"{node}.md")
+                            if s.exists(fallback_key):
+                                _new_keys = {fallback_key}
+                        
                         # 给新生成的实体打上"待审批草稿"烙印
-                        new_key = minio_concept_key(user_id, kb_name, f"{node}.md")
-                        if s.exists(new_key):
-                            old_content = s.read_text(new_key)
-                            s.write_text(new_key, "<!-- AUTOFILL_DRAFT -->\n" + old_content)
-
-                        yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: concepts/{node}.md")
+                        DRAFT_TAG = "<" + "!-- AUTOFILL_DRAFT --" + ">"
+                        tagged_count = 0
+                        for new_key in _new_keys:
+                            if DRAFT_TAG not in s.read_text(new_key):
+                                old_content = s.read_text(new_key)
+                                s.write_text(new_key, DRAFT_TAG + "\n" + old_content)
+                                tagged_count += 1
+                        
+                        if tagged_count > 0:
+                            names = [k.split("/")[-1] for k in _new_keys]
+                            yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: {', '.join(names)}")
+                        else:
+                            yield format_log(f"  -> ⚠️ Writer 执行完成但未能创建新文件（可能内容被拦截）: [{node}]")
+                            if writer_results:
+                                for wr in writer_results[:3]:
+                                    yield format_log(f"     └─ {wr}")
                     else:
                         yield format_log(f"  -> ⏭️ 智能主编拒绝生成词条: [{node}]")
                     await asyncio.sleep(0.01)
@@ -328,16 +351,39 @@ class AutoFillFlow:
                 )
 
                 if report and report.get("actions"):
-                    self.writer.execute(report)
-
-                    # 💡 核心新增：强制给新生成的实体打上隐形的"待审批草稿"烙印
-                    target_file = concepts_dir / f"{node}.md"
-                    if target_file.exists():
-                        old_content = target_file.read_text(encoding="utf-8")
-                        # 将隐形标记压入文件最头部
-                        target_file.write_text("<" + "!-- AUTOFILL_DRAFT --" + ">\n" + old_content, encoding="utf-8")
-
-                    yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: concepts/{node}.md")
+                    # 快照：填补前的概念文件列表
+                    _before_files = set(f.stem for f in concepts_dir.glob("*.md"))
+                    
+                    writer_results = self.writer.execute(report)
+                    
+                    # 快照：填补后找出新建的文件
+                    _after_files = set(f.stem for f in concepts_dir.glob("*.md"))
+                    _new_stems = _after_files - _before_files
+                    
+                    # 回退：如果快照没捕捉到
+                    if not _new_stems:
+                        fallback = concepts_dir / f"{node}.md"
+                        if fallback.exists():
+                            _new_stems = {node}
+                    
+                    # 给新生成的实体打上"待审批草稿"烙印
+                    DRAFT_TAG = "<" + "!-- AUTOFILL_DRAFT --" + ">"
+                    tagged_count = 0
+                    for stem in _new_stems:
+                        target_file = concepts_dir / f"{stem}.md"
+                        if target_file.exists():
+                            old_content = target_file.read_text(encoding="utf-8")
+                            if DRAFT_TAG not in old_content:
+                                target_file.write_text(DRAFT_TAG + "\n" + old_content, encoding="utf-8")
+                                tagged_count += 1
+                    
+                    if tagged_count > 0:
+                        yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: {', '.join(s+'.md' for s in _new_stems)}")
+                    else:
+                        yield format_log(f"  -> ⚠️ Writer 执行完成但未能创建新文件（可能内容被拦截）: [{node}]")
+                        if writer_results:
+                            for wr in writer_results[:3]:
+                                yield format_log(f"     └─ {wr}")
                 else:
                     yield format_log(f"  -> ⏭️ 智能主编拒绝生成词条: [{node}]")
                 await asyncio.sleep(0.01)

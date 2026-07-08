@@ -243,7 +243,7 @@ class IngestFlow:
         """
         import re as _re
         _ACTION_PAT = _re.compile(
-            r'^(create|edit|创建|新建|生成|制作|为.{1,15}创建|为.{1,15}生成)',
+            r'^(create|edit|append|创建|新建|生成|制作|融合|阐述|补充|添加|为)',
             _re.IGNORECASE
         )
         
@@ -583,17 +583,21 @@ class IngestFlow:
                     if abstract:
                         # 取第一句（中文句号或英文句号或换行）
                         _first = re.split(r'[。\.\n]', abstract)[0][:80].strip()
-                        # 过滤动作描述泄漏
-                        if _first and not re.match(
-                            r'^(create|edit|创建|新建|生成|制作|为.{1,15}(创建|生成))',
-                            _first, re.IGNORECASE
-                        ):
+                        # 过滤动作描述泄漏（宽匹配任何任务动词）
+                        _INDEX_ACTION_RE = re.compile(
+                            r'^(create|edit|append|创建|新建|生成|制作|融合|阐述|补充|添加|为)',
+                            re.IGNORECASE
+                        )
+                        if _first and not _INDEX_ACTION_RE.match(_first):
                             summary = _first
                     break
             
             link_line = f"- [[{concept_name}]]"
             if summary:
                 link_line += f" — {summary}"
+            else:
+                # 无有效摘要时不添加 "— "，避免空摘要或泄漏
+                pass
             
             # ── 插入逻辑 ──
             MIN_SCORE = 1  # 至少 1 个关键词匹配

@@ -129,13 +129,13 @@ class WikiWriter:
                 ctx = get_context()
                 concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
                 
-                if not registry_match:
-                    # 不在注册表中，也没有模糊匹配 → 拒绝建页
+                if canonical_registry is not None and not registry_match:
+                    # Registry 激活但不在注册表中 → 拒绝建页
                     msg = f"  -> 🏛️ 拒绝创建：[{title}] 不在 Canonical Registry 中（防止 LLM 发明子概念页面）"
                     print(msg)
                     results.append(msg)
                     continue
-                elif canonical_registry and _title_norm not in canonical_registry:
+                elif canonical_registry is not None and _title_norm not in canonical_registry:
                     # normalized 不是精确 key，但模糊命中了 → 翻译变体 → 追加到已有页面
                     _existing_stem = registry_match.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
                     _existing_key = None
@@ -183,13 +183,12 @@ class WikiWriter:
                     print(msg)
                     results.append(msg)
                     continue
-                # 检查内容是否只是动作描述（"create"、"create BPE 概念页面" 等）
-                _action_pattern = _re.compile(
-                    r'^(create|edit|创建|新建|生成|制作|为.{1,10}创建.{0,20}(概念|页面|条目))[^。\n]{0,50}$',
-                    _re.IGNORECASE
-                )
-                if _action_pattern.match(_raw_content):
-                    msg = f"  -> 🚫 拦截空壳创建：[{safe_title}] 内容仅是动作描述（\"{_raw_content[:60]}\"），已丢弃。"
+                # 检查内容是否只是动作描述（"create"、"创建XX概念页面" 等）
+                # 宽匹配：任何以任务动词开头的短文本（<300字符）都视为空壳
+                _ACTION_VERBS = r'^(create|edit|delete|append|创建|新建|生成|制作|融合|阐述|补充|添加|为.{0,20}(创建|生成|融合|新建))'
+                _action_pattern = _re.compile(_ACTION_VERBS, _re.IGNORECASE)
+                if _action_pattern.match(_raw_content) and len(_raw_content) < 300:
+                    msg = f"  -> 🚫 拦截空壳创建：[{safe_title}] 内容仅是动作描述（{len(_raw_content)}字符: \"{_raw_content[:60]}...\"），已丢弃。"
                     print(msg)
                     results.append(msg)
                     continue
@@ -260,12 +259,12 @@ class WikiWriter:
                     # 🏛️ Canonical Registry 验证 + 翻译变体查找
                     _e_norm = _normalize(_e_target_stem)
                     _e_registry_match = _find_registry_match(_e_target_stem)
-                    if not _e_registry_match:
+                    if canonical_registry is not None and not _e_registry_match:
                         msg = f"  -> 🏛️ 拒绝编辑：[{_e_target_stem}] 不在 Canonical Registry 中"
                         print(msg)
                         results.append(msg)
                         continue
-                    elif canonical_registry and _e_norm not in canonical_registry:
+                    elif canonical_registry is not None and _e_norm not in canonical_registry:
                         # 模糊命中（翻译变体）→ 重定向到注册表中的正确名字
                         _e_canonical = _e_registry_match.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
                         raw_file = f"concepts/{_e_canonical}.md"
