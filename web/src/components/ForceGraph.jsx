@@ -7,6 +7,7 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
   const { apiFetch } = useAuth()
   const fgRef = useRef()
   const [graphData, setGraphData] = useState({ nodes: [], links: [] })
+  const [aliases, setAliases] = useState({})  // wikilink简称 → 节点全名
 
   // 拓扑高亮状态
   const [highlightNodes, setHighlightNodes] = useState(new Set())
@@ -21,6 +22,7 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
   useEffect(() => {
     if (!selectedSandbox) {
       setGraphData({ nodes: [], links: [] })
+      setAliases({})
       return
     }
 
@@ -32,6 +34,7 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
           validNodeIds.has(link.source) && validNodeIds.has(link.target)
         )
         setGraphData({ nodes: data.nodes, links: safeLinks })
+        setAliases(data.aliases || {})
       })
       .catch(err => console.error("星图获取失败:", err))
   }, [selectedSandbox])
@@ -201,7 +204,9 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
                   // 🚀 核心双链点击拦截（加入黑洞视觉识别） 🚀
                   a: ({node, href, children, ...props}) => {
                     if (href && href.startsWith('#wiki:')) {
-                      const targetConcept = decodeURIComponent(href.replace('#wiki:', ''))
+                      const rawConcept = decodeURIComponent(href.replace('#wiki:', ''))
+                      // 用别名映射解析简称 → 全名
+                      const targetConcept = aliases[rawConcept] || rawConcept
 
                       // 💡 渲染时就进行判定：去星图节点里找，看看它是不是真实的物理节点
                       const realNode = graphData.nodes.find(n => n.id === targetConcept && !n.is_blackhole)

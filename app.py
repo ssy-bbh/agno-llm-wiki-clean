@@ -1919,7 +1919,8 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
         # 2. 构建节点集合 + 别名索引（支持简称匹配）
         nodes = []
         node_set = set()
-        _alias_map = {}  # normalized_alias -> canonical_node_id
+        _alias_map = {}  # normalized -> canonical (for backend link resolution)
+        _aliases = {}    # raw_wikilink_text -> canonical_node_id (for frontend)
         for key in concept_keys:
             name = _minio_concept_name(key)
             nodes.append({"id": name, "group": 1})
@@ -1929,10 +1930,13 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
             _alias_map[_norm] = name
             _en = re.match(r'^([A-Za-z][A-Za-z0-9 _-]*)', name)
             if _en:
-                _alias_map[re.sub(r'[^a-zA-Z0-9]', '', _en.group(1)).lower()] = name
+                _en_clean = re.sub(r'[^a-zA-Z0-9]', '', _en.group(1)).lower()
+                _alias_map[_en_clean] = name
+                _aliases[_en.group(1).strip()] = name  # "BPE" -> "BPE (字节对编码)"
             _zh = re.findall(r'[\u4e00-\u9fa5]{2,}', name)
             for z in _zh:
                 _alias_map[z.lower()] = name
+                _aliases[z] = name  # "字节对编码" -> "BPE (字节对编码)"
 
         # 3. 读取每个概念内容，提取 [[链接]] 构建边
         links = []
@@ -1961,7 +1965,7 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
                         _seen_links.add(_link_key)
                         links.append({"source": source, "target": resolved})
 
-        return {"nodes": nodes, "links": links}
+        return {"nodes": nodes, "links": links, "aliases": _aliases}
 
     # ── 本地模式 ──
     base_dir = get_wiki_root(user_id) / workspace
@@ -1973,6 +1977,7 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
 
     nodes, links, node_set = [], [], set()
     _alias_map = {}  # normalized_alias -> canonical_node_id
+    _aliases = {}    # raw_wikilink_text -> canonical_node_id (for frontend)
     try:
         for fp in search_dir.rglob("*.md"):
             name = fp.stem
@@ -1985,10 +1990,13 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
             _alias_map[_norm] = name
             _en = re.match(r'^([A-Za-z][A-Za-z0-9 _-]*)', name)
             if _en:
-                _alias_map[re.sub(r'[^a-zA-Z0-9]', '', _en.group(1)).lower()] = name
+                _en_clean = re.sub(r'[^a-zA-Z0-9]', '', _en.group(1)).lower()
+                _alias_map[_en_clean] = name
+                _aliases[_en.group(1).strip()] = name
             _zh = re.findall(r'[\u4e00-\u9fa5]{2,}', name)
             for z in _zh:
                 _alias_map[z.lower()] = name
+                _aliases[z] = name
 
         _seen_links = set()
         for fp in search_dir.rglob("*.md"):
@@ -2013,7 +2021,7 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
                         _seen_links.add(_link_key)
                         links.append({"source": source, "target": resolved})
 
-        return {"nodes": nodes, "links": links}
+        return {"nodes": nodes, "links": links, "aliases": _aliases}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
