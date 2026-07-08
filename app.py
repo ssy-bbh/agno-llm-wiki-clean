@@ -1916,16 +1916,27 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
         if not concept_keys:
             return {"nodes": [], "links": []}
 
-        # 2. 构建节点集合
+        # 2. 构建节点集合 + 别名索引（支持简称匹配）
         nodes = []
         node_set = set()
+        _alias_map = {}  # normalized_alias -> canonical_node_id
         for key in concept_keys:
             name = _minio_concept_name(key)
             nodes.append({"id": name, "group": 1})
             node_set.add(name.lower())
+            # 注册别名：全名、括号内中文名、括号前英文名
+            _norm = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', name).lower()
+            _alias_map[_norm] = name
+            _en = re.match(r'^([A-Za-z][A-Za-z0-9 _-]*)', name)
+            if _en:
+                _alias_map[re.sub(r'[^a-zA-Z0-9]', '', _en.group(1)).lower()] = name
+            _zh = re.findall(r'[\u4e00-\u9fa5]{2,}', name)
+            for z in _zh:
+                _alias_map[z.lower()] = name
 
         # 3. 读取每个概念内容，提取 [[链接]] 构建边
         links = []
+        _seen_links = set()
         for key in concept_keys:
             source = _minio_concept_name(key)
             try:
@@ -1936,8 +1947,19 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
                 target = match.split("|")[0].strip()
                 if target.lower() == "index":
                     continue
+                # 精确匹配 → 别名匹配
+                resolved = None
                 if target.lower() in node_set:
-                    links.append({"source": source, "target": target})
+                    resolved = target
+                else:
+                    _t_norm = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', target).lower()
+                    if _t_norm in _alias_map:
+                        resolved = _alias_map[_t_norm]
+                if resolved and resolved != source:
+                    _link_key = (source, resolved)
+                    if _link_key not in _seen_links:
+                        _seen_links.add(_link_key)
+                        links.append({"source": source, "target": resolved})
 
         return {"nodes": nodes, "links": links}
 
@@ -1950,6 +1972,7 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
         return {"nodes": [], "links": []}
 
     nodes, links, node_set = [], [], set()
+    _alias_map = {}  # normalized_alias -> canonical_node_id
     try:
         for fp in search_dir.rglob("*.md"):
             name = fp.stem
@@ -1957,7 +1980,17 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
                 continue
             nodes.append({"id": name, "group": 1})
             node_set.add(name.lower())
+            # 注册别名
+            _norm = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', name).lower()
+            _alias_map[_norm] = name
+            _en = re.match(r'^([A-Za-z][A-Za-z0-9 _-]*)', name)
+            if _en:
+                _alias_map[re.sub(r'[^a-zA-Z0-9]', '', _en.group(1)).lower()] = name
+            _zh = re.findall(r'[\u4e00-\u9fa5]{2,}', name)
+            for z in _zh:
+                _alias_map[z.lower()] = name
 
+        _seen_links = set()
         for fp in search_dir.rglob("*.md"):
             source = fp.stem
             if source.lower() == "index":
@@ -1967,8 +2000,18 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
                 target = match.split("|")[0].strip()
                 if target.lower() == "index":
                     continue
+                resolved = None
                 if target.lower() in node_set:
-                    links.append({"source": source, "target": target})
+                    resolved = target
+                else:
+                    _t_norm = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', target).lower()
+                    if _t_norm in _alias_map:
+                        resolved = _alias_map[_t_norm]
+                if resolved and resolved != source:
+                    _link_key = (source, resolved)
+                    if _link_key not in _seen_links:
+                        _seen_links.add(_link_key)
+                        links.append({"source": source, "target": resolved})
 
         return {"nodes": nodes, "links": links}
     except Exception as e:
