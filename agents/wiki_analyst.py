@@ -52,7 +52,7 @@ class WikiAnalyst:
         
         # 📉 分层模型：MAP 提取是简单任务，用轻量模型省 90% 费用
         self.agent = Agent(
-            model=get_qwen_model(model_id="qwen-plus"),
+            model=get_qwen_model(role="map"),
             instructions=[effective_instructions],
             output_schema=AnalysisReport,
             stream=False

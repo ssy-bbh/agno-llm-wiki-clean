@@ -113,12 +113,8 @@ class WikiEditor:
            - `title`：新子地图的名称（如 "YOLO系列演进 MOC"）。
            - `content`：新子地图的完整正文（包含领域摘要、分类标题以及所有的具体链接）。
         """
-        # 🎯 模型分层：REDUCE 融合+建页是复杂任务，必须用强模型
-        # MAP/Schema 等简单阶段用 qwen-plus/turbo，这里用 deepseek-v4-pro
-        import os
-        _editor_model_id = os.getenv("EDITOR_MODEL_ID", "deepseek-v4-pro")
         self.agent = Agent(
-            model=get_qwen_model(model_id=_editor_model_id),
+            model=get_qwen_model(role="editor"),
             instructions=[self.instructions],
             output_schema=EditorReport,
             stream=False
@@ -196,9 +192,16 @@ class WikiEditor:
             user_prompt += f"""
         ---
         🎯 【当前融合目标】: {target_concept}
-        你正在处理这一个概念的融合任务。你只能为这个概念生成 create/edit/append_link actions。
+        你正在处理这一个概念的融合任务。你只能为这个概念生成 create/edit/merge_into/append_link actions。
         ⚠️ 绝对禁止为其他概念创建新页面！资料中涉及的其他概念内容，作为当前概念的正文写入。
         ✅ 但你仍然必须为该概念生成 append_link action，将其分类追加到 index.md 导航地图中。
+        
+        🔀 【变体合并】: 如果当前目标概念在实质上只是某个已有概念的变体、子类型或实现方式
+        （例如 "Inverted Dropout" 是 "Dropout" 的变体），
+        你可以输出 merge_into action 将内容追加到已有页面，而不是创建独立页面：
+        {{"type": "merge_into", "file": "concepts/已有概念.md", "content": "关于变体的知识内容...", "rationale": "理由"}}
+        ⚠️ merge_into 的 file 必须指向已存在的文件，content 必须包含该变体的实质知识（定义、原理、公式、对比）。
+        ⚠️ 只有当目标概念确实只是已有概念的变体时才用 merge_into，不要用 merge_into 来偷懒。
         """
 
         # 🏛️ Canonical Registry 约束：Editor 只能用注册表里的名字
@@ -269,7 +272,7 @@ class WikiEditor:
                 # ── 内容质量验证：检查每个 create/edit 的 content 是否含实质知识 ──
                 _content_errors = []
                 for act in result.get("actions", []):
-                    if act.get("type") in ("create", "edit"):
+                    if act.get("type") in ("create", "edit", "merge_into"):
                         _content = (act.get("content") or "").strip()
                         _title = act.get("title") or act.get("file", "")
                         _ok, _reason = is_substantive_content(_content, concept_name=_title, min_score=2)

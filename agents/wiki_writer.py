@@ -216,6 +216,14 @@ class WikiWriter:
                 # ── 摘要清洗（正向检测，无知识信号则清空）──
                 _raw_abstract = validate_abstract((action.get("abstract") or "").strip())
 
+                # 🧹 去掉 content 开头的重复一级标题（Editor 输出通常以 # Title 开头）
+                _raw_content = re.sub(r'^#\s+.+\n+', '', _raw_content, count=1).strip()
+
+                # 🧠 Abstract 为空时，从 content 提取第一段作为摘要
+                if not _raw_abstract and _raw_content:
+                    _first_para = _raw_content.split('\n\n')[0].strip()
+                    _raw_abstract = validate_abstract(_first_para[:300])
+
                 # 🛡️ 物理拦截雷达启动（统一存储接口，消除 MinIO/Local 分支）
                 found_existing_key = None
                 all_concept_keys = s.list_keys(concepts_prefix)
@@ -230,7 +238,11 @@ class WikiWriter:
                     _ex_name = found_existing_key.split("/")[-1]
                     print(f"  -> 🛡️ 拦截创建冲突：同义词文件 [{_ex_name}] 已存在，自动转为 [增量追加]...")
                     safe_new_content = action.get("content", "").replace("\\n", "\n")
-                    updated_content = s.read_text(found_existing_key) + f"\n\n---\n### 🧠 增量融合视角 ({title})\n{safe_new_content}\n"
+                    # 🧹 剥掉 Editor 输出里的 YAML frontmatter（避免双重 frontmatter）
+                    _stripped = re.sub(r'^---\n.*?\n---\n\s*', '', safe_new_content, count=1, flags=re.DOTALL)
+                    # 🧹 去掉重复的一级标题（Editor 输出通常以 # Title 开头）
+                    _stripped = re.sub(r'^# .+\n+', '', _stripped, count=1)
+                    updated_content = s.read_text(found_existing_key) + f"\n\n---\n### 🧠 增量融合视角 ({title})\n{_stripped}\n"
                     s.write_text(found_existing_key, updated_content)
                     results.append(f"成功合并至: {_ex_name}")
                     continue
@@ -300,6 +312,15 @@ class WikiWriter:
                             results.append(msg)
                             continue
                         _fb_abstract = validate_abstract((action.get("abstract") or "").strip())
+
+                        # 🛡️ 文件已存在（如 autofill 空壳）→ 直接覆盖，避免 create_page 双重 frontmatter
+                        _fb_key = _resolve_key(raw_file)
+                        if s.exists(_fb_key):
+                            print(f"  -> 🔄 编辑目标存在(空壳)，直接覆盖：[{_fallback_title}]")
+                            s.write_text(_fb_key, _fallback_content)
+                            results.append(f"成功覆盖空壳文件: {_fallback_title}")
+                            continue
+
                         print(f"  -> 🔄 编辑目标不存在，降级为创建：[{_fallback_title}]")
                         res = create_page(raw_file, _fallback_title, action.get("tags", []), _fb_abstract, _fallback_content)
                         print(f"  -> {res}")
@@ -412,6 +433,84 @@ class WikiWriter:
                     s.write_text(_m_idx_key, '\n'.join(new_lines))
 
                     print(f"  -> ✂️ [精细截断] index.md 导航地图已优雅折叠至 [[{moc_title}]] (已保留上下文描述)")
+
+            elif act_type == "merge_into":
+                # 🔀 变体合并：将当前概念内容追加到已有概念的页面中
+                merge_target = raw_file.replace("concepts/", "").replace(".md", "")
+                merge_content = (action.get("content") or "").replace("\\n", "\n").strip()
+                merge_rationale = action.get("rationale", "")
+
+                # 1. 内容实质性检查
+                if not merge_content or len(merge_content) < 40:
+                    msg = f"  -> 🚫 拦截空壳合并：[{target_concept}] 内容过短（{len(merge_content)}字符 < 40）"
+                    print(msg)
+                    results.append(msg)
+                    continue
+                _m_ok, _m_reason = is_substantive_content(merge_content, concept_name=target_concept)
+                if not _m_ok:
+                    msg = f"  -> 🚫 拦截空壳合并：[{target_concept}] {_m_reason}"
+                    print(msg)
+                    results.append(msg)
+                    continue
+
+                # 2. 定位目标文件
+                s = get_storage()
+                ctx = get_context()
+                concepts_prefix = minio_concepts_prefix(ctx["user_id"], ctx["kb_name"])
+                all_keys = s.list_keys(concepts_prefix)
+                merge_key = None
+                for _mk in all_keys:
+                    if _mk.endswith(".md"):
+                        _mk_stem = _mk.split("/")[-1].replace(".md", "")
+                        if _is_same_concept(_mk_stem, merge_target) or _is_target(_mk_stem):
+                            merge_key = _mk
+                            break
+
+                # 也尝试 registry 匹配
+                if not merge_key:
+                    registry_match = _find_registry_match(merge_target)
+                    if registry_match:
+                        _r_stem = registry_match.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_")
+                        for _mk in all_keys:
+                            if _mk.endswith(".md"):
+                                _mk_stem = _mk.split("/")[-1].replace(".md", "")
+                                if _is_same_concept(_mk_stem, _r_stem):
+                                    merge_key = _mk
+                                    break
+
+                if not merge_key:
+                    # 目标文件不存在 → 降级为创建当前概念的独立页面
+                    print(f"  -> 🔄 合并目标 [{merge_target}] 不存在，降级为创建 [{target_concept}]")
+                    _fb_abstract = validate_abstract((action.get("abstract") or "").strip())
+                    res = create_page(
+                        f"concepts/{target_concept}.md",
+                        target_concept,
+                        action.get("tags", []),
+                        _fb_abstract,
+                        merge_content
+                    )
+                    print(f"  -> {res}")
+                    results.append(res)
+                    continue
+
+                # 3. 追加内容到目标文件的 Details 段之后
+                existing = s.read_text(merge_key)
+                merge_header = f"### 🧠 变体/子类型: {target_concept}"
+                if merge_header in existing:
+                    print(f"  -> ⏭️ 幂等跳过：[{merge_key}] 已包含 [{target_concept}] 的内容")
+                    results.append(f"幂等跳过: {target_concept} 已合并")
+                    continue
+
+                # 追加内容
+                existing = existing.rstrip()
+                updated = f"{existing}\n\n{merge_header}\n{merge_content}\n"
+                s.write_text(merge_key, updated)
+                merge_display = merge_key.split("/")[-1].replace(".md", "")
+                msg = f"成功合并 [{target_concept}] → [{merge_display}]"
+                print(f"  -> 🔀 {msg}")
+                if merge_rationale:
+                    print(f"     理由: {merge_rationale}")
+                results.append(msg)
 
             elif act_type == "append_link":
                 # 🚫 Schema 模式下跳过 Editor 的 append_link：

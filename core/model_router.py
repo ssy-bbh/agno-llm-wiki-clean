@@ -37,6 +37,18 @@ PRESET_PROVIDERS = {
         "model_id": "deepseek-ai/DeepSeek-V3",
         "env_key": "SILICONFLOW_API_KEY",
     },
+    "glm52": {
+        "name": "GLM 5.2 (智谱 · 公司部署)",
+        "base_url": "http://10.180.1.202:30000/v1",
+        "model_id": "/models/GLM-5.2-W4A8",
+        "env_key": "GLM_API_KEY",
+    },
+    "dsv4pro_internal": {
+        "name": "DeepSeek V4 Pro (公司部署)",
+        "base_url": "http://10.180.1.206:30000/v1",
+        "model_id": "deepseek-v4-pro",
+        "env_key": "DSV4PRO_API_KEY",
+    },
     "custom": {
         "name": "自定义 (OpenAI 兼容)",
         "base_url": "",
@@ -114,17 +126,24 @@ def _get_user_default_provider(user_id: str) -> Optional[dict]:
 
 
 def get_default_model() -> OpenAILike:
-    """获取系统默认模型（从 .env 读取）"""
-    api_key = os.getenv("QWEN_API_KEY")
-    if not api_key:
-        raise ValueError("⚠️ 未找到 QWEN_API_KEY，请检查 .env 文件！")
-
-    return OpenAILike(
-        id=os.getenv("QWEN_MODEL_ID", "deepseek-v4-pro"),
-        api_key=api_key,
-        base_url=os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        role_map={"system": "system", "user": "user", "assistant": "assistant", "tool": "tool"},
-    )
+    """获取系统默认模型：公司预置 GLM 5.2 → DSV4Pro → 报错"""
+    glm_key = os.getenv("GLM_API_KEY")
+    if glm_key:
+        return OpenAILike(
+            id=os.getenv("GLM_MODEL_ID", "/models/GLM-5.2-W4A8"),
+            api_key=glm_key,
+            base_url=os.getenv("GLM_BASE_URL", "http://10.180.1.202:30000/v1"),
+            role_map={"system": "system", "user": "user", "assistant": "assistant", "tool": "tool"},
+        )
+    ds_key = os.getenv("DSV4PRO_API_KEY")
+    if ds_key:
+        return OpenAILike(
+            id="deepseek-v4-pro",
+            api_key=ds_key,
+            base_url=os.getenv("DSV4PRO_BASE_URL", "http://10.180.1.206:30000/v1"),
+            role_map={"system": "system", "user": "user", "assistant": "assistant", "tool": "tool"},
+        )
+    raise ValueError("⚠️ 未找到任何模型 API Key，请检查 .env 或配置自定义 API Key！")
 
 
 def _create_model(api_key: str, base_url: str, model_id: str) -> OpenAILike:
@@ -137,7 +156,7 @@ def _create_model(api_key: str, base_url: str, model_id: str) -> OpenAILike:
             break
 
     if not base_url:
-        base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        base_url = os.getenv("DSV4PRO_BASE_URL", "http://10.180.1.206:30000/v1")
     if not model_id:
         model_id = "deepseek-v4-pro"
 

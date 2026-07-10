@@ -59,7 +59,8 @@ from core.ingest_control import (
     load_shuffle_cache, get_pending_concepts, mark_concept_done,
 )
 from core.llm_factory import set_user_context
-from core.model_router import get_model_for_user, get_default_model, list_providers
+from core.model_router import get_model_for_user, list_providers
+from core.llm_factory import get_qwen_model
 
 from workflows.query_flow import QueryFlow
 from workflows.lint_flow import LintFlow
@@ -234,7 +235,7 @@ class IntentRouter:
     def __init__(self):
         from agno.agent import Agent
         self.agent = Agent(
-            model=get_default_model(),
+            model=get_qwen_model(),
             instructions=[
                 "你是一个意图分类器。根据用户输入判断意图。",
                 "- chat：打招呼、闲聊、夸赞、问AI身份",
@@ -1917,11 +1918,22 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
             return {"nodes": [], "links": []}
 
         # 2. 构建节点集合 + 别名索引（支持简称匹配）
+        #    过滤掉 DRAFT 标记的文件（未审批，不应出现在星图中）
+        DRAFT_TAG = "<!-- AUTOFILL_DRAFT -->"
         nodes = []
         node_set = set()
         _alias_map = {}  # normalized -> canonical (for backend link resolution)
         _aliases = {}    # raw_wikilink_text -> canonical_node_id (for frontend)
+        _draft_keys = set()  # 记录 DRAFT 文件，后续跳过
         for key in concept_keys:
+            # 跳过 DRAFT 文件（未审批）
+            try:
+                _content_check = s.read_text(key)
+                if DRAFT_TAG in _content_check:
+                    _draft_keys.add(key)
+                    continue
+            except Exception:
+                pass
             name = _minio_concept_name(key)
             nodes.append({"id": name, "group": 1})
             node_set.add(name.lower())
@@ -1942,6 +1954,8 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
         links = []
         _seen_links = set()
         for key in concept_keys:
+            if key in _draft_keys:
+                continue
             source = _minio_concept_name(key)
             try:
                 content = s.read_text(key)
@@ -1975,14 +1989,24 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
     if not base_dir.exists():
         return {"nodes": [], "links": []}
 
+    DRAFT_TAG = "<!-- AUTOFILL_DRAFT -->"
     nodes, links, node_set = [], [], set()
     _alias_map = {}  # normalized_alias -> canonical_node_id
     _aliases = {}    # raw_wikilink_text -> canonical_node_id (for frontend)
+    _draft_files = set()  # DRAFT 文件 stem 集合
     try:
         for fp in search_dir.rglob("*.md"):
             name = fp.stem
             if name.lower() == "index":
                 continue
+            # 跳过 DRAFT 文件（未审批）
+            try:
+                _fc = fp.read_text(encoding="utf-8")
+                if DRAFT_TAG in _fc:
+                    _draft_files.add(name.lower())
+                    continue
+            except Exception:
+                pass
             nodes.append({"id": name, "group": 1})
             node_set.add(name.lower())
             # 注册别名
@@ -2001,7 +2025,7 @@ async def get_graph(workspace: str, user=Depends(get_current_user)):
         _seen_links = set()
         for fp in search_dir.rglob("*.md"):
             source = fp.stem
-            if source.lower() == "index":
+            if source.lower() == "index" or source.lower() in _draft_files:
                 continue
             content = fp.read_text(encoding="utf-8")
             for match in re.findall(r'\[\[(.*?)\]\]', content):

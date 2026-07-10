@@ -18,8 +18,8 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
   const [mdContent, setMdContent] = useState('')
   const [isLoadingMd, setIsLoadingMd] = useState(false)
 
-  // 1. 初始化拉取图谱网络数据
-  useEffect(() => {
+  // 1. 拉取图谱网络数据（提取为函数，供初始化和事件刷新共用）
+  const fetchGraph = useCallback(() => {
     if (!selectedSandbox) {
       setGraphData({ nodes: [], links: [] })
       setAliases({})
@@ -37,7 +37,19 @@ export default function ForceGraph({ selectedSandbox, onNodeClick, selectedNode 
         setAliases(data.aliases || {})
       })
       .catch(err => console.error("星图获取失败:", err))
-  }, [selectedSandbox])
+  }, [selectedSandbox, apiFetch])
+
+  // 初始化拉取
+  useEffect(() => {
+    fetchGraph()
+  }, [fetchGraph])
+
+  // 监听 KB_PHYSICAL_UPDATE（审批通过/拒绝/Ingest 完成等）→ 刷新星图
+  useEffect(() => {
+    const handleKbUpdate = () => fetchGraph()
+    window.addEventListener('KB_PHYSICAL_UPDATE', handleKbUpdate)
+    return () => window.removeEventListener('KB_PHYSICAL_UPDATE', handleKbUpdate)
+  }, [fetchGraph])
 
   // 🚀 统一节点聚焦与文档调度中心
   const selectNode = useCallback((node, forceOpenModal = false) => {

@@ -241,44 +241,118 @@ class IngestFlow:
         """从概念页中提取 Abstract 段摘要（~300字），避免传全文给 LLM。
         
         会过滤掉动作描述（"创建...概念页面"等），回退到 Details 首句。
+        兼容 Editor 输出中 Abstract 段内含子标题（如 ## 概述）的情况。
         """
         import re as _re
         _ACTION_PAT = _re.compile(
             r'^(create|edit|append|action\s*=|创建|新建|生成|制作|融合|阐述|补充|添加|为)',
             _re.IGNORECASE
         )
+        _MAJOR_SECTIONS = ["## Details", "## Related", "## References", "## 知识缺口"]
+        
+        def _extract_text_from_section(section_text: str) -> str:
+            """从段落文本中跳过子标题，提取实际内容"""
+            lines = []
+            for line in section_text.strip().split("\n"):
+                stripped = line.strip()
+                if stripped.startswith("## "):  # 跳过子标题（如 ## 概述）
+                    continue
+                if stripped and len(stripped) > 10:
+                    lines.append(stripped)
+            return "\n".join(lines)[:500]
         
         abstract = ""
-        # 优先提取 ## Abstract 到下一个 ## 之间的内容
+        # 优先提取 ## Abstract 到下一个主段落（## Details 等）之间的内容
         if "## Abstract" in content:
             after = content.split("## Abstract", 1)[1]
-            if "\n## " in after:
-                after = after.split("\n## ", 1)[0]
-            abstract = after.strip()[:500]
+            end_pos = len(after)
+            for ms in _MAJOR_SECTIONS:
+                pos = after.find(ms)
+                if pos != -1 and pos < end_pos:
+                    end_pos = pos
+            section_text = after[:end_pos]
+            abstract = _extract_text_from_section(section_text)
         
         # 检查 abstract 是否是动作描述 → 如果是，回退到 Details 首句
         if abstract and _ACTION_PAT.match(abstract):
-            abstract = ""  # 标记为无效
+            abstract = ""
         
-        # 回退：从 Details 段取首句
+        # 回退：从 Details 段取实际文本
         if not abstract and "## Details" in content:
             details = content.split("## Details", 1)[1]
-            if "\n## " in details:
-                details = details.split("\n## ", 1)[0]
-            first_line = ""
-            for line in details.strip().split("\n"):
-                line = line.strip()
-                if line and not line.startswith("#") and len(line) > 10:
-                    first_line = line
+            end_pos = len(details)
+            for ms in ["## Related", "## References", "## 知识缺口"]:
+                pos = details.find(ms)
+                if pos != -1 and pos < end_pos:
+                    end_pos = pos
+            section_text = details[:end_pos]
+            lines = []
+            for line in section_text.strip().split("\n"):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if stripped and len(stripped) > 10:
+                    lines.append(stripped)
                     break
-            if first_line and not _ACTION_PAT.match(first_line):
-                abstract = first_line[:200]
+            if lines and not _ACTION_PAT.match(lines[0]):
+                abstract = lines[0][:200]
         
-        # 最终回退：取前 300 字（跳过 frontmatter）
+        # 最终回退：跳过 frontmatter + 标题行，取实际内容
         if not abstract:
             body = content.split("---\n")[-1] if "---" in content else content
-            return body[:300]
+            lines = []
+            for line in body.split("\n"):
+                stripped = line.strip()
+                if stripped.startswith("#") or stripped.startswith(">"):
+                    continue
+                if stripped:
+                    lines.append(stripped)
+            return "\n".join(lines)[:300]
         return abstract
+
+    @staticmethod
+    def _readable_summary(text: str) -> str:
+        """从 Abstract 中提取可读摘要（语义完整，不硬截断）。
+        
+        规则：
+        1. 过滤掉标题行（# 开头）和元信息（> 开头）
+        2. 优先按句号/英文句号/换行分割，取第一句
+        3. 如果第一句太短（<15字），拼接第二句
+        4. 如果第一句太长（>150字），在逗号处断开
+        5. 最终不超过 150 字符
+        """
+        if not text:
+            return ""
+        # 过滤掉标题行和元信息
+        clean_lines = []
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith(">") or stripped.startswith("---"):
+                continue
+            clean_lines.append(stripped)
+        clean_text = "".join(clean_lines)
+        if not clean_text:
+            return ""
+        # 按句号分割
+        sentences = re.split(r'[。\.]+', clean_text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        if not sentences:
+            return ""
+        first = sentences[0]
+        # 太短则拼接下一句
+        if len(first) < 15 and len(sentences) > 1:
+            first = f"{sentences[0]}。{sentences[1]}".strip()
+        # 太长则在逗号处断开
+        if len(first) > 150:
+            parts = re.split(r'[，,]', first)
+            built = parts[0]
+            for p in parts[1:]:
+                if len(built) + len(p) + 1 <= 150:
+                    built += f"，{p}"
+                else:
+                    break
+            first = built
+        return first[:150].strip()
 
     def _map_extract(self, chunk, chunk_id):
         """Map 阶段的核心逻辑：只提取，不写盘"""
@@ -335,19 +409,18 @@ class IngestFlow:
             print("  🔬 [Schema Phase 0] 首次摄入，推断领域编译约定...")
             prompt = build_phase0_prompt(kb_name, sample_chunks)
 
-            # Schema 是全局唯一的编译指南，用最聪明的模型 + 重试
+            # Schema 是全局唯一的编译指南 + 重试
             from core.llm_factory import get_qwen_model
             from agno.agent import Agent
             from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-            _schema_model_id = os.environ.get("SCHEMA_MODEL_ID", "deepseek-v4-pro")
             agent = Agent(
-                model=get_qwen_model(model_id=_schema_model_id),
+                model=get_qwen_model(role="schema"),
                 instructions=["你是一个领域知识分析专家。"],
                 stream=False,
             )
 
-            _SCHEMA_TIMEOUT = 60  # Schema 重要，给更多时间
+            _SCHEMA_TIMEOUT = 120
             schema_text = None
             for _attempt in range(2):  # 最多重试 1 次
                 pool = ThreadPoolExecutor(max_workers=1)
@@ -430,7 +503,6 @@ class IngestFlow:
             return
         try:
             from core.path_resolver import minio_suggestions_key, minio_log_key, get_suggestions_path, get_log_path
-            from core.llm_factory import get_qwen_model
             from agno.agent import Agent
 
             s = get_storage()
@@ -451,16 +523,17 @@ class IngestFlow:
                 return
 
             prompt = build_suggestion_prompt(existing_sug, recent_log)
+            from core.llm_factory import get_qwen_model
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError
             agent = Agent(
-                model=get_qwen_model(model_id="qwen-plus"),
+                model=get_qwen_model(role="schema_suggest"),
                 instructions=["你是知识库的 Schema 演化顾问。"],
                 stream=False,
             )
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError
             pool = ThreadPoolExecutor(max_workers=1)
             future = pool.submit(agent.run, prompt)
             try:
-                response = future.result(timeout=60)
+                response = future.result(timeout=120)
             except FuturesTimeoutError:
                 print("  ⏰ [Schema] 建议生成超时，跳过")
                 pool.shutdown(wait=False, cancel_futures=True)
@@ -515,7 +588,9 @@ class IngestFlow:
                 from core.path_resolver import minio_index_key, minio_concepts_prefix
                 idx_key = minio_index_key(user_id, kb_name)
                 if not s.exists(idx_key):
-                    return
+                    # 创建初始 index.md
+                    initial = f"# {kb_name} - 知识导航\n\n## 概念\n"
+                    s.write_text(idx_key, initial)
                 index_content = s.read_text(idx_key)
                 prefix = minio_concepts_prefix(user_id, kb_name)
                 concept_keys = s.list_keys(prefix)
@@ -523,7 +598,9 @@ class IngestFlow:
                 from tools.edit_tools import _resolve
                 idx_path = _resolve("index.md")
                 if not idx_path.exists():
-                    return
+                    # 创建初始 index.md
+                    idx_path.parent.mkdir(parents=True, exist_ok=True)
+                    idx_path.write_text(f"# {kb_name} - 知识导航\n\n## 概念\n", encoding="utf-8")
                 index_content = idx_path.read_text(encoding="utf-8")
                 concepts_dir = _resolve("concepts")
                 concept_keys = [f for f in concepts_dir.glob("*.md")] if concepts_dir.exists() else []
@@ -601,8 +678,20 @@ class IngestFlow:
                     content = s.read_text(ck) if USE_MINIO else ck.read_text(encoding="utf-8")
                     abstract = self._extract_abstract(content)
                     if abstract:
-                        # 取第一句（中文句号或英文句号或换行）
-                        _first = re.split(r'[。\.\n]', abstract)[0][:80].strip()
+                        # 取第一句（优先句号，无句号则放宽到逗号或 150 字符）
+                        _sentences = re.split(r'[。\.\n]', abstract)
+                        _first = _sentences[0].strip()
+                        if len(_first) < 15 and len(_sentences) > 1:
+                            _first = f"{_sentences[0]}。{_sentences[1]}".strip()
+                        if len(_first) > 150:
+                            _comma_parts = re.split(r'[，,]', _first)
+                            _built = _comma_parts[0]
+                            for _cp in _comma_parts[1:]:
+                                if len(_built) + len(_cp) + 1 <= 150:
+                                    _built += f"，{_cp}"
+                                else:
+                                    break
+                            _first = _built
                         # 正向知识信号检测（无信号 = 动作描述 → 清空）
                         _first = validate_abstract(_first)
                         if _first:
@@ -813,8 +902,7 @@ class IngestFlow:
                         if self._normalize_name(stem) == norm:
                             content = get_storage().read_text(ck)
                             abs_text = self._extract_abstract(content)
-                            # 取第一句作为摘要
-                            first_sentence = abs_text.split("。")[0].split("\n")[0][:80] if abs_text else ""
+                            first_sentence = self._readable_summary(abs_text)
                             if first_sentence:
                                 summary_map[lk] = first_sentence
                             break
@@ -823,7 +911,7 @@ class IngestFlow:
                         if self._normalize_name(cf.stem) == norm:
                             content = cf.read_text(encoding="utf-8")
                             abs_text = self._extract_abstract(content)
-                            first_sentence = abs_text.split("。")[0].split("\n")[0][:80] if abs_text else ""
+                            first_sentence = self._readable_summary(abs_text)
                             if first_sentence:
                                 summary_map[lk] = first_sentence
                             break

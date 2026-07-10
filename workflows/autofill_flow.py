@@ -152,6 +152,8 @@ class AutoFillFlow:
             yield format_log("🪄 正在物理启动熔炉，呼叫 WikiEditor / WikiWriter 智能体合成真空实体...")
             await asyncio.sleep(0.01)
 
+            filled_nodes = []  # 记录成功填补的节点名
+
             for node, count in target_ghosts:
                 yield format_log(f"✨ [实例化中] 正在驱动大模型提取上下文并合成新实体: [{node}]")
                 await asyncio.sleep(0.01)
@@ -209,6 +211,7 @@ class AutoFillFlow:
                         if tagged_count > 0:
                             names = [k.split("/")[-1] for k in _new_keys]
                             yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: {', '.join(names)}")
+                            filled_nodes.append(node)
                         else:
                             yield format_log(f"  -> ⚠️ Writer 执行完成但未能创建新文件（可能内容被拦截）: [{node}]")
                             if writer_results:
@@ -219,6 +222,26 @@ class AutoFillFlow:
                     await asyncio.sleep(0.01)
                 except Exception as e:
                     yield format_log(f"  -> ❌ 填补节点 [{node}] 发生未知阻断: {e}")
+
+            # 📝 写入 log.md（OKF 兼容）
+            if filled_nodes:
+                try:
+                    from core.schema_engine import is_enabled as schema_enabled, build_log_entry
+                    if schema_enabled():
+                        from core.path_resolver import minio_log_key
+                        entry = build_log_entry(
+                            "autofill", "知识黑洞填补",
+                            details={
+                                "filled": f"{len(filled_nodes)} 个",
+                                "nodes": ", ".join(filled_nodes),
+                                "threshold": str(self.threshold),
+                            }
+                        )
+                        log_key = minio_log_key(user_id, kb_name)
+                        existing_log = s.read_text(log_key) if s.exists(log_key) else "# 活动日志\n"
+                        s.write_text(log_key, existing_log + entry)
+                except Exception as e:
+                    yield format_log(f"  ⚠️ log.md 写入失败（不影响结果）: {e}")
 
             yield format_log("✅ [AutoFill Flow] 真空幽灵实体全部实例化完毕，图谱暗物质已清除！")
             return
@@ -324,6 +347,8 @@ class AutoFillFlow:
         yield format_log("🪄 正在物理启动熔炉，呼叫 WikiEditor / WikiWriter 智能体合成真空实体...")
         await asyncio.sleep(0.01)
 
+        filled_nodes = []  # 记录成功填补的节点名
+
         for node, count in target_ghosts:
             yield format_log(f"✨ [实例化中] 正在驱动大模型提取上下文并合成新实体: [{node}]")
             await asyncio.sleep(0.01)
@@ -379,6 +404,7 @@ class AutoFillFlow:
                     
                     if tagged_count > 0:
                         yield format_log(f"  -> 📝 [物理落盘] 自动生成草稿成功，已送入 Inbox 待审: {', '.join(s+'.md' for s in _new_stems)}")
+                        filled_nodes.append(node)
                     else:
                         yield format_log(f"  -> ⚠️ Writer 执行完成但未能创建新文件（可能内容被拦截）: [{node}]")
                         if writer_results:
@@ -389,6 +415,27 @@ class AutoFillFlow:
                 await asyncio.sleep(0.01)
             except Exception as e:
                 yield format_log(f"  -> ❌ 填补节点 [{node}] 发生未知阻断: {e}")
+
+        # 📝 写入 log.md（OKF 兼容）
+        if filled_nodes:
+            try:
+                from core.schema_engine import is_enabled as schema_enabled, build_log_entry
+                if schema_enabled():
+                    from core.path_resolver import get_log_path
+                    entry = build_log_entry(
+                        "autofill", "知识黑洞填补",
+                        details={
+                            "filled": f"{len(filled_nodes)} 个",
+                            "nodes": ", ".join(filled_nodes),
+                            "threshold": str(self.threshold),
+                        }
+                    )
+                    log_path = get_log_path(user_id, kb_name)
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    existing_log = log_path.read_text(encoding="utf-8") if log_path.exists() else "# 活动日志\n"
+                    log_path.write_text(existing_log + entry, encoding="utf-8")
+            except Exception as e:
+                yield format_log(f"  ⚠️ log.md 写入失败（不影响结果）: {e}")
 
         yield format_log("✅ [AutoFill Flow] 真空幽灵实体全部实例化完毕，图谱暗物质已清除！")
 

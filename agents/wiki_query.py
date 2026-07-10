@@ -28,7 +28,7 @@ class WikiRouter:
         3. 触发外脑：只要本地大概率不全，把 needs_web_search 设为 true。
         """
         self.agent = Agent(
-            model=get_qwen_model(),
+            model=get_qwen_model(role="query"),
             instructions=[self.instructions],
             output_schema=RouteDecision,
             stream=False
@@ -51,7 +51,7 @@ class WikiResponder:
         诚实指出哪些来自本地，哪些来自网络。遇到 imageUrl 必须用 Markdown 插入。
         """
         self.agent = Agent(
-            model=get_qwen_model(),
+            model=get_qwen_model(role="query"),
             instructions=[self.instructions],
             stream=True
         )

@@ -8,7 +8,7 @@ def get_web_researcher():
     return Agent(
         name="Web Researcher",
         role="全网深度研究与情报分析专员",
-        model=get_qwen_model(),
+        model=get_qwen_model(role="research"),
         tools=[search_web_text, parse_webpage, ask_ai_direct],
         instructions="""你是一名专业的网络研究分析师。你的任务是根据用户问题，
 利用联网搜索工具进行深度调研，并输出结构化的研究报告。
