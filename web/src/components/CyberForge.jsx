@@ -146,12 +146,18 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
           setIngestStatus('idle')
           setTerminating(false)
           // 关键修复：保留 phase=done，防止后端 finally 块将 phase 覆写为 idle
-          // 三层防护：1) 后端返回 phase=done  2) pollSeenDone  3) progressRef 当前是 done
+          // 四层防护：1) 后端返回 phase=done  2) pollSeenDone  3) progressRef 当前是 done  4) 数据字段推断
           const curPhase = progressRef.current?.phase
-          if (data.progress?.phase === 'done' || pollSeenDone || curPhase === 'done') {
+          const p = data.progress
+          const inferredDone = p?.reduce_done > 0 && p?.total_concepts > 0 && p?.reduce_done >= p?.total_concepts
+          if (data.progress?.phase === 'done' || pollSeenDone || curPhase === 'done' || inferredDone) {
             // 保留完成状态，让完成卡片能正确显示
-            if (data.progress?.phase === 'done') {
-              setProgress(data.progress)
+            if (data.progress?.phase === 'done' || inferredDone) {
+              const finalProgress = (inferredDone && data.progress?.phase !== 'done')
+                ? { ...data.progress, phase: 'done' }
+                : data.progress
+              setProgress(finalProgress)
+              if (inferredDone) console.log('[POLL] inferred done from data fields (reduce_done:', p?.reduce_done, 'total:', p?.total_concepts, ')')
             }
             // 否则保持现有 progress 不变（前端已有 phase=done）
           } else {
@@ -417,10 +423,18 @@ export default function CyberForge({ selectedSandbox, setForgeLogs }) {
           // 关键修复：如果本轮 SSE 曾收到 phase=done，保留它！
           // React 18 会将两个事件批处理，导致 phase=done 被 phase=idle 覆盖
           if (data.status === 'idle' && ingestStatusRef.current === 'ingesting') {
-            const newProgress = (seenDoneThisSession && data.phase !== 'done')
-              ? { ...data, phase: 'done' }  // 保留 done，防止 finally 覆盖
+            // 后备检测：即使 seenDoneThisSession 为 false（SSE 重连后重置），
+            // 如果数据字段表明已完成（reduce_done >= total_concepts > 0），也视为完成
+            const inferredDone = seenDoneThisSession || (
+              data.reduce_done > 0 && data.total_concepts > 0 && data.reduce_done >= data.total_concepts
+            )
+            const newProgress = (inferredDone && data.phase !== 'done')
+              ? { ...data, phase: 'done' }  // 保留/推断 done，防止 finally 覆盖
               : { ...data }
-            console.log('[SSE] idle+ingesting → seenDone:', seenDoneThisSession, 'dataPhase:', data.phase, '→ final:', newProgress.phase)
+            if (inferredDone && data.phase !== 'done') {
+              console.log('[SSE] idle+ingesting → INFERRED DONE from data fields (reduce_done:', data.reduce_done, 'total:', data.total_concepts, ')')
+            }
+            console.log('[SSE] idle+ingesting → seenDone:', seenDoneThisSession, 'inferredDone:', inferredDone, 'dataPhase:', data.phase, '→ final:', newProgress.phase)
             setIngestStatus('idle')
             setProgress(newProgress)
             setTerminating(false)

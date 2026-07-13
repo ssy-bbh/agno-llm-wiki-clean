@@ -3,6 +3,7 @@ edit_tools.py — 局部精准编辑工具 (线程安全·用户隔离版)
 """
 import os
 import threading
+import contextvars
 from pathlib import Path
 
 from core.storage import get_storage
@@ -11,27 +12,54 @@ from core.storage import get_storage
 WIKI_ROOT = Path(__file__).parent.parent / "data" / "wiki"
 
 # ═══════════════════════════════════════════════════════
-# 🧵 线程安全上下文（替代 os.environ，解决并发竞态）
+# 🧵 异步安全上下文（ContextVar：async 协程级隔离）
 # ═══════════════════════════════════════════════════════
-_ctx = threading.local()
+# 替代 threading.local()：
+#   - threading.local 按 OS 线程隔离，但 FastAPI 的 async 端点
+#     共享同一个事件循环线程，多个并发请求会互相覆盖
+#   - ContextVar 按 async 协程隔离，每个请求有独立的上下文副本
+#   - ThreadPoolExecutor.submit() 自动继承父线程的 ContextVar 值
+# ═══════════════════════════════════════════════════════
+_var_user_id = contextvars.ContextVar("edit_user_id", default="")
+_var_kb_name = contextvars.ContextVar("edit_kb_name", default="default")
+_var_sub_dir = contextvars.ContextVar("edit_sub_dir", default="")
+_var_doc_name = contextvars.ContextVar("edit_doc_name", default="")
 
 
 def set_context(user_id: str = "", kb_name: str = "default", sub_dir: str = "", doc_name: str = ""):
-    """设置当前线程的路由上下文（线程安全，不影响其他线程）"""
-    _ctx.user_id = user_id
-    _ctx.kb_name = kb_name
-    _ctx.sub_dir = sub_dir
-    _ctx.doc_name = doc_name
+    """设置当前协程/线程的路由上下文（async 安全，不影响其他请求）"""
+    _var_user_id.set(user_id)
+    _var_kb_name.set(kb_name)
+    _var_sub_dir.set(sub_dir)
+    _var_doc_name.set(doc_name)
 
 
 def get_context() -> dict:
-    """获取当前线程的路由上下文"""
+    """获取当前协程/线程的路由上下文"""
     return {
-        "user_id": getattr(_ctx, "user_id", ""),
-        "kb_name": getattr(_ctx, "kb_name", "default"),
-        "sub_dir": getattr(_ctx, "sub_dir", ""),
-        "doc_name": getattr(_ctx, "doc_name", ""),
+        "user_id": _var_user_id.get(),
+        "kb_name": _var_kb_name.get(),
+        "sub_dir": _var_sub_dir.get(),
+        "doc_name": _var_doc_name.get(),
     }
+
+
+# ═══════════════════════════════════════════════════════
+# 🔒 文件操作锁池（防止 read-modify-write 竞态）
+# ═══════════════════════════════════════════════════════
+# 同一个文件同时只能有一个线程在做 读→改→写 操作，
+# 防止两个线程同时读取相同内容、各自修改、后写覆盖先写。
+_file_lock_pool: dict[str, threading.Lock] = {}
+_file_lock_pool_guard = threading.Lock()
+
+
+def _get_file_lock(key: str) -> threading.Lock:
+    """获取文件级锁（双检锁，线程安全）"""
+    if key not in _file_lock_pool:
+        with _file_lock_pool_guard:
+            if key not in _file_lock_pool:
+                _file_lock_pool[key] = threading.Lock()
+    return _file_lock_pool[key]
 
 
 def _resolve(file_name: str) -> Path:
@@ -167,20 +195,26 @@ def create_page(file_name: str, title: str, tags: list[str], abstract: str, cont
     # 本地模式下确保目录存在
     path = _resolve(file_name)
 
-    # ── 统一查重：模糊名称匹配（去 -/_/空格/.md 后比较） ──
-    parent_prefix = str(PurePosixPath(key).parent) + "/"
-    sibling_keys = s.list_keys(parent_prefix)
-    clean_new = PurePosixPath(key).stem.lower().replace("-", "").replace("_", "").replace(" ", "")
-    for k in sibling_keys:
-        if k.endswith(".md"):
-            clean_exist = PurePosixPath(k).stem.lower().replace("-", "").replace("_", "").replace(" ", "")
-            if clean_new == clean_exist:
-                return f"⚠️ 拦截重复：{k} 已存在，规避新建：{file_name}"
+    # 🔒 文件锁：查重 + 创建是原子操作，防止并发创建同名文件
+    lock = _get_file_lock(key)
+    lock.acquire()
+    try:
+        # ── 统一查重：模糊名称匹配（去 -/_/空格/.md 后比较） ──
+        parent_prefix = str(PurePosixPath(key).parent) + "/"
+        sibling_keys = s.list_keys(parent_prefix)
+        clean_new = PurePosixPath(key).stem.lower().replace("-", "").replace("_", "").replace(" ", "")
+        for k in sibling_keys:
+            if k.endswith(".md"):
+                clean_exist = PurePosixPath(k).stem.lower().replace("-", "").replace("_", "").replace(" ", "")
+                if clean_new == clean_exist:
+                    return f"⚠️ 拦截重复：{k} 已存在，规避新建：{file_name}"
 
-    # 生成标准页面内容（统一模板，消除两个分支的重复代码）
-    body = _build_body(title, tags, abstract, content)
-    s.write_text(key, body)
-    return f"✅ 成功创建页面：{file_name}"
+        # 生成标准页面内容（统一模板，消除两个分支的重复代码）
+        body = _build_body(title, tags, abstract, content)
+        s.write_text(key, body)
+        return f"✅ 成功创建页面：{file_name}"
+    finally:
+        lock.release()
 
 
 def str_replace(file_name: str, old_str: str, new_str: str) -> str:
@@ -191,17 +225,24 @@ def str_replace(file_name: str, old_str: str, new_str: str) -> str:
     if not s.exists(key):
         return f"❌ 错误：底层工具找不到文件 ({key})"
 
-    content = s.read_text(key)
+    # 🔒 文件锁：read → modify → write 必须是原子操作，
+    # 防止两个线程同时读取相同内容、各自修改、后写覆盖先写
+    lock = _get_file_lock(key)
+    lock.acquire()
+    try:
+        content = s.read_text(key)
 
-    # 1. 尝试绝对精确匹配
-    if old_str in content:
-        s.write_text(key, content.replace(old_str, new_str, 1))
-        return f"✅ 成功修改文件：{file_name}"
+        # 1. 尝试绝对精确匹配
+        if old_str in content:
+            s.write_text(key, content.replace(old_str, new_str, 1))
+            return f"✅ 成功修改文件：{file_name}"
 
-    # 2. 尝试宽容匹配 (去掉大模型首尾乱加的换行和空格)
-    old_str_clean = old_str.strip()
-    if old_str_clean and old_str_clean in content:
-        s.write_text(key, content.replace(old_str_clean, new_str, 1))
-        return f"✅ 成功修改文件(启用宽容匹配)：{file_name}"
+        # 2. 尝试宽容匹配 (去掉大模型首尾乱加的换行和空格)
+        old_str_clean = old_str.strip()
+        if old_str_clean and old_str_clean in content:
+            s.write_text(key, content.replace(old_str_clean, new_str, 1))
+            return f"✅ 成功修改文件(启用宽容匹配)：{file_name}"
 
-    return f"❌ 找不到旧文本，大模型可能产生了格式幻觉！\n寻找的: {repr(old_str)}"
+        return f"❌ 找不到旧文本，大模型可能产生了格式幻觉！\n寻找的: {repr(old_str)}"
+    finally:
+        lock.release()

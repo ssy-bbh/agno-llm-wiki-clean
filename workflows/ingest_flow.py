@@ -326,15 +326,17 @@ class IngestFlow:
                 concept_payloads[norm_c]["texts"].append(chunk_text_val)
                 concept_payloads[norm_c]["summaries"].append(summary)
 
-        # 📉 SHUFFLE 低频过滤：只在 1 个 chunk 中出现的概念大概率是噪音
+        # 📉 SHUFFLE 低频过滤：动态阈值，短文宽容、长文严格
+        total_chunks = len(map_results)
+        min_mentions = 2 if total_chunks >= 10 else 1
         before_filter = len(concept_payloads)
         concept_payloads = {
             k: v for k, v in concept_payloads.items()
-            if len(v["texts"]) >= 2
+            if len(v["texts"]) >= min_mentions
         }
         filtered = before_filter - len(concept_payloads)
         if filtered:
-            print(f"  🗑️ 过滤低频概念: {filtered} 个（仅 1 个 chunk 提及）")
+            print(f"  🗑️ 过滤低频概念: {filtered} 个（提及 < {min_mentions} 次，总 {total_chunks} 个 chunk）")
 
         # 保存 SHUFFLE 结果到检查点缓存（供 resume 跳过 MAP+SHUFFLE）
         if user_id and kb_name and not _pending:
@@ -461,7 +463,7 @@ class IngestFlow:
             stats_parts.append(f"失败: {error_count}")
         if terminated:
             stats_parts.append("⚠️ 用户终止")
-        print(f"✅ [IngestFlow] 摄入完毕 | {' | '.join(stats_parts)} | 知识图谱已延展！")
+        print(f"✅ [IngestFlow] 文件处理完成 | {' | '.join(stats_parts)} | 知识图谱已延展！")
 
         # 返回是否被终止（供外层循环判断）
         return not terminated

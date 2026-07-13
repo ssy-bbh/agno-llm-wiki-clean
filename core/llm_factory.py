@@ -1,35 +1,39 @@
 """
 core/llm_factory.py — 统一模型工厂（BYOK 感知）
 
-通过 threading.local() 自动感知当前请求的用户上下文，
+通过 ContextVar 自动感知当前请求的用户上下文，
 委托给 model_router 返回用户配置的模型实例。
 Agent 文件无需修改，仍然调用 get_qwen_model() 即可。
 """
 import os
-import threading
+import contextvars
 from dotenv import load_dotenv
 from agno.models.openai.like import OpenAILike
 
 load_dotenv()
 
-# ── 线程级用户上下文 ──
-_ctx = threading.local()
+# ── 协程级用户上下文（ContextVar：async 安全） ──
+# 替代 threading.local()：
+#   FastAPI async 端点共享事件循环线程，threading.local 会串号；
+#   ContextVar 按协程隔离，每个 HTTP 请求有独立副本。
+_var_user_id = contextvars.ContextVar("llm_user_id", default="")
+_var_role = contextvars.ContextVar("llm_role", default="user")
 
 
 def set_user_context(user_id: str = "", role: str = "user"):
-    """在请求入口设置当前线程的用户 ID 和角色"""
-    _ctx.user_id = user_id
-    _ctx.role = role
+    """在请求入口设置当前协程的用户 ID 和角色"""
+    _var_user_id.set(user_id)
+    _var_role.set(role)
 
 
 def get_user_context() -> str:
-    """获取当前线程的用户 ID"""
-    return getattr(_ctx, "user_id", "")
+    """获取当前协程的用户 ID"""
+    return _var_user_id.get()
 
 
 def get_user_role() -> str:
-    """获取当前线程的用户角色"""
-    return getattr(_ctx, "role", "user")
+    """获取当前协程的用户角色"""
+    return _var_role.get()
 
 
 def get_qwen_model(model_id=None):

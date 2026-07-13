@@ -9,6 +9,7 @@ import json
 import uuid
 import time
 import threading
+import contextvars
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
@@ -71,11 +72,45 @@ from core.task_log import task_log, TaskOutputCapture
 # ==========================================
 # 🚀 应用生命周期
 # ==========================================
+def _backfill_api_keys():
+    """启动时回填：给没有 API Key 的老用户分配系统默认 Key"""
+    default_key = os.getenv("QWEN_API_KEY", "")
+    if not default_key:
+        return
+    from core.auth import _get_users_db
+    conn = _get_users_db()
+    try:
+        rows = conn.execute("SELECT user_id, api_keys FROM users").fetchall()
+        count = 0
+        for row in rows:
+            keys = json.loads(row["api_keys"] or "{}")
+            has_key = any(v.get("api_key") for v in keys.values())
+            if not has_key:
+                keys["qwen"] = {
+                    "api_key": default_key,
+                    "base_url": os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+                    "model_id": os.getenv("QWEN_MODEL_ID", "deepseek-v4-pro"),
+                }
+                conn.execute(
+                    "UPDATE users SET api_keys = ? WHERE user_id = ?",
+                    (json.dumps(keys, ensure_ascii=False), row["user_id"])
+                )
+                count += 1
+        if count:
+            conn.commit()
+            print(f"🔑 已为 {count} 个老用户回填系统默认 API Key")
+    except Exception as e:
+        print(f"⚠️ API Key 回填失败: {e}")
+    finally:
+        conn.close()
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """启动 / 关闭钩子"""
     # 启动时初始化
     _init_memory_db()
+    _backfill_api_keys()  # 给没有 API Key 的老用户回填系统默认 Key
     print("🧠 LLM-Wiki OS v0.2.0 已启动")
     yield
     print("👋 LLM-Wiki OS 正在关闭...")
@@ -96,7 +131,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def _set_user_context_middleware(request: Request, call_next):
-    """从 JWT 提取 user_id + role 写入 threading.local，让 llm_factory 自动选模型"""
+    """从 JWT 提取 user_id + role 写入 ContextVar，让 llm_factory 自动选模型"""
     user_id = ""
     role = "user"
     auth_header = request.headers.get("authorization", "")
@@ -682,11 +717,23 @@ _ingest_gen_lock = threading.Lock()
 _ingest_gen = {}  # (user_id, workspace) -> generation number
 
 def _next_ingest_gen(user_id: str, workspace: str) -> int:
-    """Increment and return a new generation number for this (user, workspace)."""
+    """Increment and return a new generation number for this (user, workspace).
+    同时持久化到文件，确保跨 Worker 可见。"""
     key = (user_id, workspace)
     with _ingest_gen_lock:
-        _ingest_gen[key] = _ingest_gen.get(key, 0) + 1
-        return _ingest_gen[key]
+        new_gen = _ingest_gen.get(key, 0) + 1
+        _ingest_gen[key] = new_gen
+        # 写入状态文件，让其他 Worker 的 _current_ingest_gen() 能看到
+        fpath = _INGEST_STATUS_DIR / f"{user_id}__{workspace}.json"
+        try:
+            data = {}
+            if fpath.exists():
+                data = json.loads(fpath.read_text(encoding="utf-8"))
+            data["gen"] = new_gen
+            fpath.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+        return new_gen
 
 def _current_ingest_gen(user_id: str, workspace: str) -> int:
     """Return max(in-memory gen, file gen) — ensures cross-worker visibility."""
@@ -784,9 +831,15 @@ async def user_stream_task_logs(workspace: str, request: Request, user=Depends(g
                     else:
                         # stopping / idle: 发送信号让前端知道后台已停，但保留实际进度 phase
                         # 这样前端能看到 phase="done" 并显示完成卡片
+                        # 关键修复：如果进度文件有 phase=done 但还没推送过（因为 cur_st 已非 ingesting），
+                        # 确保在此状态变更事件中包含最新进度
                         _evt = {'type': 'progress', 'status': cur_st, **prog}
                         print(f"🔔 [SSE] status={last_status}→{cur_st} phase={prog.get('phase')} total_concepts={prog.get('total_concepts')} reduce_done={prog.get('reduce_done')}", flush=True)
                         yield f"data: {json.dumps(_evt)}\n\n"
+                        # 如果 phase=done 且之前未推送过（进度时间戳未更新），再发一次显式的进度事件
+                        if prog.get('phase') == 'done' and prog_ts > last_progress_ts:
+                            yield f"data: {json.dumps({'type': 'progress', **prog})}\n\n"
+                            last_progress_ts = prog_ts
                     last_status = cur_st
         except (asyncio.CancelledError, GeneratorExit):
             pass
@@ -1329,6 +1382,24 @@ async def create_workspace(req: SandboxCreate, user=Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="非法的沙箱名称！")
 
     try:
+        # 🛡️ 防御性清理：创建新沙箱前，清除同名沙箱的所有残留状态
+        # 场景：旧沙箱被终止/删除后状态文件残留 → 新沙箱不应继承旧检查点
+        _base = Path(__file__).resolve().parent / "data"
+        _stale_files = [
+            _base / ".ingest_status" / f"{user_id}__{safe_name}.json",
+            _base / ".ingest_status" / f"{user_id}__{safe_name}_progress.json",
+            _base / ".ingest_control" / f"{user_id}__{safe_name}.checkpoint.json",
+            _base / ".ingest_control" / f"{user_id}__{safe_name}.flag",
+            _base / ".task_logs" / f"{user_id}__{safe_name}.jsonl",
+        ]
+        for _sf in _stale_files:
+            _sf.unlink(missing_ok=True)
+        # 清理内存状态
+        task_log.clear(user_id=user_id, workspace=safe_name)
+        task_log.clear_progress(user_id=user_id, workspace=safe_name)
+        clear_checkpoint(user_id, safe_name)
+        clear_terminate(user_id, safe_name)
+
         if USE_MINIO:
             # MinIO 模式：只初始化 index.md，不创建本地目录
             from core.storage import get_storage
@@ -1361,12 +1432,13 @@ async def delete_workspace(name: str, user=Depends(get_current_user)):
     dirs_to_clean = [
         base / "wiki" / user_id / safe_name,       # wiki 数据
         base / "raw" / user_id / safe_name,          # 原始上传
-        base / ".ingest_control" / user_id / safe_name,  # 摄入控制
     ]
     files_to_clean = [
-        base / ".ingest_status" / f"{user_id}__{safe_name}.json",  # 摄入状态
-        base / ".task_logs" / f"{user_id}__{safe_name}.log",        # 任务日志
-        base / ".task_logs" / f"{user_id}__{safe_name}.log.sse",   # SSE 缓冲
+        base / ".ingest_status" / f"{user_id}__{safe_name}.json",           # 摄入状态
+        base / ".ingest_status" / f"{user_id}__{safe_name}_progress.json", # 进度数据
+        base / ".ingest_control" / f"{user_id}__{safe_name}.checkpoint.json", # 检查点
+        base / ".ingest_control" / f"{user_id}__{safe_name}.flag",          # 终止标记
+        base / ".task_logs" / f"{user_id}__{safe_name}.jsonl",             # 任务日志
     ]
 
     deleted = []
@@ -1378,6 +1450,12 @@ async def delete_workspace(name: str, user=Depends(get_current_user)):
         if f.exists():
             f.unlink(missing_ok=True)
             deleted.append(str(f))
+
+    # 清理内存中的任务日志 + 进度 + 检查点 + 终止标记
+    task_log.clear(user_id=user_id, workspace=safe_name)
+    task_log.clear_progress(user_id=user_id, workspace=safe_name)
+    clear_checkpoint(user_id, safe_name)
+    clear_terminate(user_id, safe_name)
 
     # MinIO 模式：同时清理 MinIO 中的对象
     minio_deleted = 0
@@ -1528,7 +1606,8 @@ async def upload_batch_endpoint(
                                     terminated = True
                                     task_log.append(user_id, workspace, f"🛑 摄入在文件 {filename} 内被终止", "warning")
                                     break
-                                save_file_checkpoint(user_id, workspace, filename)
+                                if _current_ingest_gen(user_id, workspace) == my_gen:
+                                    save_file_checkpoint(user_id, workspace, filename)
                             except Exception as e:
                                 print(f"❌ 提取 {filename} 失败: {e}")
                             finally:
@@ -1554,7 +1633,8 @@ async def upload_batch_endpoint(
                                     terminated = True
                                     task_log.append(user_id, workspace, f"🛑 摄入在文件 {fp.name} 内被终止", "warning")
                                     break
-                                save_file_checkpoint(user_id, workspace, fp.name)
+                                if _current_ingest_gen(user_id, workspace) == my_gen:
+                                    save_file_checkpoint(user_id, workspace, fp.name)
                             except Exception as e:
                                 print(f"❌ 提取 {fp.name} 失败: {e}")
 
@@ -1568,12 +1648,20 @@ async def upload_batch_endpoint(
                         # 终止时：仅将 phase 改为 idle，保留进度数据（不归零）
                         task_log.set_progress(user_id, workspace, phase="idle")
                     else:
-                        # 正常完成：保留 done_files/done_concepts（防止重复处理），仅清除 SHUFFLE 缓存
+                        # 正常完成：显式设置 phase=done（_RE_COMPLETE 可能未被触发）
                         clear_shuffle_cache(user_id, workspace)
-                    # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
+                        prog = task_log.get_progress(user_id, workspace)
+                        task_log.set_progress(
+                            user_id, workspace,
+                            phase="done",
+                            total_concepts=prog.get("total_concepts", 0),
+                            reduce_done=prog.get("reduce_done", 0),
+                            force=True,
+                        )
                     _write_ingest_status(user_id, workspace, "idle", gen=my_gen)
 
-        threading.Thread(target=run_background_batch, daemon=True).start()
+        _ctx = contextvars.copy_context()
+        threading.Thread(target=_ctx.run, args=(run_background_batch,), daemon=True).start()
 
         return {
             "status": "success",
@@ -1717,7 +1805,8 @@ async def resume_ingest(
                             if result is False:
                                 terminated = True
                                 break
-                            save_file_checkpoint(user_id, workspace, filename)
+                            if _current_ingest_gen(user_id, workspace) == resume_gen:
+                                save_file_checkpoint(user_id, workspace, filename)
                         except Exception as e:
                             print(f"❌ {filename} 失败: {e}")
 
@@ -1730,11 +1819,20 @@ async def resume_ingest(
                         # 终止时：仅将 phase 改为 idle，保留进度数据（不归零）
                         task_log.set_progress(user_id, workspace, phase="idle")
                     else:
-                        # 正常完成：保留 done_files/done_concepts，仅清除 SHUFFLE 缓存
+                        # 正常完成：显式设置 phase=done
                         clear_shuffle_cache(user_id, workspace)
+                        prog = task_log.get_progress(user_id, workspace)
+                        task_log.set_progress(
+                            user_id, workspace,
+                            phase="done",
+                            total_concepts=prog.get("total_concepts", 0),
+                            reduce_done=prog.get("reduce_done", 0),
+                            force=True,
+                        )
                     _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
 
-        threading.Thread(target=run_resume_batch, daemon=True).start()
+        _ctx = contextvars.copy_context()
+        threading.Thread(target=_ctx.run, args=(run_resume_batch,), daemon=True).start()
 
         return {
             "status": "ok",
@@ -1813,7 +1911,8 @@ async def resume_ingest(
                         if result is False:
                             terminated = True
                             break
-                        save_file_checkpoint(user_id, workspace, fp.name)
+                        if _current_ingest_gen(user_id, workspace) == resume_gen:
+                            save_file_checkpoint(user_id, workspace, fp.name)
                     except Exception as e:
                         print(f"❌ {fp.name} 失败: {e}")
 
@@ -1827,12 +1926,20 @@ async def resume_ingest(
                     # 终止时：仅将 phase 改为 idle，保留进度数据（不归零）
                     task_log.set_progress(user_id, workspace, phase="idle")
                 else:
-                    # 正常完成：保留 done_files/done_concepts，仅清除 SHUFFLE 缓存
+                    # 正常完成：显式设置 phase=done
                     clear_shuffle_cache(user_id, workspace)
-                # 正常完成时：_RE_COMPLETE 已写入 phase=done + 正确值，不覆盖
+                    prog = task_log.get_progress(user_id, workspace)
+                    task_log.set_progress(
+                        user_id, workspace,
+                        phase="done",
+                        total_concepts=prog.get("total_concepts", 0),
+                        reduce_done=prog.get("reduce_done", 0),
+                        force=True,
+                    )
                 _write_ingest_status(user_id, workspace, "idle", gen=resume_gen)
 
-    threading.Thread(target=run_resume_batch, daemon=True).start()
+    _ctx = contextvars.copy_context()
+    threading.Thread(target=_ctx.run, args=(run_resume_batch,), daemon=True).start()
 
     return {
         "status": "ok",

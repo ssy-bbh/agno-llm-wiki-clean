@@ -12,6 +12,7 @@ from agents.wiki_editor import WikiEditor
 from agents.wiki_writer import WikiWriter
 from tools.edit_tools import _resolve, set_context
 from core.path_resolver import get_wiki_root, USE_MINIO
+from core.llm_factory import set_user_context
 
 
 class AutoFillFlow:
@@ -37,6 +38,7 @@ class AutoFillFlow:
         await asyncio.sleep(0.01)
 
         # 设置线程安全上下文(替代 os.environ,解决并发竞态)
+        set_user_context(user_id=user_id)  # LLM API Key 路由
         set_context(user_id=user_id, kb_name=kb_name, sub_dir="")
 
         if USE_MINIO:
@@ -175,7 +177,9 @@ class AutoFillFlow:
 
                 try:
                     fresh_editor = WikiEditor()
-                    report = fresh_editor.merge(
+                    # 同步 LLM 调用放入线程池，避免阻塞事件循环
+                    report = await asyncio.to_thread(
+                        fresh_editor.merge,
                         raw_text=prompt_text,
                         analyst_summary=f"这是一个高频核心实体，必须创建一个全新的详细词条：{node}",
                         existing_context=f"=== concepts/{node}.md ===\n(全新概念，待你创建)\n"
@@ -321,7 +325,9 @@ class AutoFillFlow:
 
             try:
                 fresh_editor = WikiEditor()
-                report = fresh_editor.merge(
+                # 同步 LLM 调用放入线程池，避免阻塞事件循环
+                report = await asyncio.to_thread(
+                    fresh_editor.merge,
                     raw_text=prompt_text,
                     analyst_summary=f"这是一个高频核心实体，必须创建一个全新的详细词条：{node}",
                     existing_context=f"=== concepts/{node}.md ===\n(全新概念，待你创建)\n"

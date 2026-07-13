@@ -2,6 +2,7 @@
 core/auth.py — JWT 认证 + 用户注册登录 + bcrypt 密码哈希
 """
 import os
+import json
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -154,9 +155,23 @@ def register_user(username: str, password: str) -> AuthResponse:
             raise ValueError(f"用户名 '{username}' 已被注册")
 
         pw_hash = hash_password(password)
+        
+        # 自动分配系统默认 API Key（从 .env 读取）
+        default_api_keys = "{}"
+        default_key = os.getenv("QWEN_API_KEY", "")
+        if default_key:
+            default_api_keys = json.dumps({
+                "qwen": {
+                    "api_key": default_key,
+                    "base_url": os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+                    "model_id": os.getenv("QWEN_MODEL_ID", "deepseek-v4-pro"),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }, ensure_ascii=False)
+        
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
-            (user_id, username, pw_hash)
+            "INSERT INTO users (user_id, username, password_hash, api_keys) VALUES (?, ?, ?, ?)",
+            (user_id, username, pw_hash, default_api_keys)
         )
         conn.commit()
 
