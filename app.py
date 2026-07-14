@@ -51,7 +51,7 @@ from core.auth import (
     AuthRequest, AuthResponse,
     register_user, login_user,
     get_current_user, get_optional_user, get_admin_user,
-    save_user_api_key, get_user_api_keys,
+    save_user_api_key, delete_user_api_key, get_user_api_keys,
     decode_token,
 )
 from core.ingest_control import (
@@ -111,7 +111,7 @@ async def lifespan(application: FastAPI):
     """启动 / 关闭钩子"""
     # 启动时初始化
     _init_memory_db()
-    _backfill_api_keys()  # 给没有 API Key 的老用户回填系统默认 Key
+    # _backfill_api_keys()  # 已禁用：不自动分配，让用户走系统默认 DEFAULT_PROVIDER
     print("🧠 LLM-Wiki OS v0.2.0 已启动")
     yield
     print("👋 LLM-Wiki OS 正在关闭...")
@@ -377,6 +377,16 @@ async def api_save_key(req: ApiKeySaveRequest, user=Depends(get_current_user)):
     # 清除该用户的 QueryFlow 缓存，下次请求会用新模型重建
     _query_flow_cache.pop(user["user_id"], None)
     return {"status": "success", "provider": req.provider}
+
+
+@app.delete("/api/settings/api-key/{provider}")
+async def api_delete_key(provider: str, user=Depends(get_current_user)):
+    """删除用户指定 provider 的 API Key，回退到系统默认模型"""
+    ok = delete_user_api_key(user["user_id"], provider)
+    if not ok:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    _query_flow_cache.pop(user["user_id"], None)
+    return {"status": "success", "provider": provider}
 
 
 # ==========================================

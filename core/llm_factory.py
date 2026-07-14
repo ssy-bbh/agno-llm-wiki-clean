@@ -5,28 +5,34 @@ core/llm_factory.py — 统一模型工厂（BYOK 感知，角色可配）
 切换提供商只需改 .env 的 DEFAULT_PROVIDER，无需改代码。
 """
 import os
-import threading
+import contextvars
 from dotenv import load_dotenv
 from agno.models.openai.like import OpenAILike
 
 load_dotenv()
 
-# ── 线程级用户上下文 ──
-_ctx = threading.local()
+# ── 协程级用户上下文（ContextVar：async 安全） ──
+# 替代 threading.local()：
+#   FastAPI async 端点共享事件循环线程，threading.local 会串号；
+#   ContextVar 按协程隔离，每个 HTTP 请求有独立副本。
+_var_user_id = contextvars.ContextVar("llm_user_id", default="")
+_var_role = contextvars.ContextVar("llm_role", default="user")
 
 
 def set_user_context(user_id: str = "", role: str = "user"):
-    """在请求入口设置当前线程的用户 ID 和角色"""
-    _ctx.user_id = user_id
-    _ctx.role = role
+    """在请求入口设置当前协程的用户 ID 和角色"""
+    _var_user_id.set(user_id)
+    _var_role.set(role)
 
 
 def get_user_context() -> str:
-    return getattr(_ctx, "user_id", "")
+    """获取当前协程的用户 ID"""
+    return _var_user_id.get()
 
 
 def get_user_role() -> str:
-    return getattr(_ctx, "role", "user")
+    """获取当前协程的用户角色"""
+    return _var_role.get()
 
 
 def _make_model(model_id: str, api_key: str, base_url: str) -> OpenAILike:
@@ -169,12 +175,13 @@ def get_qwen_model(model_id=None, role=None):
                     model.id = role_mid
             return model
         except Exception:
-            if ctx_role == "admin":
-                pass  # 管理员回退到系统默认
-            else:
-                raise ValueError(
-                    "你还没有配置 API Key，无法使用 AI 功能。\n\n"
-                    "👉 请点击右上角 ⚙️ **设置** → 选择模型厂商 → 输入你的 API Key 即可开始使用。"
-                )
+            # 用户没配 Key，回退到系统默认
+            pass
 
-    return _get_system_model(model_id=model_id, role=role)
+    try:
+        return _get_system_model(model_id=model_id, role=role)
+    except Exception:
+        raise ValueError(
+            "系统默认模型不可用（可能超时或未配置），请自行配置 API Key。\n\n"
+            "👉 点击右上角 ⚙️ **设置** → 选择模型厂商 → 输入你的 API Key 即可使用。"
+        )

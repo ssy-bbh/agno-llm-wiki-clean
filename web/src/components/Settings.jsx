@@ -60,6 +60,25 @@ export default function Settings({ onClose }) {
     }
   }
 
+  const handleClear = async () => {
+    if (!selectedProvider) return
+    setSaving(true)
+    setMessage('')
+    try {
+      const res = await apiFetch(`/api/settings/api-key/${selectedProvider}`, {
+        method: 'DELETE',
+      })
+      if (!res.ok) throw new Error('clear failed')
+      setMessage('cleared! using system default')
+      setApiKey('')
+      fetchProviders()
+    } catch (err) {
+      setMessage('error: ' + err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
@@ -137,13 +156,24 @@ export default function Settings({ onClose }) {
               {message && (
                 <p className={`text-xs ${message.startsWith('saved') ? 'text-emerald-400' : 'text-red-400'}`}>{message}</p>
               )}
-              <button
-                onClick={handleSave}
-                disabled={saving}
-                className="px-4 py-2 rounded-lg text-xs font-medium bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white transition-all disabled:opacity-50"
-              >
-                {saving ? 'Saving...' : '💾 Save'}
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleSave}
+                  disabled={saving}
+                  className="px-4 py-2 rounded-lg text-xs font-medium bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white transition-all disabled:opacity-50"
+                >
+                  {saving ? 'Saving...' : '💾 Save'}
+                </button>
+                {selectedProvider && providers.find(p => p.id === selectedProvider)?.configured && (
+                  <button
+                    onClick={handleClear}
+                    disabled={saving}
+                    className="px-4 py-2 rounded-lg text-xs font-medium bg-slate-700/60 hover:bg-red-600/30 text-slate-300 hover:text-red-300 border border-slate-600/40 hover:border-red-500/40 transition-all disabled:opacity-50"
+                  >
+                    🗑️ Clear
+                  </button>
+                )}
+              </div>
             </div>
           )}
         </div>

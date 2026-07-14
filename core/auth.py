@@ -156,22 +156,9 @@ def register_user(username: str, password: str) -> AuthResponse:
 
         pw_hash = hash_password(password)
         
-        # 自动分配系统默认 API Key（从 .env 读取）
-        default_api_keys = "{}"
-        default_key = os.getenv("QWEN_API_KEY", "")
-        if default_key:
-            default_api_keys = json.dumps({
-                "qwen": {
-                    "api_key": default_key,
-                    "base_url": os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-                    "model_id": os.getenv("QWEN_MODEL_ID", "deepseek-v4-pro"),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            }, ensure_ascii=False)
-        
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash, api_keys) VALUES (?, ?, ?, ?)",
-            (user_id, username, pw_hash, default_api_keys)
+            "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
+            (user_id, username, pw_hash)
         )
         conn.commit()
 
@@ -327,6 +314,29 @@ def get_user_api_key(user_id: str, provider: str) -> Optional[dict]:
             return None
         keys = json.loads(row["api_keys"] or "{}")
         return keys.get(provider)
+    finally:
+        conn.close()
+
+
+def delete_user_api_key(user_id: str, provider: str) -> bool:
+    """删除用户指定 provider 的 API Key 配置，回退到系统默认"""
+    import json
+    conn = _get_users_db()
+    try:
+        row = conn.execute(
+            "SELECT api_keys FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if not row:
+            return False
+        keys = json.loads(row["api_keys"] or "{}")
+        if provider in keys:
+            del keys[provider]
+            conn.execute(
+                "UPDATE users SET api_keys = ? WHERE user_id = ?",
+                (json.dumps(keys, ensure_ascii=False), user_id)
+            )
+            conn.commit()
+        return True
     finally:
         conn.close()
 

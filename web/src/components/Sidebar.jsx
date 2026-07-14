@@ -26,7 +26,8 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
         body: JSON.stringify({ name: name.trim() })
       })
       if (!response.ok) throw new Error("create failed")
-      fetchWorkspaces()
+      const newSandbox = { id: name.trim(), name: name.trim(), status: 'active' }
+      setSandboxes(prev => [newSandbox, ...prev.filter(s => s.id !== name.trim())])
     } catch (err) {
       alert("创建失败: " + err.message)
     }
