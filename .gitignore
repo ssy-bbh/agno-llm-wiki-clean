@@ -16,6 +16,7 @@ data/wiki/
 !data/wiki/README.md
 data/.ingest_control/
 data/.ingest_status/
+data/.task_logs/
 
 # =============================================
 # 📦 构建产物 & 依赖

@@ -34,6 +34,20 @@ export default function Sidebar({ mode, onModeChange, selectedSandbox, onSandbox
 
   const handleDeleteSandbox = async (name, e) => {
     e.stopPropagation()
+    // 检查沙箱是否正在运行摄入任务
+    try {
+      const progressRes = await apiFetch(`/api/task-logs/${encodeURIComponent(name)}/status`)
+      if (progressRes.ok) {
+        const data = await progressRes.json()
+        const status = data?.status
+        if (status === 'ingesting' || status === 'stopping') {
+          alert(`沙箱「${name}」正在执行摄入任务，请先停止任务再删除。`)
+          return
+        }
+      }
+    } catch (_) {
+      // 接口不可用时不阻塞删除
+    }
     if (!window.confirm(`确定要永久删除沙箱「${name}」及其所有知识数据吗？\n\n此操作不可撤销！`)) return
     try {
       const response = await apiFetch(`/api/workspaces/${encodeURIComponent(name)}`, { method: 'DELETE' })

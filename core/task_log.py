@@ -33,9 +33,10 @@ class TaskLogManager:
                     cls._instance._progress_lock = threading.Lock()
         return cls._instance
 
-    # ── 结构化进度追踪 ──
     # ── 文件持久化路径（跨 worker 共享） ──
     _PROGRESS_DIR = Path(__file__).resolve().parent.parent / "data" / ".ingest_status"
+    _LOG_DIR = Path(__file__).resolve().parent.parent / "data" / ".task_logs"
+    _LOG_MAX_LINES = 2000  # 与内存 deque maxlen 一致
 
     def _progress_file(self, user_id: str, workspace: str) -> Path:
         self._PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
@@ -111,6 +112,21 @@ class TaskLogManager:
             else:
                 self._progress.clear()
 
+    def _log_file(self, user_id: str, workspace: str) -> Path:
+        """JSONL 日志文件路径（跨 worker 共享）"""
+        self._LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return self._LOG_DIR / f"{user_id}__{workspace}.jsonl"
+
+    def _truncate_log_file(self, fpath: Path):
+        """日志文件超限时裁剪头部，保留最后 _LOG_MAX_LINES 行"""
+        try:
+            lines = fpath.read_text(encoding="utf-8").splitlines()
+            if len(lines) > self._LOG_MAX_LINES:
+                keep = lines[-self._LOG_MAX_LINES:]
+                fpath.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
     def append(self, user_id: str, workspace: str, message: str, level: str = "info"):
         key = f"{user_id}:{workspace}"
         entry = {
@@ -127,27 +143,83 @@ class TaskLogManager:
                 "last_active": time.time(),
                 "total_lines": len(self._logs[key]),
             }
+        # 追加写入 JSONL 文件（跨 worker 可见）
+        try:
+            fpath = self._log_file(user_id, workspace)
+            with open(fpath, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # 定期截断：每 200 次本 worker 写入检查一次文件大小
+            # 用文件大小判断（比读行数快），超过 ~200KB 时截断
+            line_count = self._meta.get(key, {}).get("total_lines", 0)
+            if line_count % 200 == 0 and line_count > 0:
+                try:
+                    if fpath.stat().st_size > 200 * 1024:
+                        self._truncate_log_file(fpath)
+                except OSError:
+                    pass
+        except Exception:
+            pass
 
     def get_logs(self, user_id: str = "", workspace: str = "", limit: int = 500, since: float = 0):
-        with self._log_lock:
-            if user_id and workspace:
-                key = f"{user_id}:{workspace}"
-                logs = list(self._logs.get(key, []))
-            elif user_id:
-                logs = []
-                for k, v in self._logs.items():
-                    if k.startswith(f"{user_id}:"):
+        # 优先从共享文件读取（跨 worker 可见），内存作为 fallback
+        if user_id and workspace:
+            fpath = self._log_file(user_id, workspace)
+            logs = self._read_log_file(fpath)
+            if not logs:
+                # Fallback: 文件不存在或为空，读内存（可能是本 worker 刚写入但还没落盘）
+                with self._log_lock:
+                    key = f"{user_id}:{workspace}"
+                    logs = list(self._logs.get(key, []))
+        elif user_id:
+            # 读该用户所有沙箱的日志文件
+            logs = []
+            log_dir = self._LOG_DIR
+            if log_dir.exists():
+                prefix = f"{user_id}__"
+                for fpath in log_dir.iterdir():
+                    if fpath.name.startswith(prefix) and fpath.suffix == ".jsonl":
+                        logs.extend(self._read_log_file(fpath))
+            if not logs:
+                with self._log_lock:
+                    for k, v in self._logs.items():
+                        if k.startswith(f"{user_id}:"):
+                            logs.extend(list(v))
+            logs.sort(key=lambda x: x.get("timestamp", 0))
+        else:
+            # 读所有日志文件
+            logs = []
+            log_dir = self._LOG_DIR
+            if log_dir.exists():
+                for fpath in log_dir.iterdir():
+                    if fpath.suffix == ".jsonl":
+                        logs.extend(self._read_log_file(fpath))
+            if not logs:
+                with self._log_lock:
+                    for v in self._logs.values():
                         logs.extend(list(v))
-                logs.sort(key=lambda x: x.get("timestamp", 0))
-            else:
-                logs = []
-                for v in self._logs.values():
-                    logs.extend(list(v))
-                logs.sort(key=lambda x: x.get("timestamp", 0))
+            logs.sort(key=lambda x: x.get("timestamp", 0))
 
         if since > 0:
             logs = [l for l in logs if l.get("timestamp", 0) > since]
         return logs[-limit:]
+
+    @staticmethod
+    def _read_log_file(fpath: Path) -> list:
+        """从 JSONL 文件读取日志条目"""
+        try:
+            if not fpath.exists():
+                return []
+            entries = []
+            for line in fpath.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            return entries
+        except Exception:
+            return []
 
     def list_keys(self):
         """List all (user, workspace) pairs with metadata."""
@@ -163,14 +235,38 @@ class TaskLogManager:
                 key = f"{user_id}:{workspace}"
                 self._logs.pop(key, None)
                 self._meta.pop(key, None)
+                # 删除对应的日志文件
+                try:
+                    self._log_file(user_id, workspace).unlink(missing_ok=True)
+                except Exception:
+                    pass
             elif user_id:
                 to_remove = [k for k in self._logs if k.startswith(f"{user_id}:")]
                 for k in to_remove:
                     self._logs.pop(k, None)
                     self._meta.pop(k, None)
+                # 删除该用户所有日志文件
+                try:
+                    log_dir = self._LOG_DIR
+                    if log_dir.exists():
+                        prefix = f"{user_id}__"
+                        for fpath in log_dir.iterdir():
+                            if fpath.name.startswith(prefix) and fpath.suffix == ".jsonl":
+                                fpath.unlink(missing_ok=True)
+                except Exception:
+                    pass
             else:
                 self._logs.clear()
                 self._meta.clear()
+                # 删除所有日志文件
+                try:
+                    log_dir = self._LOG_DIR
+                    if log_dir.exists():
+                        for fpath in log_dir.iterdir():
+                            if fpath.suffix == ".jsonl":
+                                fpath.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 # Singleton accessor
@@ -231,7 +327,7 @@ class _TeeWriter(io.TextIOBase):
     _RE_SHUFFLE = re.compile(r'Phase 2:\s*SHUFFLE')
     _RE_REDUCE_TOTAL = re.compile(r'发现\s*(\d+)\s*个独立核心概念')
     _RE_REDUCE_PROGRESS = re.compile(r'\[融合\s*(\d+)/(\d+)\]')
-    _RE_COMPLETE = re.compile(r'提炼完成|全部完成|摄入完毕')
+    _RE_COMPLETE = re.compile(r'提炼完成|全部完成|全部提炼完成')
     _RE_MAP_START = re.compile(r'Phase 1:\s*MAP')
 
     def __init__(self, original, log_mgr, user_id, workspace,
