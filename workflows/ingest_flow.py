@@ -980,7 +980,7 @@ class IngestFlow:
             print(f"✂️ 自适应切片: chunk_size={chunk_size}, overlap={overlap} → {len(chunks)} 个知识块", flush=True)
         elif path.exists() and path.is_dir():
             # ── 目录模式：遍历所有文件，合并文本后切块 ──
-            SUPPORTED_EXT = {".pdf", ".docx", ".md", ".txt"}
+            SUPPORTED_EXT = {".pdf", ".doc", ".docx", ".md", ".txt"}
             all_text = ""
             file_count = 0
             for file in sorted(path.iterdir()):

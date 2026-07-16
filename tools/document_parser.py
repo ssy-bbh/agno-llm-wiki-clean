@@ -2,6 +2,8 @@
 document_parser.py — 文档解析与智能切片工具
 """
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 # 确保安装了依赖：pip install pdfplumber python-docx
@@ -28,6 +30,26 @@ try:
     _HAS_OCR = True
 except ImportError:
     _HAS_OCR = False
+
+
+def _find_soffice() -> str | None:
+    """查找 LibreOffice soffice 可执行文件"""
+    import shutil
+    # 1. PATH 中直接可用
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    # 2. Windows 常见安装路径
+    if os.name == "nt":
+        for p in [r"C:\Program Files\LibreOffice\program\soffice.exe",
+                   r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"]:
+            if os.path.exists(p):
+                return p
+    # 3. Linux 常见安装路径
+    for p in ["/usr/bin/soffice", "/usr/bin/libreoffice", "/usr/lib/libreoffice/program/soffice"]:
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def extract_text(file_path: str) -> str:
@@ -90,6 +112,39 @@ def extract_text(file_path: str) -> str:
             else:
                 msg_parts.append("OCR 也未能识别，PDF 可能损坏或为纯图片格式。")
             print("\n".join(msg_parts), flush=True)
+
+    elif ext == ".doc":
+        print(f"  [解析] 检测到旧版 .doc 格式，尝试通过 LibreOffice 转换为 .docx...", flush=True)
+        tmpdir = tempfile.mkdtemp(prefix="doc_conv_")
+        try:
+            # 查找 LibreOffice / soffice
+            soffice = _find_soffice()
+            if soffice is None:
+                raise RuntimeError(
+                    "未找到 LibreOffice/soffice。服务器请执行: apt install libreoffice-writer；"
+                    "Windows 请安装 LibreOffice 并确保 soffice.exe 在 PATH 中。"
+                )
+            # 复制文件到临时目录（避免路径含空格/中文导致 LibreOffice 报错）
+            safe_src = os.path.join(tmpdir, "input.doc")
+            import shutil
+            shutil.copy2(str(path), safe_src)
+            # 调用 LibreOffice 无头转换
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "docx", "--outdir", tmpdir, safe_src],
+                capture_output=True, timeout=60,
+            )
+            converted = os.path.join(tmpdir, "input.docx")
+            if not os.path.exists(converted):
+                raise RuntimeError("LibreOffice 转换 .doc → .docx 失败，未生成输出文件")
+            print(f"  [解析] 转换成功，开始解析 docx...", flush=True)
+            if not docx:
+                raise ImportError("请先安装 python-docx: pip install python-docx")
+            doc_obj = docx.Document(converted)
+            text = "\n".join([para.text for para in doc_obj.paragraphs if para.text.strip()])
+            print(f"  [解析] .doc 提取: {len(text)} 字符", flush=True)
+        finally:
+            import shutil as _sh
+            _sh.rmtree(tmpdir, ignore_errors=True)
 
     elif ext == ".docx":
         if not docx:
